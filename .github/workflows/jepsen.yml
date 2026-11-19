@@ -3,6 +3,8 @@
 # or by hand. It lets every workload, nemesis and checker run for real before the R2 host runs
 # them nightly, as Zigbox's `vm/*` branches do. The run's `store/` is an artifact for 14 days; a
 # scratch branch is deleted when the run ends. A run never files an issue: a person reads it.
+# The run itself is ci/jepsen.sh; .woodpecker/jepsen.yaml runs it on the project's machine on the
+# same pushes, where --lazyfs-all-nodes fits in memory.
 name: Jepsen
 
 on:
@@ -49,73 +51,8 @@ jobs:
         with:
           persist-credentials: false
 
-      # `args` goes to a shell word-split, so only a plain alphabet gets through, and only `test`:
-      # `test-all` multiplies the time limit by the number of tests, and the job has one hour.
-      - name: Check the inputs
-        run: |
-          if [[ "$ARGS" == *$'\n'* || "$ARGS" == *$'\r'* ]]; then
-            echo "::error::args must be one line: a newline would drop everything after it"
-            exit 1
-          fi
-          if ! [[ "$ARGS" =~ ^test([[:space:]]+[A-Za-z0-9,._=-]+)*$ ]]; then
-            echo "::error::args must be 'test' and options of letters, digits and , . _ = -: '$ARGS'"
-            exit 1
-          fi
-          limit=60
-          read -r -a words <<< "$ARGS"
-          lazyfs_fault=false
-          strict=false
-          for i in "${!words[@]}"; do
-            case "${words[$i]}" in
-              --lazyfs-strict-sync|--lazyfs-strict-sync=*) strict=true ;;
-              --nemesis|--nemesis=*)
-                spec=${words[$i]#--nemesis=}
-                [[ "${words[$i]}" == --nemesis ]] && spec=${words[$((i + 1))]:-}
-                # tools.cli keeps only the last --nemesis, so only the last one counts (#257).
-                lazyfs_fault=false
-                [[ ",$spec," == *,lose-unfsynced-writes,* ]] && lazyfs_fault=true ;;
-              --test-count|--test-count=*)
-                echo "::error::--test-count is refused: the 1200 s --time-limit check cannot bound a multiplied run"
-                exit 1 ;;
-              --lazyfs-all-nodes|--lazyfs-all-nodes=*)
-                echo "::error::NRV-E0607: --lazyfs-all-nodes is refused on a hosted runner: LazyFS on all 5 nodes leaves its 16 GB about 0.4 GiB free (P242j). Run it on the R1 host (ops/jepsen)"
-                exit 1 ;;
-              --time-limit) limit=${words[$((i + 1))]:-} ;;
-              --time-limit=*) limit=${words[$i]#--time-limit=} ;;
-            esac
-          done
-          # The canary (P242j) is a run that must fail: without the fault and strict mode it is
-          # green and blind (#257).
-          if [[ "$JEPSEN_LAZYFS_PATCH" == no ]] && { [[ $lazyfs_fault != true ]] || [[ $strict != true ]]; }; then
-            echo "::error::NRV-E0607: unpatched-lazyfs is a canary: args must name --nemesis lose-unfsynced-writes and --lazyfs-strict-sync, or the run is green and tests nothing"
-            exit 1
-          fi
-          if ! [[ "$limit" =~ ^[0-9]+$ ]] || (( limit > 1200 )); then
-            echo "::error::--time-limit must be a number of seconds, at most 1200, not '$limit'"
-            exit 1
-          fi
-          echo "Jepsen \`$ARGS\` at \`$GITHUB_SHA\` (teeth: $TEETH)" >> "$GITHUB_STEP_SUMMARY"
-
       - name: Install the pinned Zig
         run: ./zig/download.sh
-
-      # The teeth build exists from slice 1 (-Dtest-commit-keys=off); until it does, asking for it
-      # fails here, loudly, and not by running the release build as if it were the teeth.
-      - name: Build nerva (ReleaseSafe)
-        run: |
-          if [[ "$TEETH" == true ]]; then
-            if ! grep -q 'test-commit-keys' build.zig; then
-              echo "::error::teeth needs -Dtest-commit-keys=off (R1 slice 1), which this commit's build.zig lacks"
-              exit 1
-            fi
-            ./zig/zig build -Drelease -Dtest-commit-keys=off -p zig-out-teeth
-            nerva=$PWD/zig-out-teeth/bin/nerva
-          else
-            ./zig/zig build -Drelease
-            nerva=$PWD/zig-out/bin/nerva
-          fi
-          echo "NERVA=$nerva" >> "$GITHUB_ENV"
-          "$nerva" version
 
       # The runner has Temurin 21 and Docker. ssh-keygen is there; gnuplot is not, and without
       # it Jepsen's perf graphs, and so the whole result, are :unknown.
@@ -143,65 +80,19 @@ jobs:
           docker info --format 'Docker {{.ServerVersion}}, {{.NCPU}} CPUs, {{.MemTotal}} bytes'
           free -m
 
-      # Leiningen 2.12.0, sha256-checked (tools.sh).
-      - name: The suite's checkers (lein test)
-        working-directory: tests/jepsen
-        run: |
-          lein=$(./tools.sh)
-          LEIN_JAR="$PWD/.tools/leiningen-standalone.jar" "$lein" test
-
-      # A fresh cluster key for this run (P102), never a repository secret: nothing else ever
-      # knows it. Masked in the log, and searched for in the store before it is uploaded.
-      - name: Run Jepsen
-        run: |
-          NERVA_CLUSTER_KEY=$(openssl rand -hex 32)
-          echo "::add-mask::$NERVA_CLUSTER_KEY"
-          echo "NERVA_CLUSTER_KEY=$NERVA_CLUSTER_KEY" >> "$GITHUB_ENV"
-          export NERVA_CLUSTER_KEY
-          read -r -a words <<< "$ARGS"
-          # The memory record (P242i): `free -m` at the start and the end, and the lowest
-          # MemAvailable seen (sampled every 5 s) in between, which includes LazyFS's cache (about
-          # 0.9 to 1.2 GiB resident a node, from mount to unmount, on 2 of the 5 nodes, P242j).
-          free -m
-          # Every 5 s, bounded: meminfo (Cached, Shmem), RSS per command, the top processes and
-          # container cgroups (tests/jepsen/memsample.sh, P242j); the artifact `jepsen-memory`.
-          tests/jepsen/memsample.sh "$RUNNER_TEMP/jepsen-memory.log" "$RUNNER_TEMP/jepsen-memory-low.txt" &
-          sampler=$!
-          # Jepsen exits 0 valid, 1 invalid, 2 unknown, 255 on a crash.
-          rc=0
-          tests/jepsen/run.sh "$NERVA" "${words[@]}" || rc=$?
-          kill "$sampler" 2>/dev/null || true
-          free -m
-          echo "memory: the sample at the lowest MemAvailable"
-          cat "$RUNNER_TEMP/jepsen-memory-low.txt" || true
-          exit "$rc"
-
-      # Searches case-insensitively, for the key and for its first 16 hex characters. The pack
-      # and upload below run only when this step did not fail: a leak is never uploaded.
-      - name: The store holds no cluster key
-        id: keyscan
-        if: always()
-        run: |
-          [[ -n "${NERVA_CLUSTER_KEY:-}" ]] || exit 0
-          [[ -d tests/jepsen/store ]] || exit 0
-          if grep -rliF -e "$NERVA_CLUSTER_KEY" -e "${NERVA_CLUSTER_KEY:0:16}" tests/jepsen/store; then
-            echo "::error::the cluster key is in the store (files above): do not share the artifact"
-            exit 1
-          fi
-          echo "No file in store/ holds the run's cluster key" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Pack Jepsen's store
-        if: always() && steps.keyscan.outcome != 'failure'
-        run: |
-          if [ -d tests/jepsen/store ]; then
-            tar -czf "$RUNNER_TEMP/jepsen-store.tar.gz" -C tests/jepsen store
-          fi
+      # The checks of the inputs, the build, the suite's checkers, the run and the search for the
+      # cluster key in the store are ci/jepsen.sh's, the same as .woodpecker/jepsen.yaml's. A store
+      # that holds the key is never packed, so never uploaded.
+      - name: Jepsen
+        env:
+          JEPSEN_OUT: ${{ runner.temp }}/jepsen-out
+        run: ci/jepsen.sh
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
-        if: always() && steps.keyscan.outcome != 'failure'
+        if: always()
         with:
           name: jepsen-store
-          path: ${{ runner.temp }}/jepsen-store.tar.gz
+          path: ${{ runner.temp }}/jepsen-out/jepsen-store.tar.gz
           if-no-files-found: ignore
           retention-days: 14
 
@@ -209,7 +100,7 @@ jobs:
         if: always()
         with:
           name: jepsen-memory
-          path: ${{ runner.temp }}/jepsen-memory*
+          path: ${{ runner.temp }}/jepsen-out/jepsen-memory*
           if-no-files-found: ignore
           retention-days: 14
 

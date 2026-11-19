@@ -1,8 +1,9 @@
 # Sourced by ci/*.sh. What a CI script needs from the system running it, in one place, so the
-# scripts run the same under GitHub Actions, Woodpecker or a shell (P-ci-portable).
+# scripts run the same under GitHub Actions, Woodpecker or a shell (ops/ci/README.md, "Nerva on Woodpecker").
 #
 #   ci_error MESSAGE      an error line: an annotation on GitHub, `error: ...` elsewhere
 #   ci_warning MESSAGE    the same for a warning
+#   ci_mask VALUE         hides VALUE in GitHub's log; elsewhere nothing (never print it)
 #   ci_summary            appends stdin to the run's summary: GitHub's step summary, else
 #                         $CI_SUMMARY if set, else the log
 #   ci_event              push | pull_request | manual | cron | other
@@ -15,6 +16,10 @@ ci_error() {
 
 ci_warning() {
     if [ "${GITHUB_ACTIONS:-}" = true ]; then echo "::warning::$*"; else echo "warning: $*" >&2; fi
+}
+
+ci_mask() {
+    if [ "${GITHUB_ACTIONS:-}" = true ]; then echo "::add-mask::$1"; fi
 }
 
 ci_summary() {

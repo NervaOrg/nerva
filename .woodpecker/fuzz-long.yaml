@@ -1,0 +1,44 @@
+# Woodpecker, on the project's own machine (ops/ci/README.md, "Nerva on Woodpecker"): fuzz.yml's
+# long search, every fuzzer and the VOPR on random seeds for MINUTES (default 120, at most 300).
+# Started by hand with the variable NERVA_RUN=fuzz (and MINUTES), or by a cron job named
+# fuzz-long. Never a pull request (P147e). Each entry is one workflow; the agent runs as many at
+# once as it allows, and queues the rest. A failure prints its seed and the replay command.
+when:
+  - event: manual
+    evaluate: 'NERVA_RUN == "fuzz"'
+  - event: cron
+    cron: fuzz-long
+
+matrix:
+  include:
+      - { JOB: fuzz-long, ARG: ewah }
+      - { JOB: fuzz-long, ARG: lsm_scan }
+      - { JOB: fuzz-long, ARG: lsm_cache_map }
+      - { JOB: fuzz-long, ARG: lsm_manifest_log }
+      - { JOB: fuzz-long, ARG: lsm_manifest_level }
+      - { JOB: fuzz-long, ARG: lsm_segmented_array }
+      - { JOB: fuzz-long, ARG: lsm_tree }
+      - { JOB: fuzz-long, ARG: message_bus }
+      - { JOB: fuzz-long, ARG: storage }
+      - { JOB: fuzz-long, ARG: vsr_free_set }
+      - { JOB: fuzz-long, ARG: vsr_superblock }
+      - { JOB: fuzz-long, ARG: vsr_superblock_quorums }
+      - { JOB: fuzz-long, ARG: vsr_multi_batch }
+      - { JOB: fuzz-long, ARG: nerva_adds }
+      - { JOB: fuzz-long, ARG: nerva_http_head }
+      - { JOB: fuzz-long, ARG: nerva_documents }
+      - { JOB: vopr-long, ARG: nerva-1 }
+      - { JOB: vopr-long, ARG: nerva-2 }
+      - { JOB: vopr-long, ARG: nerva-3 }
+      - { JOB: vopr-long, ARG: nerva-4 }
+      - { JOB: vopr-long, ARG: nerva-5 }
+      - { JOB: vopr-long, ARG: nerva-6 }
+      - { JOB: vopr-long, ARG: testing-1 }
+
+steps:
+  - name: ${JOB} ${ARG}
+    image: docker.io/library/ubuntu:24.04@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8
+    commands:
+      - ci/woodpecker_step.sh ${JOB} ${ARG}
+    volumes:
+      - /var/cache/nerva-ci:/cache

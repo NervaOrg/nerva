@@ -3,6 +3,7 @@
 # runs on GitHub's hosted runners (P147e): every job below starts at once, up to the account's
 # concurrent-job limit, else they queue. The always-on search is the R2 fleet.
 # A failure prints its seed and the command that replays it exactly, in the job log and summary.
+# The commands are ci/job.sh's; .woodpecker/fuzz-long.yaml runs the same on the project's machine.
 name: Fuzz (long)
 
 on:
@@ -52,8 +53,7 @@ jobs:
       - name: Fuzz ${{ matrix.fuzzer }} on random seeds
         env:
           MINUTES: ${{ inputs.minutes }}
-        run: |
-          .github/scripts/fuzz_loop.sh fuzz '${{ matrix.fuzzer }}' "$(( MINUTES > 300 ? 300 : MINUTES ))"
+        run: ci/job.sh fuzz-long '${{ matrix.fuzzer }}'
 
   vopr:
     runs-on: ubuntu-24.04
@@ -82,5 +82,4 @@ jobs:
       - name: VOPR (${{ matrix.state_machine }}, lane ${{ matrix.lane }}) on random seeds
         env:
           MINUTES: ${{ inputs.minutes }}
-        run: |
-          .github/scripts/fuzz_loop.sh vopr '${{ matrix.state_machine }}' "$(( MINUTES > 300 ? 300 : MINUTES ))"
+        run: ci/job.sh vopr-long '${{ matrix.state_machine }}-${{ matrix.lane }}'

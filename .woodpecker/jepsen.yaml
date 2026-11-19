@@ -1,0 +1,29 @@
+# Woodpecker, on the project's own machine (ops/ci/README.md, "Nerva on Woodpecker"): jepsen.yml's
+# run on demand, by ci/jepsen.sh. A push to a scratch branch jepsen/<slice>-<slug>, or by hand with
+# the variable NERVA_RUN=jepsen and, optionally, ARGS (`test ...`, --time-limit at most 1200),
+# TEETH=true and JEPSEN_LAZYFS_PATCH=no (the canary). Never a pull request (P147e). Unlike a
+# hosted runner, the machine has the memory for --lazyfs-all-nodes.
+#
+# The five nodes are containers on the host's Docker, which the step reaches through its socket
+# (Trusted: volumes, network and security, since the step is privileged for /dev/fuse and uses
+# the host's network to reach the nodes' bridge). One Jepsen run at a time on a machine; the
+# store and memory record stay in /var/cache/nerva-ci/jepsen/ for 14 days. The branch is not
+# deleted here: GitHub's jepsen.yml does that while it still runs on the same pushes.
+when:
+  - event: push
+    branch: 'jepsen/**'
+  - event: manual
+    evaluate: 'NERVA_RUN == "jepsen"'
+
+steps:
+  - name: jepsen
+    image: docker.io/library/ubuntu:24.04@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8
+    privileged: true
+    # Woodpecker 3.20 honours this for a Trusted repository; `woodpecker-cli lint`'s schema
+    # warns about it all the same.
+    network_mode: host
+    commands:
+      - ci/woodpecker_step.sh jepsen
+    volumes:
+      - /var/cache/nerva-ci:/cache
+      - /var/run/docker.sock:/var/run/docker.sock

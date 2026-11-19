@@ -21,7 +21,8 @@ free_min_gib="${CI_FREE_MIN_GIB:-40}"
 
 case "$job" in
     integration) minutes=45 ;;
-    unit | vopr | vopr-main) minutes=60 ;;
+    unit | vopr | vopr-main | jepsen) minutes=60 ;;
+    fuzz-long | vopr-long) minutes=330 ;;
     *) minutes=30 ;;
 esac
 
@@ -29,6 +30,10 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get -o Acquire::Retries=5 update -qq
 apt-get -o Acquire::Retries=5 install -y -qq --no-install-recommends ca-certificates curl git \
     xz-utils python3 openssl procps iproute2 gnupg >/dev/null
+# Jepsen drives the host's Docker (the socket is mounted; the client is below) with a JDK, gnuplot
+# and ssh-keygen.
+[ "$job" != jepsen ] || apt-get -o Acquire::Retries=5 install -y -qq --no-install-recommends \
+    openjdk-21-jdk-headless gnuplot-nox openssh-client >/dev/null
 git config --global --add safe.directory "$PWD"
 
 code=$(ci/changes.sh)
@@ -46,6 +51,15 @@ chown -R "$user:$user" "$PWD"
 chown "$user:$user" "$cache"
 touch "$cache/.lock"
 chown "$user:$user" "$cache/.lock"
+if [ "$job" = jepsen ]; then
+    # The job still runs as `ci`: root would leave root's files in the shared Zig cache. The
+    # socket's group lets it reach Docker, which is root on the host in all but name.
+    sock=/var/run/docker.sock
+    [ -S "$sock" ] || { echo "error: $sock is not mounted (see .woodpecker/jepsen.yaml)" >&2; exit 1; }
+    gid=$(stat -c %g "$sock")
+    getent group "$gid" >/dev/null || groupadd --gid "$gid" dockerhost
+    usermod -aG "$(getent group "$gid" | cut -d: -f1)" "$user"
+fi
 
 local_key="local-$job${arg:+-$arg}"
 exec 9<"$cache/.lock"
@@ -61,6 +75,37 @@ if [ "$(df --output=avail -B1G "$cache" | tail -1 | tr -d ' ')" -lt "$free_min_g
     fi
 fi
 flock -s 9
+if [ "$job" = jepsen ]; then
+    # run.sh's containers, network and subnet have fixed names: one run at a time on a machine.
+    # Each run's store and memory record stay here for 14 days (GitHub keeps its artifacts as long).
+    install -d -o "$user" -g "$user" "$cache/jepsen"
+    touch "$cache/jepsen/.lock"
+    exec 8<"$cache/jepsen/.lock"
+    echo "jepsen: waiting for any other Jepsen run on this machine"
+    flock -x 8
+    find "$cache/jepsen" -mindepth 1 -maxdepth 1 -type d -mtime +14 -exec rm -rf {} +
+    # Docker's static client, pinned: only the `docker` binary of the release archive, kept in the
+    # cache (the archive is 82 MB). The Jepsen lock above makes this the only writer.
+    docker_version=29.9.3
+    docker_sha256=3fb5d1f13014c18cc54945bc177c58a9056a482dada031e17d12cf2e6922c973
+    docker_cli="$cache/tools/docker-$docker_version"
+    if [ ! -x "$docker_cli/docker" ]; then
+        [ "$(uname -m)" = x86_64 ] || { echo "error: the pinned Docker client is x86_64; this is $(uname -m)" >&2; exit 1; }
+        rm -rf "$docker_cli.partial"
+        mkdir -p "$docker_cli.partial"
+        curl -fsSL --retry 3 -o "$docker_cli.partial/docker.tgz" \
+            "https://download.docker.com/linux/static/stable/x86_64/docker-$docker_version.tgz"
+        echo "$docker_sha256  $docker_cli.partial/docker.tgz" | sha256sum -c - >/dev/null ||
+            { echo "error: docker-$docker_version.tgz does not match its pinned sha256" >&2; exit 1; }
+        tar --no-same-owner -xzf "$docker_cli.partial/docker.tgz" -C "$docker_cli.partial" --strip-components=1 docker/docker
+        rm "$docker_cli.partial/docker.tgz"
+        mv "$docker_cli.partial" "$docker_cli"
+    fi
+    ln -sf "$docker_cli/docker" /usr/local/bin/docker
+    export JEPSEN_OUT="$cache/jepsen/$(date -u +%Y%m%dT%H%M%SZ)-${CI_PIPELINE_NUMBER:-local}"
+    install -d -o "$user" -g "$user" "$JEPSEN_OUT"
+    echo "jepsen: the store and memory record go to /var/cache/nerva-ci/${JEPSEN_OUT#"$cache"/} on the host"
+fi
 df -h "$cache" . | sed 's/^/  /'
 
 as_ci() {

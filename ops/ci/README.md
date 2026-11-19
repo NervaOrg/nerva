@@ -166,7 +166,9 @@ It asks for:
 - the DNS name;
 - `github` or `forgejo`;
 - your login (it becomes the admin);
-- which organisations may log in (leave empty to let anyone with an account in);
+- which organisations may sign up (for Nerva, the organisation that owns the repository). Left
+  empty, nobody can sign up and the admins add users by hand: an open sign-up would let anyone
+  run code on the box;
 - an optional second name for remote agents.
 
 Then the OAuth app:
@@ -258,10 +260,14 @@ Set this up once, after adding the repository in Woodpecker:
 1. **Settings, General:** turn **Allow pull requests** off, and set **Require approval** to
    *forks* as a second line of defence. The workflows also only match `push` and `manual`
    events. Fork pull requests run on GitHub's hosted runners only.
-2. **Settings, Project:** mark the repository **Trusted**, with *volumes* (and, for the Jepsen
-   workflow later, *security*, which `privileged: true` and `/dev/kvm` need). The workflows
-   mount the host's cache, and an untrusted repository may not mount host paths.
-3. **On every agent box**, create the shared cache:
+2. **Settings, General:** set the repository's **Timeout** to 360 minutes, since the long fuzz
+   runs take up to 330. The bootstrap lets a repository choose up to 360 (`CI_MAX_TIMEOUT`).
+3. **Settings, Project:** mark the repository **Trusted** for *volumes*, *network* and
+   *security*. Every workflow mounts the host's cache. Jepsen also mounts the host's Docker
+   socket and runs privileged on the host's network, to reach its five node containers.
+   Mounting the Docker socket gives that step root on the box: it runs only for this
+   repository's own branches.
+4. **On every agent box**, create the shared cache:
 
    ```bash
    install -d -m 0755 -o 1001 -g 1001 /var/cache/nerva-ci
@@ -271,10 +277,27 @@ Set this up once, after adding the repository in Woodpecker:
    per job, saved only by a push to `main` that passed. Jobs share it under a `flock`. When
    free space drops below 40 GiB (`CI_FREE_MIN_GIB`), the next job takes the lock exclusively
    and prunes it.
-4. **GitHub statuses:** each workflow reports as `ci/woodpecker/push/<file>`, for example
+5. **GitHub statuses:** each workflow reports as `ci/woodpecker/push/<file>`, for example
    `ci/woodpecker/push/check` or `ci/woodpecker/push/demo/1`. Whether any of them becomes a
    required check on `main` is the owner's choice. GitHub's own checks stay required either
    way, since forks only get those.
+
+**By hand** (*Run pipeline* on the repository, with variables):
+
+| Variables | Runs |
+|---|---|
+| none | every CI workflow, as a push would |
+| `NERVA_RUN=fuzz`, `MINUTES=120` | `fuzz-long`: every fuzzer and the VOPR lanes on random seeds (fuzz.yml) |
+| `NERVA_RUN=jepsen`, `ARGS=test ...`, `TEETH=true`, `JEPSEN_LAZYFS_PATCH=no` | one Jepsen run (jepsen.yml); a push to `jepsen/**` runs one too |
+
+A cron job named `fuzz-long` (Settings, Cron) runs the long fuzz on a schedule. A Jepsen run
+waits for any other on the box, since its containers have fixed names. Its store and memory
+record stay in `/var/cache/nerva-ci/jepsen/` for 14 days. Do not run `ops/jepsen`'s nightly on
+an agent box: it uses the same container names and does not take the lock.
+
+While the move is under way, GitHub Actions still runs every workflow as before; Woodpecker runs
+the same commands beside it. Perf nightly stays on GitHub: it measures on a dedicated Fly machine
+(N56), and a shared CI box would only add noise.
 
 To run a job by hand on any Linux box with the toolchain's needs (as root, in a scratch copy of
 the tree, with `/cache` present):
@@ -297,3 +320,14 @@ CI_PIPELINE_EVENT=manual ci/woodpecker_step.sh check
   - Forgejo's SSH server, mirrors and dumps.
 
   The first run on a new box is the test. A `FAIL` line says what to fix.
+- Nerva's workflows: each `ci/woodpecker_step.sh` job was run as root in a plain Ubuntu 24.04
+  container with `/cache` mounted:
+  - `check` and `fuzz-smoke` ran in full. `fuzz-smoke` ran as a push to `main` and saved its
+    cache.
+  - `fuzz-long` and `vopr-long` ran for one minute each.
+  - A Markdown-only push skipped.
+  - `jepsen` ran up to `docker info`, against a fake socket: there was no Docker daemon to drive.
+
+  The `when` filters were checked with `woodpecker-cli exec` for push, a `jepsen/**` push,
+  manual runs and `NERVA_RUN`; the cron filter was not checked. No workflow has run on a
+  Woodpecker server yet.
