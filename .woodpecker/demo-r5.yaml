@@ -1,0 +1,18 @@
+# Woodpecker, on the project's own machine (ops/ci/README.md, "Nerva on Woodpecker"). Pushes to any
+# branch of NervaLog/nerva but jepsen/**, and manual runs without NERVA_RUN: never a pull request,
+# so never a fork's code (P147e; the repository's "Allow pull requests" is off as well). The commands are ci/job.sh's, the same as
+# ci.yml's job of the same name.
+when:
+  - event: push
+    branch:
+      exclude: ['jepsen/**']
+  - event: manual
+    evaluate: 'NERVA_RUN == ""'
+
+steps:
+  - name: demo-r5
+    image: docker.io/library/ubuntu:24.04@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8
+    commands:
+      - ci/woodpecker_step.sh demo-r5
+    volumes:
+      - /var/cache/nerva-ci:/cache

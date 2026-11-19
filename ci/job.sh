@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# One CI job, the same under GitHub Actions (.github/workflows/ci.yml), Woodpecker (.woodpecker/)
+# or a shell. Run from the repository root, after ci/install_zig.sh.
+#
+#   ci/job.sh check                 typecheck, format, the scripts' own tests, declared views
+#   ci/job.sh integration           three real replicas (~3.5 GiB of disk)
+#   ci/job.sh api                   the JSON API against a model
+#   ci/job.sh releases              mixed releases
+#   ci/job.sh targets               every release target type-checks; on a push to main, builds
+#   ci/job.sh unit                  unit tests
+#   ci/job.sh fuzz-smoke            every fuzzer at its smoke size
+#   ci/job.sh demo <file>           one demo under crashes (tests/demo/<file>)
+#   ci/job.sh demo-r4 | demo-r5     a milestone's demo
+#   ci/job.sh vopr <seed|random>    one VOPR seed, Debug (a pull request's)
+#   ci/job.sh vopr-main <lane>      main's VOPR, ReleaseSafe: `fixed` (1, 2, 5) or random-N (6 min)
+#
+# Every job's commands are here and nowhere else; the CI systems' files only say where and when.
+set -euo pipefail
+. "$(dirname "$0")/lib.sh"
+
+job="${1:?usage: ci/job.sh <job> [arg]}"
+arg="${2:-}"
+targets=(x86_64-linux aarch64-linux x86_64-macos aarch64-macos)
+demos_expected="canvas_chaos.py seats_chaos.py "
+
+case "$job" in
+check)
+    ./zig/zig build check
+    ./zig/zig build test:fmt
+    .github/scripts/docs_only_test.sh
+    scripts/quickstart_loop_test.sh # its refusals, NRV-E0741 and NRV-E0742
+    # The release scripts: the bill of materials (N63) and the refusals (NRV-E1112 to E1117,
+    # E1130 to E1138, E1152, E1164). Needs ci/install_repo_tools.sh first.
+    python3 .github/scripts/test_sbom.py
+    python3 .github/scripts/test_release_check.py
+    python3 .github/scripts/test_mac_sign.py
+    python3 -I .github/scripts/test_site_release.py
+    python3 -I .github/scripts/test_release_finish.py
+    python3 -I .github/scripts/test_r2.py
+    python3 -I .github/scripts/test_package_repos.py
+    python3 -I .github/scripts/test_site_build.py
+    python3 -I .github/scripts/test_repos_alarm.py
+    # The nightly perf scripts, the simulation fleet's and Jepsen nightly's reporters (no network).
+    python3 perf/nightly/test_compare.py
+    python3 perf/nightly/test_file_issue.py
+    python3 ops/sim-fleet/test_sim_fleet.py
+    python3 -I ops/jepsen/test_jepsen_report.py
+    ./zig/zig build test:views
+    ;;
+integration) ./zig/zig build test:integration ;;
+api) ./zig/zig build test:api ;;
+releases) ./zig/zig build test:release ;;
+targets)
+    # Every release target compiles (#276): a Debug check of each, then, except on a pull request,
+    # each built as release.yml builds it.
+    for t in "${targets[@]}"; do ./zig/zig build check -Dtarget="$t"; done
+    if [ "$(ci_event)" != pull_request ]; then
+        for t in "${targets[@]}"; do ./zig/zig build -Drelease -Dtarget="$t"; done
+    fi
+    ;;
+unit)
+    # `benchmark.perf: usage example` skips itself where perf_event_open is denied (UPSTREAM.md).
+    ./zig/zig build test:unit
+    ;;
+fuzz-smoke)
+    # `lsm_segmented_array` logs "too slow for the smoke mode" in Debug: a warning, not a failure.
+    ./zig/zig build fuzz -- smoke
+    ;;
+demo)
+    [ -n "$arg" ] || { echo "usage: ci/job.sh demo <file>" >&2; exit 2; }
+    # The CI files list the demos one by one; they must be the ones test:demo runs (build.zig).
+    listed=$(grep -o '"[a-z_]*_chaos\.py"' build.zig | tr -d '"' | sort | tr '\n' ' ')
+    if [ "$listed" != "$demos_expected" ]; then
+        ci_error "build.zig's test:demo runs '$listed'; update demos_expected in ci/job.sh, ci.yml's demo matrix and .woodpecker/demo.yaml"
+        exit 1
+    fi
+    ./zig/zig build -Drelease
+    python3 "tests/demo/$arg" zig-out/bin/nerva --seconds=75
+    ;;
+demo-r4 | demo-r5) ./zig/zig build -Drelease "$job" ;;
+vopr)
+    # A failure replays exactly with `./zig/zig build vopr -- <seed>`.
+    seed="${arg:?usage: ci/job.sh vopr <seed|random>}"
+    if [ "$seed" = random ]; then seed=$(od -An -N8 -tu8 /dev/urandom | tr -d ' '); fi
+    echo "VOPR seed: $seed"
+    echo "### VOPR seed \`$seed\`" | ci_summary
+    ./zig/zig build vopr -- "$seed"
+    ;;
+vopr-main)
+    # A failure replays exactly with `./zig/zig build -Drelease vopr -- <seed>`.
+    case "$arg" in
+    fixed)
+        for seed in 1 2 5; do
+            echo "VOPR seed: $seed"
+            echo "### VOPR seed \`$seed\` (ReleaseSafe)" | ci_summary
+            ./zig/zig build -Drelease vopr -- "$seed"
+        done
+        ;;
+    random-*) .github/scripts/fuzz_loop.sh vopr nerva 6 ;;
+    *) echo "usage: ci/job.sh vopr-main fixed|random-N" >&2; exit 2 ;;
+    esac
+    ;;
+*) echo "ci/job.sh: unknown job '$job'" >&2; exit 2 ;;
+esac

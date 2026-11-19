@@ -243,6 +243,46 @@ and the agent appears under Admin, then Agents.
   - Woodpecker: `docker compose -f /opt/woodpecker/compose.yaml logs -f`
   - Forgejo: `journalctl -u forgejo -f`
 
+## Nerva on Woodpecker
+
+Nerva's CI is plain scripts under `ci/`. GitHub's `ci.yml` and the workflows in `.woodpecker/`
+both call `ci/job.sh <job>`, so the two run the same checks. Each `.woodpecker/*.yaml` file
+runs `ci/woodpecker_step.sh <job>` in a pinned `ubuntu:24.04` image. That script installs the
+base packages, skips a docs-only push (`ci/changes.sh`), and runs the job as an unprivileged
+user `ci` under GitHub's timeout for it.
+
+**Only the repository's own branches run here; forks never do (P147e).** Woodpecker can run a
+pull request from a fork on this box, and a fork's code must never run on a self-hosted machine.
+Set this up once, after adding the repository in Woodpecker:
+
+1. **Settings, General:** turn **Allow pull requests** off, and set **Require approval** to
+   *forks* as a second line of defence. The workflows also only match `push` and `manual`
+   events. Fork pull requests run on GitHub's hosted runners only.
+2. **Settings, Project:** mark the repository **Trusted**, with *volumes* (and, for the Jepsen
+   workflow later, *security*, which `privileged: true` and `/dev/kvm` need). The workflows
+   mount the host's cache, and an untrusted repository may not mount host paths.
+3. **On every agent box**, create the shared cache:
+
+   ```bash
+   install -d -m 0755 -o 1001 -g 1001 /var/cache/nerva-ci
+   ```
+
+   It holds the pinned Zig (`nerva-toolchain/`), Zig's global cache, and a `.zig-cache` copy
+   per job, saved only by a push to `main` that passed. Jobs share it under a `flock`. When
+   free space drops below 40 GiB (`CI_FREE_MIN_GIB`), the next job takes the lock exclusively
+   and prunes it.
+4. **GitHub statuses:** each workflow reports as `ci/woodpecker/push/<file>`, for example
+   `ci/woodpecker/push/check` or `ci/woodpecker/push/demo/1`. Whether any of them becomes a
+   required check on `main` is the owner's choice. GitHub's own checks stay required either
+   way, since forks only get those.
+
+To run a job by hand on any Linux box with the toolchain's needs (as root, in a scratch copy of
+the tree, with `/cache` present):
+
+```bash
+CI_PIPELINE_EVENT=manual ci/woodpecker_step.sh check
+```
+
 ## What was and was not tested
 
 - Both scripts pass `bash -n` and `shellcheck`.
