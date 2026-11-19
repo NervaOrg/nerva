@@ -13,6 +13,9 @@
 #   ci/job.sh demo-r4 | demo-r5     a milestone's demo
 #   ci/job.sh vopr <seed|random>    one VOPR seed, Debug (a pull request's)
 #   ci/job.sh vopr-main <lane>      main's VOPR, ReleaseSafe: `fixed` (1, 2, 5) or random-N (6 min)
+#   ci/job.sh fuzz-long <fuzzer>    one fuzzer on random seeds for $MINUTES (default 120, at most 300)
+#   ci/job.sh vopr-long <sm>-<lane> the VOPR of state machine <sm> (nerva, testing) likewise
+#   ci/job.sh jepsen                one Jepsen run ($ARGS, $TEETH: ci/jepsen.sh)
 #
 # Every job's commands are here and nowhere else; the CI systems' files only say where and when.
 set -euo pipefail
@@ -99,6 +102,20 @@ vopr-main)
     random-*) .github/scripts/fuzz_loop.sh vopr nerva 6 ;;
     *) echo "usage: ci/job.sh vopr-main fixed|random-N" >&2; exit 2 ;;
     esac
+    ;;
+jepsen) exec ci/jepsen.sh ;;
+fuzz-long | vopr-long)
+    # Searches, where fuzz-smoke and vopr only check (N59, fuzz.yml). A failure prints its seed
+    # and the command that replays it exactly.
+    minutes="${MINUTES:-120}"
+    [[ "$minutes" =~ ^[1-9][0-9]*$ ]] || { echo "error: MINUTES must be a whole number, not '$minutes'" >&2; exit 2; }
+    ((minutes <= 300)) || minutes=300
+    [ -n "$arg" ] || { echo "usage: ci/job.sh $job <fuzzer | state machine-lane>" >&2; exit 2; }
+    if [ "$job" = fuzz-long ]; then
+        .github/scripts/fuzz_loop.sh fuzz "$arg" "$minutes"
+    else
+        .github/scripts/fuzz_loop.sh vopr "${arg%-*}" "$minutes"
+    fi
     ;;
 *) echo "ci/job.sh: unknown job '$job'" >&2; exit 2 ;;
 esac

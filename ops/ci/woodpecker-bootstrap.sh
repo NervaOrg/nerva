@@ -105,8 +105,8 @@ if [ "$mode" = server ]; then
         setting CI_ADMINS "$CI_ADMINS"
     fi
     if [ -z "${CI_ORGS+set}" ]; then
-        ask CI_ORGS "Only members of these organisations may log in (comma separated, empty: \
-anyone with an account)" ""
+        ask CI_ORGS "Only members of these organisations may sign up (comma separated, empty: \
+nobody; the admins add users by hand)" ""
         setting CI_ORGS "$CI_ORGS"
     fi
     if [ -z "${CI_GRPC_HOST+set}" ]; then
@@ -116,6 +116,10 @@ anyone with an account)" ""
     valid CI_HOST '[a-z0-9.-]+'
     valid CI_ADMINS '[A-Za-z0-9._,-]+'
     valid CI_ORGS '[A-Za-z0-9._,-]*'
+    # The longest a workflow may run, in minutes; each repository picks its own up to this.
+    [ -n "${CI_MAX_TIMEOUT:-}" ] || setting CI_MAX_TIMEOUT 360
+    CI_MAX_TIMEOUT="${CI_MAX_TIMEOUT:-360}"
+    valid CI_MAX_TIMEOUT '[1-9][0-9]*'
     valid CI_GRPC_HOST '[a-z0-9.-]*'
     [ "$CI_FORGE" = github ] || valid CI_FORGE_URL 'https://[a-z0-9.:-]+(/[A-Za-z0-9._/-]*)?'
 else
@@ -243,8 +247,10 @@ if [ "$mode" = server ]; then
       WOODPECKER_FORGEJO_CLIENT_FILE: /run/secrets/forge-client-id
       WOODPECKER_FORGEJO_SECRET_FILE: /run/secrets/forge-client-secret"
     fi
-    orgs_env=""
-    [ -n "$CI_ORGS" ] && orgs_env="      WOODPECKER_ORGS: $CI_ORGS"
+    # Open sign-up only behind an organisation: with no CI_ORGS, anyone with a forge account
+    # could sign up, enable a repository of their own and run its code on these machines.
+    open=false orgs_env=""
+    [ -n "$CI_ORGS" ] && open=true orgs_env="      WOODPECKER_ORGS: $CI_ORGS"
     cat > "$new" <<EOF
 # Written by woodpecker-bootstrap.sh on every run; change $etc/ci.env and rerun it instead.
 name: woodpecker
@@ -263,7 +269,8 @@ services:
     environment:
       WOODPECKER_HOST: https://$CI_HOST
       WOODPECKER_ADMIN: $CI_ADMINS
-      WOODPECKER_OPEN: "true"
+      WOODPECKER_OPEN: "$open"
+      WOODPECKER_MAX_PIPELINE_TIMEOUT: "$CI_MAX_TIMEOUT"
 $orgs_env
 $forge_env
       WOODPECKER_AGENT_SECRET_FILE: /run/secrets/agent-secret
