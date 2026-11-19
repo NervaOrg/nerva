@@ -1,0 +1,243 @@
+# Jepsen on a hosted runner (R1 slice 2, P215): the suite in tests/jepsen/ against a ReleaseSafe
+# `nerva`, five Docker containers, started by a push to a scratch branch `jepsen/<slice>-<slug>`
+# or by hand. It lets every workload, nemesis and checker run for real before the R2 host runs
+# them nightly, as Zigbox's `vm/*` branches do. The run's `store/` is an artifact for 14 days; a
+# scratch branch is deleted when the run ends. A run never files an issue: a person reads it.
+name: Jepsen
+
+on:
+  push:
+    branches:
+      - 'jepsen/**'
+  workflow_dispatch:
+    inputs:
+      args:
+        description: "Arguments to `lein run`: `test ...` with --time-limit at most 1200"
+        required: true
+        default: "test --workload bank --nemesis kill,partition --time-limit 300"
+      teeth:
+        description: "Test the commit-key-deduplication-off build (slice 1's -Dtest-commit-keys=off) instead of the release one"
+        type: boolean
+        required: false
+        default: false
+      unpatched-lazyfs:
+        description: "Canary: build the node image with stock LazyFS, without lazyfs-osync.patch (P242h); run it with --nemesis lose-unfsynced-writes --lazyfs-strict-sync, it must fail (P242j: a hosted run cannot run the all-nodes fault)"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jepsen-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # A push has no inputs: it runs this.
+  ARGS: ${{ inputs.args || 'test --workload bank --nemesis kill,partition --time-limit 300' }}
+  TEETH: ${{ inputs.teeth && 'true' || 'false' }}
+  JEPSEN_LAZYFS_PATCH: ${{ inputs.unpatched-lazyfs && 'no' || 'yes' }}
+
+jobs:
+  jepsen:
+    runs-on: ubuntu-24.04
+    # Up to 1200 s of requests and faults, five nodes' setup, the recovery, the checkers, the build.
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      # `args` goes to a shell word-split, so only a plain alphabet gets through, and only `test`:
+      # `test-all` multiplies the time limit by the number of tests, and the job has one hour.
+      - name: Check the inputs
+        run: |
+          if [[ "$ARGS" == *$'\n'* || "$ARGS" == *$'\r'* ]]; then
+            echo "::error::args must be one line: a newline would drop everything after it"
+            exit 1
+          fi
+          if ! [[ "$ARGS" =~ ^test([[:space:]]+[A-Za-z0-9,._=-]+)*$ ]]; then
+            echo "::error::args must be 'test' and options of letters, digits and , . _ = -: '$ARGS'"
+            exit 1
+          fi
+          limit=60
+          read -r -a words <<< "$ARGS"
+          lazyfs_fault=false
+          strict=false
+          for i in "${!words[@]}"; do
+            case "${words[$i]}" in
+              --lazyfs-strict-sync|--lazyfs-strict-sync=*) strict=true ;;
+              --nemesis|--nemesis=*)
+                spec=${words[$i]#--nemesis=}
+                [[ "${words[$i]}" == --nemesis ]] && spec=${words[$((i + 1))]:-}
+                # tools.cli keeps only the last --nemesis, so only the last one counts (#257).
+                lazyfs_fault=false
+                [[ ",$spec," == *,lose-unfsynced-writes,* ]] && lazyfs_fault=true ;;
+              --test-count|--test-count=*)
+                echo "::error::--test-count is refused: the 1200 s --time-limit check cannot bound a multiplied run"
+                exit 1 ;;
+              --lazyfs-all-nodes|--lazyfs-all-nodes=*)
+                echo "::error::NRV-E0607: --lazyfs-all-nodes is refused on a hosted runner: LazyFS on all 5 nodes leaves its 16 GB about 0.4 GiB free (P242j). Run it on the R1 host (ops/jepsen)"
+                exit 1 ;;
+              --time-limit) limit=${words[$((i + 1))]:-} ;;
+              --time-limit=*) limit=${words[$i]#--time-limit=} ;;
+            esac
+          done
+          # The canary (P242j) is a run that must fail: without the fault and strict mode it is
+          # green and blind (#257).
+          if [[ "$JEPSEN_LAZYFS_PATCH" == no ]] && { [[ $lazyfs_fault != true ]] || [[ $strict != true ]]; }; then
+            echo "::error::NRV-E0607: unpatched-lazyfs is a canary: args must name --nemesis lose-unfsynced-writes and --lazyfs-strict-sync, or the run is green and tests nothing"
+            exit 1
+          fi
+          if ! [[ "$limit" =~ ^[0-9]+$ ]] || (( limit > 1200 )); then
+            echo "::error::--time-limit must be a number of seconds, at most 1200, not '$limit'"
+            exit 1
+          fi
+          echo "Jepsen \`$ARGS\` at \`$GITHUB_SHA\` (teeth: $TEETH)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install the pinned Zig
+        run: ./zig/download.sh
+
+      # The teeth build exists from slice 1 (-Dtest-commit-keys=off); until it does, asking for it
+      # fails here, loudly, and not by running the release build as if it were the teeth.
+      - name: Build nerva (ReleaseSafe)
+        run: |
+          if [[ "$TEETH" == true ]]; then
+            if ! grep -q 'test-commit-keys' build.zig; then
+              echo "::error::teeth needs -Dtest-commit-keys=off (R1 slice 1), which this commit's build.zig lacks"
+              exit 1
+            fi
+            ./zig/zig build -Drelease -Dtest-commit-keys=off -p zig-out-teeth
+            nerva=$PWD/zig-out-teeth/bin/nerva
+          else
+            ./zig/zig build -Drelease
+            nerva=$PWD/zig-out/bin/nerva
+          fi
+          echo "NERVA=$nerva" >> "$GITHUB_ENV"
+          "$nerva" version
+
+      # The runner has Temurin 21 and Docker. ssh-keygen is there; gnuplot is not, and without
+      # it Jepsen's perf graphs, and so the whole result, are :unknown.
+      - name: Tools
+        run: |
+          [[ -n "${JAVA_HOME_21_X64:-}" ]] || { echo "::error::no JDK 21 on this runner"; exit 1; }
+          echo "JAVA_HOME=$JAVA_HOME_21_X64" >> "$GITHUB_ENV"
+          echo "$JAVA_HOME_21_X64/bin" >> "$GITHUB_PATH"
+          # The runner sometimes cannot resolve the Ubuntu mirror (a network fault, not Nerva's):
+          # up to 5 attempts, sleeping 15, 30, 60 and 120 s between them.
+          apt_ok=
+          delays=(15 30 60 120)
+          for attempt in 1 2 3 4 5; do
+            if sudo -n apt-get -o Acquire::Retries=3 update -q &&
+               sudo -n apt-get -o Acquire::Retries=3 install -y -q --no-install-recommends gnuplot-nox; then
+              apt_ok=1
+              break
+            fi
+            if (( attempt < 5 )); then
+              echo "apt-get failed (attempt $attempt of 5); retrying in ${delays[attempt-1]} s"
+              sleep "${delays[attempt-1]}"
+            fi
+          done
+          [[ -n "$apt_ok" ]] || { echo "::error::apt-get could not reach the Ubuntu mirror after 5 attempts (a runner network fault, not Nerva)"; exit 1; }
+          docker info --format 'Docker {{.ServerVersion}}, {{.NCPU}} CPUs, {{.MemTotal}} bytes'
+          free -m
+
+      # Leiningen 2.12.0, sha256-checked (tools.sh).
+      - name: The suite's checkers (lein test)
+        working-directory: tests/jepsen
+        run: |
+          lein=$(./tools.sh)
+          LEIN_JAR="$PWD/.tools/leiningen-standalone.jar" "$lein" test
+
+      # A fresh cluster key for this run (P102), never a repository secret: nothing else ever
+      # knows it. Masked in the log, and searched for in the store before it is uploaded.
+      - name: Run Jepsen
+        run: |
+          NERVA_CLUSTER_KEY=$(openssl rand -hex 32)
+          echo "::add-mask::$NERVA_CLUSTER_KEY"
+          echo "NERVA_CLUSTER_KEY=$NERVA_CLUSTER_KEY" >> "$GITHUB_ENV"
+          export NERVA_CLUSTER_KEY
+          read -r -a words <<< "$ARGS"
+          # The memory record (P242i): `free -m` at the start and the end, and the lowest
+          # MemAvailable seen (sampled every 5 s) in between, which includes LazyFS's cache (about
+          # 0.9 to 1.2 GiB resident a node, from mount to unmount, on 2 of the 5 nodes, P242j).
+          free -m
+          # Every 5 s, bounded: meminfo (Cached, Shmem), RSS per command, the top processes and
+          # container cgroups (tests/jepsen/memsample.sh, P242j); the artifact `jepsen-memory`.
+          tests/jepsen/memsample.sh "$RUNNER_TEMP/jepsen-memory.log" "$RUNNER_TEMP/jepsen-memory-low.txt" &
+          sampler=$!
+          # Jepsen exits 0 valid, 1 invalid, 2 unknown, 255 on a crash.
+          rc=0
+          tests/jepsen/run.sh "$NERVA" "${words[@]}" || rc=$?
+          kill "$sampler" 2>/dev/null || true
+          free -m
+          echo "memory: the sample at the lowest MemAvailable"
+          cat "$RUNNER_TEMP/jepsen-memory-low.txt" || true
+          exit "$rc"
+
+      # Searches case-insensitively, for the key and for its first 16 hex characters. The pack
+      # and upload below run only when this step did not fail: a leak is never uploaded.
+      - name: The store holds no cluster key
+        id: keyscan
+        if: always()
+        run: |
+          [[ -n "${NERVA_CLUSTER_KEY:-}" ]] || exit 0
+          [[ -d tests/jepsen/store ]] || exit 0
+          if grep -rliF -e "$NERVA_CLUSTER_KEY" -e "${NERVA_CLUSTER_KEY:0:16}" tests/jepsen/store; then
+            echo "::error::the cluster key is in the store (files above): do not share the artifact"
+            exit 1
+          fi
+          echo "No file in store/ holds the run's cluster key" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Pack Jepsen's store
+        if: always() && steps.keyscan.outcome != 'failure'
+        run: |
+          if [ -d tests/jepsen/store ]; then
+            tar -czf "$RUNNER_TEMP/jepsen-store.tar.gz" -C tests/jepsen store
+          fi
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always() && steps.keyscan.outcome != 'failure'
+        with:
+          name: jepsen-store
+          path: ${{ runner.temp }}/jepsen-store.tar.gz
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: jepsen-memory
+          path: ${{ runner.temp }}/jepsen-memory*
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # A scratch branch lives for one run, win or lose: push a new commit to the same name to run
+  # again. Never `main`, and only `jepsen/**`.
+  cleanup:
+    needs: jepsen
+    if: ${{ always() && github.event_name == 'push' && startsWith(github.ref, 'refs/heads/jepsen/') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Delete the scratch branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ github.ref_name }}
+          RUN_SHA: ${{ github.sha }}
+        # Only while the branch still points at this run's commit: a newer push to the same
+        # name (which cancelled this run) holds its own commit, and its run deletes it.
+        run: |
+          ref="repos/$GITHUB_REPOSITORY/git/refs/heads/$BRANCH"
+          if ! head=$(gh api "$ref" --jq .object.sha 2>/dev/null); then
+            echo "Branch $BRANCH is already gone"
+            exit 0
+          fi
+          if [[ "$head" != "$RUN_SHA" ]]; then
+            echo "Branch $BRANCH moved to $head; leaving it for that run"
+            exit 0
+          fi
+          gh api -X DELETE "$ref" 2>&1 || echo "Branch $BRANCH could not be deleted (already gone?)"

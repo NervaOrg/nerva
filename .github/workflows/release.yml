@@ -1,0 +1,314 @@
+# A commit to main that changes VERSION publishes release v<VERSION> (docs/DECISIONS.md N40). The
+# jobs run in order: version, then ci and packages (packages.yml, the packaging tests; both on that
+# commit, and the release waits for both, #384), then release (binaries for four targets, and
+# a draft release), then finish (release-finish.yml, on main), which publishes it once the owner has
+# approved `apple-signing` (P360).
+# A version with a suffix (0.2.0-rc.1) is a prerelease. Releasing a version twice fails.
+# The release notes are the version's section of CHANGELOG.md (`## v<VERSION> — <date>`); a
+# version without one is refused before CI runs. Each release carries its software bill of
+# materials, `nerva-v<VERSION>.cdx.json` (CycloneDX, N63), covered by SHA256SUMS.
+#
+# v0.7.1 (docs/briefs/v0.7.1.md, "Release mechanics"): each Linux tarball also holds install.sh, the
+# units and the settings examples (packaging/linux); the four Linux packages (nerva_<v>-1_<arch>.deb
+# and nerva-<v>-1.<arch>.rpm; a prerelease's `-` is `~` inside the package and `.` in the file name,
+# because GitHub renames an asset whose name has a `~`, P311) are built from the same binaries and
+# are in SHA256SUMS; and the release is a DRAFT. `finish` then runs on main: its `mac` job signs and
+# notarizes the Mac zip (mac-sign.yml; environment `apple-signing`, so the owner's one approval of
+# that run ships the release) and uploads it, with its `.zip.sha256`, to the draft; `mac-verify`
+# (mac-verify.yml) checks it on both architectures. Only then `publish` publishes the draft, commits
+# the Homebrew formula to the tap and opens the site's pull request, and `verify` installs from the
+# tap. A prerelease dispatched from a branch stops at its draft, since `finish` runs only on main;
+# release-finish.yml dispatched from main with the draft's tag rehearses it, or finishes a run that
+# stopped. The owner's own Mac (`zig build -Drelease mac-release -Dnotarize=true`) remains the
+# fallback if the runner or Apple's notary service fails. (SHA256SUMS does not cover the zip, which
+# is made after it.)
+# Publishing creates the tag on the commit the draft names. The run refuses a second release of a
+# version while a draft of it exists (a draft has no tag; checked again just before the draft is
+# created, because "Re-run failed jobs" does not run the `version` job again), a binary whose
+# `nerva version` says another version than VERSION, the keys-off test build, and a release (a
+# version without a suffix) dispatched from a ref other than main (.github/scripts/release_check.sh,
+# NRV-E1112 to NRV-E1116).
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths: [VERSION]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    # Listing a draft release needs write access; this job only reads (release_check.sh unreleased).
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      # The full history: `candidate` asks whether the candidate is an ancestor of this commit.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Read VERSION
+        id: version
+        run: |
+          version=$(tr -d ' \n' < VERSION)
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::VERSION is not a version: '$version'"
+            exit 1
+          fi
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse a version without release notes
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          .github/scripts/release_notes.sh "$TAG" > notes.md
+          cat notes.md
+
+      # The site's RELEASES sentence (NRV-E1130): the publish job needs it after the release is
+      # public, so a missing one is refused here, before anything is built.
+      - name: Refuse a version without a site line
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: .github/scripts/release_notes.sh site "$TAG"
+
+      - name: Refuse a version whose bill of materials cannot be written
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: python3 .github/scripts/sbom.py "$TAG" "$GITHUB_SHA" > /dev/null
+
+      # A suffix-less version is cut only from main (P147b); a prerelease may be a dispatch from a
+      # branch, which is how the draft's mechanics are tested.
+      - name: Refuse a release dispatched from a ref other than main
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: .github/scripts/release_check.sh ref "$TAG" "$GITHUB_REF"
+
+      # The code freeze (NRV-E1158): the commit may differ from the soaked candidate named by
+      # release/candidate only outside src/, build.zig, build.zig.zon and zig/. A prerelease with no
+      # such file passes, and one with it is checked, so the rehearsal exercises this.
+      - name: Refuse a commit whose code is not the candidate's
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          # The main head before this push; empty on a dispatch, which a release then refuses.
+          BEFORE: ${{ github.event.before }}
+        run: .github/scripts/release_check.sh candidate "$TAG" "$GITHUB_SHA" "$BEFORE"
+
+      - name: Refuse a version already released, or already a draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: .github/scripts/release_check.sh unreleased "$TAG"
+
+  ci:
+    needs: version
+    uses: ./.github/workflows/ci.yml
+    # ci.yml's `changes` job asks for pull-requests: read; a called workflow cannot hold more
+    # than its caller grants. `issues: write` is for ci.yml's `alarm` job (P376), which a release's
+    # call skips (`repos-fresh` runs on pushes of CI itself); the grant is checked when the file loads.
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: write
+
+  # The packaging tests on this very commit (docs/briefs/v0.7.1.md, demo row 6; #384): called, not
+  # observed, so a later push to main cannot cancel it, a red run stops the draft, and its result is
+  # on this run. It runs beside `ci`; each job is on a hosted runner of its own (the tests need about
+  # 2 GiB of disk, which only a fresh runner has).
+  packages:
+    needs: version
+    uses: ./.github/workflows/packages.yml
+    permissions:
+      contents: read
+
+  release:
+    needs: [version, ci, packages]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Zig
+        run: |
+          .github/scripts/free_disk.sh
+          ./zig/download.sh
+
+      # Every target is cross-compiled from Linux. The binary's first line is `<protocol>+<commit>`
+      # and its `version` line is VERSION (P259b, P284b); the protocol is the data file and protocol
+      # release (`release` in build.zig), VERSION names the release. A Linux tarball
+      # holds the binary, LICENSE and NOTICE as before and, beside them, slice 4's installer.
+      - name: Build
+        run: |
+          mkdir dist
+          linux_files=(install.sh nerva@.service nerva-api@.service replica.env.example api.env.example)
+          for target in x86_64-linux aarch64-linux x86_64-macos aarch64-macos; do
+            # Linux binaries ship stripped and their debug info is a file apart (P417). The pinned
+            # Zig strips ELF only, so the macOS binaries keep theirs for now.
+            strip=()
+            case "$target" in *-linux) strip=(-Dstrip=true) ;; esac
+            ./zig/zig build -Drelease -Dtarget="$target" "${strip[@]}"
+            name="nerva-$TAG-$target"
+            mkdir "$name"
+            cp zig-out/bin/nerva LICENSE NOTICE "$name/"
+            mkdir -p "bin/$target"
+            cp zig-out/bin/nerva "bin/$target/nerva"
+            case "$target" in
+              *-linux)
+                for file in "${linux_files[@]}"; do cp -p "packaging/linux/$file" "$name/"; done
+                cp zig-out/bin/nerva.debug "dist/$name.debug"
+                ;;
+            esac
+            tar -czf "dist/$name.tar.gz" "$name"
+          done
+
+      # The other three targets cannot run here (no qemu-user on the image), but each is built by
+      # the same command in the same loop: the version is VERSION's text in the binary's data.
+      - name: Check each binary holds this version
+        run: |
+          for binary in bin/*/nerva; do
+            strings -a -n 5 "$binary" | grep -qxF "${TAG#v}" \
+              || { echo "::error::$binary does not hold the version ${TAG#v}"; exit 1; }
+          done
+
+      # The debug file is the linked build, the binary is that build stripped: the code is the same.
+      - name: Check each debug file holds its binary's code
+        run: |
+          for target in x86_64-linux aarch64-linux; do
+            debug="dist/nerva-$TAG-$target.debug"
+            for section in .text .rodata .data .data.rel.ro .eh_frame; do
+              want=$(readelf -x "$section" "$debug" 2>&1) || true
+              case "$want" in
+                *"Hex dump of section"*) ;;
+                *) echo "::error::$debug has no $section to compare"; exit 1 ;;
+              esac
+              [ "$want" = "$(readelf -x "$section" "bin/$target/nerva" 2>&1)" ] \
+                || { echo "::error::$debug differs from the $target binary in $section"; exit 1; }
+            done
+          done
+
+      - name: Check the Linux x86_64 binary runs, and is this release
+        run: |
+          tar -xzf "dist/nerva-$TAG-x86_64-linux.tar.gz"
+          "./nerva-$TAG-x86_64-linux/nerva" version | tee version.txt
+          grep -q "+$(git rev-parse --short=7 HEAD)" version.txt
+          # NRV-E1112: its `version` line is VERSION. NRV-E1113: it is not the keys-off build (#271).
+          .github/scripts/release_check.sh binary "./nerva-$TAG-x86_64-linux/nerva" "${TAG#v}"
+          # Only the first line: `nerva version` goes on to print release, format and bundles lines,
+          # which an env-file refuses.
+          binary_version=$(head -n1 version.txt | sed 's/^Nerva version //')
+          echo "BINARY_VERSION=$binary_version" >> "$GITHUB_ENV"
+
+      # dpkg-deb is on the image. rpmbuild is the `rpm` package, pinned to the version
+      # packages.yml's tests ran against (P284b, P295) and asserted: a runner image change fails here.
+      - name: Install rpmbuild, pinned
+        run: |
+          set -eu
+          sudo apt-get -o Acquire::Retries=5 update -qq
+          sudo apt-get -o Acquire::Retries=5 install -y -qq rpm=4.18.2+dfsg-2.1build2
+          test "$(rpmbuild --version)" = "RPM version 4.18.2"
+          dpkg-deb --version | head -n1
+
+      # The four packages, from the binaries above, by the scripts packages.yml tests
+      # (tests/packaging/packages.py --require-version-line, on this commit). A prerelease's
+      # `0.7.1-rc.1` is `0.7.1~rc.1` inside the package, which sorts before 0.7.1, and `0.7.1.rc.1` in
+      # the file name (P311).
+      - name: Build the Linux packages
+        run: |
+          set -eu
+          pkgver=$(printf '%s' "${TAG#v}" | sed 's/-/~/')
+          filever=${pkgver//\~/.}
+          sh packaging/linux/build-deb.sh bin/x86_64-linux/nerva amd64 "$pkgver" dist
+          sh packaging/linux/build-deb.sh bin/aarch64-linux/nerva arm64 "$pkgver" dist
+          sh packaging/linux/build-rpm.sh bin/x86_64-linux/nerva x86_64 "$pkgver" dist
+          sh packaging/linux/build-rpm.sh bin/aarch64-linux/nerva aarch64 "$pkgver" dist
+          for arch in amd64:x86_64:x86_64 arm64:aarch64:aarch64; do
+            IFS=: read -r deb rpm target <<< "$arch"
+            dpkg-deb --fsys-tarfile "dist/nerva_$filever-1_$deb.deb" | tar -xO ./usr/bin/nerva \
+              | cmp - "bin/$target-linux/nerva"
+            rpm2archive - < "dist/nerva-$filever-1.$rpm.rpm" | tar -xzO ./usr/bin/nerva \
+              | cmp - "bin/$target-linux/nerva"
+          done
+          ls -l dist
+
+      # The Mac zip is not here and not in SHA256SUMS: the owner uploads it with its own
+      # `.zip.sha256`. Everything else is, and the bill of materials.
+      - name: Write the bill of materials and SHA256SUMS
+        run: |
+          python3 .github/scripts/sbom.py "$TAG" "$GITHUB_SHA" > "dist/nerva-$TAG.cdx.json"
+          (cd dist && sha256sum -- *.tar.gz *.deb *.rpm *.debug *.cdx.json > SHA256SUMS && sha256sum -c SHA256SUMS)
+          test "$(wc -l < dist/SHA256SUMS)" = 11
+          # P417d: a .debug file is "signed" by being listed in SHA256SUMS, which is signed (P417c).
+          for f in dist/*.debug; do grep -q -- "  $(basename "$f")\$" dist/SHA256SUMS; done
+
+      # A DRAFT, not a release: it names this commit as the target and creates no tag until it is
+      # published, by the owner, after they upload the Mac zip (docs/briefs/v0.7.1.md, step 6).
+      # "Re-run failed jobs" re-runs only this job and reuses the `version` job's result, so the
+      # check runs again here, just before the draft is made: a second run must not make a second draft.
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          .github/scripts/release_check.sh unreleased "$TAG"
+          prerelease=()
+          case "$TAG" in *-*) prerelease=(--prerelease) ;; esac
+          {
+            .github/scripts/release_notes.sh "$TAG"
+            echo
+            echo "---"
+            echo
+            echo "Nerva at commit $GITHUB_SHA. Binaries report \`$BINARY_VERSION\`." \
+              "Check downloads against \`SHA256SUMS\`, which lists the tarballs, the packages," \
+              "the \`.debug\` files and the bill of materials. \`SHA256SUMS.asc\` is its detached" \
+              "signature, made with the release key in \`packaging/keys/nerva-release.asc\`:" \
+              "\`gpg --verify SHA256SUMS.asc SHA256SUMS\`. Each Linux tarball's binary is" \
+              "stripped; its \`.debug\` file is the same build with symbols, to read a" \
+              "core dump or a stack trace. The macOS zip is checked against its own" \
+              "\`.zip.sha256\`. What the binaries are built from is in \`nerva-$TAG.cdx.json\`" \
+              "(CycloneDX)."
+          } > notes.md
+          gh release create "$TAG" dist/* "${prerelease[@]}" --draft --target "$GITHUB_SHA" \
+            --title "Nerva $TAG" --notes-file notes.md
+
+      # GitHub renames a file whose name has a character it does not keep (NRV-E1115).
+      - name: Check the draft holds what was built
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: .github/scripts/release_check.sh assets "$TAG" dist
+
+  # Everything after the draft is release-finish.yml (P360): `mac` signs and notarizes the zip and
+  # waits for the owner's one approval (environment apple-signing), `mac-verify` checks it on both
+  # architectures, `publish` publishes the draft, commits the formula to the tap and opens the
+  # site's pull request (environment release-publish), and `verify` installs from the tap. The `if`
+  # skips it on a dispatch from any ref but main, so a prerelease dispatched from a branch makes its
+  # draft and stops there (it is finished by dispatching release-finish.yml from main with its tag);
+  # the workflow's own `guard` and each environment's main-only deployment rule are the other guards.
+  # A prerelease draft may target only main plus VERSION and CHANGELOG.md (release_check.sh
+  # mac-draft, P343). It inherits this repository's secrets: a called workflow sees none, its jobs'
+  # environment secrets included, unless the caller passes them (P459).
+  finish:
+    needs: [version, release]
+    if: github.ref == 'refs/heads/main'
+    uses: ./.github/workflows/release-finish.yml
+    permissions:
+      contents: write
+      issues: write
+    secrets: inherit
+    with:
+      tag: ${{ needs.version.outputs.tag }}

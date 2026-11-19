@@ -1,0 +1,170 @@
+# Linux packaging (v0.7.1, slice 4; docs/briefs/v0.7.1.md): the release tarball's install.sh and
+# the two systemd units, proved on a real systemd; and slice 5's .deb and .rpm packages.
+#
+# It runs on every push to main (so on the release commit), is called by release.yml, whose draft
+# waits for it on the release commit itself (#384), and runs on a pull request that changes
+# packaging, the code whose output or exit statuses the installer and units rely on
+# (src/nerva_main.zig, src/nerva/diagnostic.zig) or VERSION (a draft's run waits until the pull
+# request is marked ready). Every job runs on GitHub's hosted runners, as ci.yml's do (P147e): a
+# test that installs a service and starts replicas as root needs a machine of its own, and a fork's
+# pull request must never run on a self-hosted one. The pinned toolchain comes from Actions' cache,
+# installed as ci.yml installs it. This workflow is not a required check: a pull request that
+# touches none of those paths never starts it.
+name: Packages
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - 'packaging/**'
+      - 'tests/packaging/**'
+      - '.github/workflows/packages.yml'
+      - '.github/scripts/package_repos.sh'
+      - '.github/scripts/repo_install_check.sh'
+      - '.github/scripts/test_package_repos.py'
+      - 'src/nerva_main.zig'
+      - 'src/nerva/diagnostic.zig'
+      - 'VERSION'
+  workflow_dispatch:
+  # release.yml calls it on the release commit and does not publish until it is green (#384, P386).
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: packages-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Installs the Zig pinned by zig/download.sh. Checkout removes ./zig's toolchain, so it is kept
+  # on the Machine's volume, under the cache directory, keyed by download.sh's hash (which holds
+  # the version and checksums), and linked back in; Zig finds its lib next to the real binary.
+  # A copy is used only if complete (written aside, then renamed) and it runs; otherwise it is
+  # replaced by a fresh download. download.sh then checks the version, as before. First, a disk
+  # left too full by earlier jobs on the volume is freed (free_disk.sh, N65).
+  INSTALL_ZIG: |
+    set -eu
+    .github/scripts/free_disk.sh
+    cache="${XDG_CACHE_HOME:-$HOME/.cache}/nerva-toolchain"
+    toolchain="$cache/zig-$(sha256sum zig/download.sh | cut -c1-16)"
+    if [ -x "$toolchain/zig" ] && [ -f "$toolchain/lib/std/std.zig" ]; then
+      rm -rf zig/zig zig/lib
+      ln -s "$toolchain/zig" zig/zig
+      ln -s "$toolchain/lib" zig/lib
+    fi
+    if ! ./zig/zig env > /dev/null 2>&1 || [ ! -f zig/lib/std/std.zig ]; then
+      rm -rf zig/zig zig/lib
+      ./zig/download.sh
+      mkdir -p "$cache"
+      rm -rf "$toolchain" "$toolchain.partial"
+      mkdir "$toolchain.partial"
+      cp -a zig/zig zig/lib "$toolchain.partial/"
+      mv "$toolchain.partial" "$toolchain"
+    fi
+    echo "Zig $(./zig/zig version) from $(readlink -f zig/zig)"
+    ./zig/download.sh
+
+jobs:
+
+  # The tarball's install.sh and units, under systemd as root on the runner (tests/packaging/
+  # install.py): install, idempotence, every NRV-E11xx, three replicas and a gateway, a SIGKILL,
+  # a replica that exits 8, uninstall. It changes /usr/local/bin, /etc and /var/lib: the runner is
+  # thrown away after the job.
+  tarball:
+    name: tarball installs
+    # A draft pull request waits for ready_for_review; every other event runs.
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/nerva-toolchain
+          key: nerva-toolchain-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
+
+      - name: Install the pinned Zig
+        run: eval "$INSTALL_ZIG"
+
+      - name: Build nerva (the release build the tarball carries)
+        run: ./zig/zig build -Drelease
+
+      - name: The runner boots with systemd
+        run: |
+          systemd-analyze --version | head -n1
+          test -d /run/systemd/system
+
+      - name: Install and run (tests/packaging/install.py)
+        run: sudo python3 -I tests/packaging/install.py zig-out/bin/nerva packaging/linux
+
+  # The .deb and .rpm (tests/packaging/packages.py, v0.7.1 slice 5): both packages for both
+  # architectures built twice with dpkg-deb and rpmbuild (reproducible), inspected, and installed,
+  # reinstalled and removed in ubuntu:24.04, debian:12, rockylinux:9 and fedora:latest. The two
+  # tools are the owner's approved dependency (P284b): dpkg-deb is part of the image, rpmbuild is
+  # the `rpm` package, pinned to the version the image's apt index offered when this was written
+  # (4.18.2, the one on ubuntu-24.04) and asserted, so an image change fails here and does not
+  # silently change the bytes. The four container images are public and pulled here only.
+  # release.yml (slice 7) runs the same scripts: packaging/linux/build-deb.sh and build-rpm.sh.
+  packages:
+    name: deb and rpm
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/nerva-toolchain
+          key: nerva-toolchain-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
+
+      - name: Install the pinned Zig
+        run: eval "$INSTALL_ZIG"
+
+      # Each package carries the binary built for its own architecture; the build scripts read the
+      # ELF header and refuse another (NRV-E1110), and packages.py compares the bytes.
+      - name: Build nerva for x86_64-linux and aarch64-linux (the release builds the packages carry)
+        run: |
+          ./zig/zig build -Drelease
+          ./zig/zig build -Drelease -Dtarget=aarch64-linux -p zig-out-aarch64
+
+      - name: Install rpmbuild, pinned
+        run: |
+          set -eu
+          sudo apt-get -o Acquire::Retries=5 update -qq
+          sudo apt-get -o Acquire::Retries=5 install -y -qq rpm=4.18.2+dfsg-2.1build2
+          rpmbuild --version
+          test "$(rpmbuild --version)" = "RPM version 4.18.2"
+          dpkg-deb --version | head -n1
+
+      - name: Build, inspect and install the packages (tests/packaging/packages.py)
+        run: python3 -I tests/packaging/packages.py zig-out/bin/nerva . --aarch64 zig-out-aarch64/bin/nerva --require-version-line
+
+      # The signed repositories (slice 2): three trees built by package_repos.sh with throwaway
+      # keys, served over local HTTP, and installed from by repo_install_check.sh in a container
+      # per distribution (apt, dnf 4 and dnf 5), with the refusals and the dual-signed InRelease.
+      # The tools are pinned as ci.yml pins them. The images are tags here; slice 4 pins them by
+      # digest in release-finish.yml's `repos-verify`.
+      - name: Install from the signed repositories on seven distributions (tests/packaging/repos.py)
+        run: |
+          set -eu
+          sudo apt-get -o Acquire::Retries=5 install -y -qq apt-utils=2.8.4ubuntu0.1 \
+            createrepo-c=0.17.3-2ubuntu3 rpm=4.18.2+dfsg-2.1build2 sqv=1.1.0-1build2 gnupg jq
+          tool_is() { # <tool> <expected first line>
+            got=$("$1" --version 2>&1 | head -n1)
+            case $got in "$2" | "$2"[!0-9.]*) ;; *) echo "error[NRV-E1139]: packages.yml: $1 reads '$got', not '$2'" >&2; exit 1 ;; esac
+          }
+          tool_is apt-ftparchive "apt 2.8.4"
+          tool_is createrepo_c "Version: 0.17.3"
+          tool_is rpmsign "RPM version 4.18.2"
+          gpg --version | head -n1 | grep -q 'gpg (GnuPG) 2\.4\.' || { echo "error[NRV-E1139]: packages.yml: gpg is not 2.4" >&2; exit 1; }
+          python3 -I tests/packaging/repos.py
