@@ -39,34 +39,6 @@ concurrency:
   group: packages-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  # Installs the Zig pinned by zig/download.sh. Checkout removes ./zig's toolchain, so it is kept
-  # on the Machine's volume, under the cache directory, keyed by download.sh's hash (which holds
-  # the version and checksums), and linked back in; Zig finds its lib next to the real binary.
-  # A copy is used only if complete (written aside, then renamed) and it runs; otherwise it is
-  # replaced by a fresh download. download.sh then checks the version, as before. First, a disk
-  # left too full by earlier jobs on the volume is freed (free_disk.sh, N65).
-  INSTALL_ZIG: |
-    set -eu
-    .github/scripts/free_disk.sh
-    cache="${XDG_CACHE_HOME:-$HOME/.cache}/nerva-toolchain"
-    toolchain="$cache/zig-$(sha256sum zig/download.sh | cut -c1-16)"
-    if [ -x "$toolchain/zig" ] && [ -f "$toolchain/lib/std/std.zig" ]; then
-      rm -rf zig/zig zig/lib
-      ln -s "$toolchain/zig" zig/zig
-      ln -s "$toolchain/lib" zig/lib
-    fi
-    if ! ./zig/zig env > /dev/null 2>&1 || [ ! -f zig/lib/std/std.zig ]; then
-      rm -rf zig/zig zig/lib
-      ./zig/download.sh
-      mkdir -p "$cache"
-      rm -rf "$toolchain" "$toolchain.partial"
-      mkdir "$toolchain.partial"
-      cp -a zig/zig zig/lib "$toolchain.partial/"
-      mv "$toolchain.partial" "$toolchain"
-    fi
-    echo "Zig $(./zig/zig version) from $(readlink -f zig/zig)"
-    ./zig/download.sh
 
 jobs:
 
@@ -91,7 +63,7 @@ jobs:
           key: nerva-toolchain-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
 
       - name: Install the pinned Zig
-        run: eval "$INSTALL_ZIG"
+        run: ci/install_zig.sh
 
       - name: Build nerva (the release build the tarball carries)
         run: ./zig/zig build -Drelease
@@ -128,7 +100,7 @@ jobs:
           key: nerva-toolchain-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
 
       - name: Install the pinned Zig
-        run: eval "$INSTALL_ZIG"
+        run: ci/install_zig.sh
 
       # Each package carries the binary built for its own architecture; the build scripts read the
       # ELF header and refuse another (NRV-E1110), and packages.py compares the bytes.

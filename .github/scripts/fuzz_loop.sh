@@ -10,14 +10,14 @@
 # warning, not a failure: some fuzzers' default sizes are long. Writes nothing outside its own
 # log directory.
 set -euo pipefail
+. "$(dirname "$0")/../../ci/lib.sh"
 
 kind="$1"
 name="$2"
 minutes="$3"
 run_minutes_max=30
-logs="${RUNNER_TEMP:-/tmp}/fuzz-loop-$kind-$name"
+logs="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/fuzz-loop-$kind-$name"
 mkdir -p "$logs"
-summary="${GITHUB_STEP_SUMMARY:-/dev/null}"
 
 case "$kind" in
   fuzz)
@@ -35,7 +35,7 @@ case "$kind" in
     exit 2
     ;;
 esac
-[[ -x "$binary" ]] || { echo "::error::build failed for $kind $name" >&2; exit 1; }
+[[ -x "$binary" ]] || { ci_error "build failed for $kind $name"; exit 1; }
 
 deadline=$(( $(date +%s) + minutes * 60 ))
 runs=0
@@ -50,10 +50,10 @@ while (( $(date +%s) < deadline )); do
   runs=$(( runs + 1 ))
   if (( status == 124 )); then
     timeouts=$(( timeouts + 1 ))
-    echo "::warning::$kind $name seed $seed ran past $run_minutes_max min (not a failure)"
+    ci_warning "$kind $name seed $seed ran past $run_minutes_max min (not a failure)"
   elif (( status != 0 )); then
     failures=$(( failures + 1 ))
-    echo "::error::$kind $name failed on seed $seed (exit $status). Replay: $(replay "$seed")"
+    ci_error "$kind $name failed on seed $seed (exit $status). Replay: $(replay "$seed")"
     tail -n 60 "$log"
     {
       echo "### ❌ $kind \`$name\` failed on seed \`$seed\` (exit $status)"
@@ -63,12 +63,12 @@ while (( $(date +%s) < deadline )); do
       echo '```'
       tail -n 30 "$log"
       echo '```'
-    } >> "$summary"
+    } | ci_summary
     # One failing seed is the finding: stop, so the job's time goes to other fuzzers.
     break
   fi
 done
 
 echo "$kind $name: $runs runs, $failures failed, $timeouts past the per-run cap, in $minutes min budget"
-echo "$kind \`$name\`: $runs runs, $failures failed, $timeouts past the per-run cap" >> "$summary"
+echo "$kind \`$name\`: $runs runs, $failures failed, $timeouts past the per-run cap" | ci_summary
 (( failures == 0 ))
