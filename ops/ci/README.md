@@ -255,7 +255,23 @@ user `ci` under GitHub's timeout for it.
 
 **Only the repository's own branches run here; forks never do (P147e).** Woodpecker can run a
 pull request from a fork on this box, and a fork's code must never run on a self-hosted machine.
-Set this up once, after adding the repository in Woodpecker:
+Set this up once. `nerva-woodpecker.sh` does steps 1 to 4: `host` on each agent box, and
+`repo` from your laptop, where it also enables the repository:
+
+```bash
+scp nerva-woodpecker.sh root@ci.myproject.org:
+```
+
+```bash
+ssh -t root@ci.myproject.org bash nerva-woodpecker.sh host
+```
+
+```bash
+WOODPECKER_SERVER=https://ci.myproject.org WOODPECKER_TOKEN=... bash nerva-woodpecker.sh repo OWNER/nerva
+```
+
+The token is a Woodpecker admin's: your avatar, then *Personal access token*. What the two modes
+set:
 
 1. **Settings, General:** turn **Allow pull requests** off, and set **Require approval** to
    *forks* as a second line of defence. The workflows also only match `push` and `manual`
@@ -331,3 +347,5 @@ CI_PIPELINE_EVENT=manual ci/woodpecker_step.sh check
   The `when` filters were checked with `woodpecker-cli exec` for push, a `jepsen/**` push,
   manual runs and `NERVA_RUN`; the cron filter was not checked. No workflow has run on a
   Woodpecker server yet.
+- `nerva-woodpecker.sh`: its failure paths were run here. Its `repo` mode was checked only
+  against the Woodpecker 3.20.1 client's API paths and field names, never against a server.
