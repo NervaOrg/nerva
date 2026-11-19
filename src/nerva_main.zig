@@ -1,0 +1,1348 @@
+//! The `nerva` binary: `format`, `start`, `view`, `api`, `export`, `import`, `recover` and
+//! `version`.
+//!
+//! Trimmed from TigerBeetle's `src/tigerbeetle/main.zig`: no REPL, benchmark, inspection, AOF or
+//! upgrades between releases (every replica runs the single bundled release).
+
+const std = @import("std");
+const log = std.log.scoped(.main);
+
+const stdx = @import("stdx");
+const builtin = @import("builtin");
+const vsr = @import("vsr.zig");
+const mv = vsr.multiversion;
+const Multiversion = mv.Multiversion;
+const MultiversionOS = mv.MultiversionOS;
+const constants = @import("constants.zig");
+const config = constants.config;
+const cli = @import("nerva/cli.zig");
+const diagnostic = @import("nerva/diagnostic.zig");
+const timings = @import("nerva/timings.zig");
+const Client = @import("nerva/client.zig").Client;
+const view_server = @import("nerva/view/server.zig");
+const api_server = @import("nerva/api/server.zig");
+const metrics = @import("nerva/api/metrics.zig");
+const http_connection = @import("nerva/http_connection.zig");
+const export_file = @import("nerva/export_file.zig");
+const export_ = @import("nerva/export.zig");
+const import_ = @import("nerva/import.zig");
+const recover = @import("nerva/recover.zig");
+const backup = @import("nerva/backup.zig");
+const release_peers = @import("nerva/release_peers.zig");
+const bundle = @import("nerva/bundle.zig");
+const format_digest = @import("nerva/format_digest.zig");
+const peer_auth = @import("nerva/peer_auth.zig");
+const preflight = @import("nerva/preflight.zig");
+
+const IO = @import("io.zig").IO;
+const Tracer = @import("trace.zig").Tracer;
+const TraceFile = @import("nerva/trace_file.zig").TraceFile;
+const Storage = @import("storage.zig").StorageType(IO);
+const AOF = @import("aof.zig").AOFType(IO);
+const MessageBus = @import("message_bus.zig").MessageBusType(IO);
+const MessagePool = @import("message_pool.zig").MessagePool;
+const StateMachine = @import("nerva/state_machine.zig").StateMachineType(Storage);
+const Replica = vsr.ReplicaType(StateMachine, MessageBus, Storage, AOF);
+const data_file_size_min = @import("vsr/superblock.zig").data_file_size_min;
+
+const MiB = stdx.MiB;
+
+/// False only in the test build `-Dtest-commit-keys=off` (R1): `start` then lets a resent key
+/// commit again. Set by `build.zig` for this binary alone; the state machine's default is true.
+const commit_keys_deduplicate = @import("nerva_options").commit_keys_deduplicate;
+const release_version = @import("nerva_options").version;
+/// Whether `start` opens the binary's own bundle and offers the releases it holds (P490): true in
+/// every build but `test:release`'s `nerva_past_single` (`build.zig`: the `multiversion_start`
+/// build parameter, with no `-D` option), which runs as `single_release`, as v0.7.1 did.
+/// `version --verbose` states the capability by this same constant, so that what a packer reads
+/// from a past binary is what `command_start` does.
+const multiversion_start = @import("nerva_options").multiversion_start;
+
+/// The runtime maximum log level: `.info`, or `.debug` with `--log-debug`.
+pub var log_level_runtime: std.log.Level = .info;
+
+pub fn log_runtime(
+    comptime message_level: std.log.Level,
+    comptime scope: @Type(.enum_literal),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    // The first reason an export or an import logs goes into the failure that follows.
+    if (message_level == .err and (scope == .import_ or scope == .export_)) {
+        diagnostic.note(format, args);
+    }
+    if (@intFromEnum(message_level) <= @intFromEnum(log_level_runtime)) {
+        stdx.log_with_timestamp(message_level, scope, format, args);
+    }
+}
+
+/// Removes the `start --trace` file before the default panic handler runs (P208).
+pub const panic = std.debug.FullPanic(diagnostic.panic);
+
+pub const std_options: std.Options = .{
+    // Messages are filtered at runtime by `log_level_runtime`.
+    .log_level = .debug,
+    .logFn = log_runtime,
+};
+
+pub fn main() void {
+    run() catch |err| diagnostic.fail_error(err);
+}
+
+fn log_level_set(log_debug: bool) void {
+    log_level_runtime = if (log_debug) .debug else .info;
+    diagnostic.debug = log_debug;
+}
+
+fn run() !void {
+    var allocator: std.heap.GeneralPurposeAllocator(.{}) = .init;
+    allocator.backing_allocator = stdx.huge_page_allocator;
+    const gpa = allocator.allocator();
+    defer switch (allocator.deinit()) {
+        .ok => {},
+        .leak => @panic("memory leaked"),
+    };
+
+    var flags = stdx.Flags.init(gpa);
+    defer flags.deinit(gpa);
+
+    const command = cli.parse_args(&flags);
+    diagnostic.command = @tagName(command);
+    switch (command) {
+        .version => |args| {
+            // Built whole, then written once: a reader that stops early (`| head -n1`) closes the
+            // pipe, which is its answer and not a bug (#420).
+            var text = std.ArrayList(u8).init(gpa);
+            defer text.deinit();
+            try version_write(text.writer(), args.verbose);
+            std.io.getStdOut().writeAll(text.items) catch |err| switch (err) {
+                error.BrokenPipe => {},
+                else => return err,
+            };
+            return;
+        },
+        .view => |*args| {
+            log_level_set(args.log_debug);
+            try command_view(gpa, args);
+        },
+        .api => |*args| {
+            log_level_set(args.log_debug);
+            try command_api(gpa, args);
+        },
+        .@"export" => |*args| {
+            log_level_set(args.log_debug);
+            command_export("export", gpa, args) catch |err| {
+                std.fs.cwd().deleteFile(args.output) catch {};
+                export_failed("export", args.output, err);
+            };
+        },
+        .backup => |*args| {
+            log_level_set(args.log_debug);
+            command_backup(gpa, args);
+        },
+        .import => |*args| {
+            log_level_set(args.log_debug);
+            import_run("import", gpa, args, null);
+        },
+        .restore => |*args| {
+            log_level_set(args.import.log_debug);
+            import_run("restore", gpa, &args.import, args.manifest);
+        },
+        .recover => |*args| {
+            log_level_runtime = if (args.log_debug) .debug else .info;
+            recover.run(gpa, .{
+                .cluster = args.cluster,
+                .replica = args.replica,
+                .replica_count = args.replica_count,
+                .addresses = args.addresses.slice(),
+                .origin = args.origin,
+                .development = args.development,
+                .path = args.path,
+            });
+        },
+        inline .format, .start => |*args, tag| {
+            log_level_set(args.log_debug);
+
+            // Operator input never reaches a vendored panic: check the kernel, and for `start`
+            // the data file, before the vendored open (R5, P149).
+            preflight.kernel_check();
+            // A build that lets a resent key commit again is a test's (R1): nothing opens
+            // without `--development`, and the warning comes before the data file is opened.
+            if (tag == .start and !commit_keys_deduplicate) {
+                if (!args.development) diagnostic.fail(
+                    "NRV-E0717",
+                    "start: this build has commit-key deduplication off " ++
+                        "(-Dtest-commit-keys=off); it runs only with --development",
+                    .{},
+                    "start a release build, or pass --development in a test",
+                    .{},
+                );
+                log.warn("NRV-W0701 start: commit-key deduplication is off: " ++
+                    "a resent key commits again", .{});
+            }
+            // Initialise IO before creating any file, so a failure leaves nothing behind.
+            var io = try IO.init(if (tag == .format) 2048 else 128, 0);
+            defer io.deinit();
+
+            // `start` runs every release its binary bundles (R6, P259): found before the data
+            // file is checked, since the file's release is judged against them.
+            // `MultiversionOS` borrows the binary's path and reads it for as long as it runs (it
+            // polls the binary, and re-executes it), so the path is freed only after it (#477).
+            var exe_path: ?[:0]const u8 = null;
+            defer if (exe_path) |path| gpa.free(path);
+            var multiversion_os: MultiversionOS = undefined;
+            var multiversion_bundled = false;
+            var multiversion: Multiversion = Multiversion.single_release(config.process.release);
+            if (tag == .start) {
+                if (multiversion_start) {
+                    exe_path = mv.self_exe_path(gpa) catch
+                        bundle_unreadable("its path is unknown");
+                    multiversion_bundled =
+                        bundle_open(gpa, &io, &multiversion_os, exe_path.?, args.path);
+                    if (multiversion_bundled) multiversion = multiversion_os.multiversion();
+                }
+                const releases_run = multiversion.releases_bundled();
+                preflight.start(gpa, args.path, if (!constants.direct_io)
+                    .disabled
+                else if (args.development)
+                    .optional
+                else
+                    .required, releases_run.slice());
+            }
+            defer if (multiversion_bundled) multiversion_os.deinit(gpa);
+
+            var time_os: stdx.TimeOS = .{};
+            const time = time_os.interface();
+
+            // `start --trace` writes spans to a file; `start --statsd` sends metrics over UDP.
+            // Never an existing file: a path given by mistake (the data file's, say) would be
+            // truncated (#29).
+            const trace_file: ?std.fs.File = if (tag == .start and args.trace != null)
+                std.fs.cwd().createFile(args.trace.?, .{ .exclusive = true }) catch |err|
+                    switch (err) {
+                        error.PathAlreadyExists => diagnostic.fail(
+                            "NRV-E0004",
+                            "start: --trace {s} exists",
+                            .{args.trace.?},
+                            "give a new path: nerva never overwrites a file",
+                            .{},
+                        ),
+                        else => diagnostic.fail_file(args.trace.?, err),
+                    }
+            else
+                null;
+            defer if (trace_file) |file| file.close();
+            // Every coded exit from here on (through `diagnostic`) removes the file, or the next
+            // start is refused with NRV-E0004 on it (#197). So does a panic (`panic` above) and
+            // SIGINT or SIGTERM (P208). Not removed: vendored `vsr.fatal` exits (NRV-E0707, say;
+            // #206). `command_start` clears this once `replica.open` has returned.
+            if (trace_file) |file| diagnostic.cleanup_register(args.trace.?, file);
+            var trace_file_writer: ?std.fs.File.Writer =
+                if (trace_file) |file| file.writer() else null;
+            // Buffered, bounded, and never failing: a trace write error must not panic the
+            // replica (#30).
+            var trace_writer: ?TraceFile = if (trace_file_writer) |*writer|
+                .init(writer.any(), if (tag == .start) args.trace_size_max else unreachable)
+            else
+                null;
+            defer if (trace_writer) |*writer| writer.flush();
+
+            var tracer = Tracer.init(gpa, time, .unknown, if (tag == .start) .{
+                .writer = if (trace_writer) |*writer| writer.writer() else null,
+                .statsd_options = if (args.statsd) |address|
+                    .{ .udp = .{ .io = &io, .address = address } }
+                else
+                    .log,
+            } else .{}) catch |err| {
+                // Only the statsd socket can fail here besides memory: the operator's `--statsd`
+                // names an address family this host has no socket for (#181, #184). A route that
+                // is missing, or a broadcast address, no longer fails: the tracer's packets to it
+                // are dropped with NRV-W0733 (#198, P427).
+                switch (err) {
+                    error.OutOfMemory => return err,
+                    else => if (tag == .start and args.statsd != null) diagnostic.fail(
+                        "NRV-E0010",
+                        "start: cannot send statsd to {}: {s}",
+                        .{ args.statsd.?.to_std(), metrics.init_reason(err) },
+                        "give --statsd an address this host can send UDP to, or leave it out",
+                        .{},
+                    ) else return err,
+                }
+            };
+            defer tracer.deinit(gpa);
+
+            var storage = Storage.init(&io, &tracer, .{
+                .path = args.path,
+                .size_min = data_file_size_min,
+                .purpose = if (tag == .format) .format else .open,
+                .direct_io = if (!constants.direct_io)
+                    .direct_io_disabled
+                else if (args.development)
+                    .direct_io_optional
+                else
+                    .direct_io_required,
+            }) catch |err| switch (err) {
+                error.PathAlreadyExists => diagnostic.fail(
+                    "NRV-E0005",
+                    "format: {s} exists",
+                    .{args.path},
+                    "give a new path, or remove the old file if it is really unwanted",
+                    .{},
+                ),
+                else => return err,
+            };
+            defer storage.deinit();
+
+            switch (tag) {
+                .format => try command_format(gpa, &storage, args),
+                .start => try command_start(
+                    gpa,
+                    &io,
+                    time,
+                    &tracer,
+                    &storage,
+                    args,
+                    multiversion,
+                    if (multiversion_bundled) &multiversion_os else null,
+                ),
+                .version, .view, .api, .@"export", .backup, .import, .restore, .recover => comptime unreachable,
+            }
+        },
+    }
+}
+
+fn command_format(
+    gpa: std.mem.Allocator,
+    storage: *Storage,
+    args: *const cli.Command.Format,
+) !void {
+    try vsr.format(Storage, gpa, storage, .{
+        .cluster = args.cluster,
+        .replica = args.replica,
+        .replica_count = args.replica_count,
+        .release = config.process.release,
+        .view = null,
+    });
+    log.info("{}: formatted: cluster={} replica_count={}", .{
+        args.replica,
+        args.cluster,
+        args.replica_count,
+    });
+}
+
+/// The first reason an export or import logged, for a failure's headline.
+fn refusal_reason() []const u8 {
+    const buffer = struct {
+        var bytes: [768]u8 = undefined;
+    };
+    return diagnostic.reason_take(&buffer.bytes) orelse "see the log above";
+}
+
+/// Exits with the code for an export that failed; `output` is the file it was writing.
+fn export_failed(comptime command: []const u8, output: []const u8, err: anyerror) noreturn {
+    switch (err) {
+        error.Timeout => diagnostic.fail(
+            "NRV-E0801",
+            command ++ ": no reply from the cluster",
+            .{},
+            "check --cluster and --addresses, and that a quorum of replicas is running",
+            .{},
+        ),
+        error.AsOfAhead => diagnostic.fail(
+            "NRV-E0802",
+            command ++ ": --as-of is past the cluster's latest op",
+            .{},
+            "give --as-of=latest or an op the cluster has reached",
+            .{},
+        ),
+        error.TooManyTables => diagnostic.fail(
+            "NRV-E0803",
+            command ++ ": more than {} tables hold rows; an export checks at most that many",
+            .{export_file.tables_max},
+            "keep fewer tables with rows, then export again",
+            .{},
+        ),
+        error.TooManyCatalogRows, error.ViewRefused => diagnostic.fail(
+            "NRV-E0803",
+            command ++ ": `nerva import` would refuse this export: {s}",
+            .{refusal_reason()},
+            "fix what the log names, then export again",
+            .{},
+        ),
+        error.RecordsAppeared => diagnostic.fail(
+            "NRV-E0803",
+            command ++ ": records or an index appeared during the export",
+            .{},
+            "export again",
+            .{},
+        ),
+        else => diagnostic.fail_file(output, err),
+    }
+}
+
+/// `import` and `restore`: creates the data file at `args.path` from an export. With a manifest
+/// (`restore`) the manifest is read first and the export is compared with it before any file
+/// exists (R5, P149).
+fn import_run(
+    comptime command: []const u8,
+    gpa: std.mem.Allocator,
+    args: *const cli.Command.Import,
+    manifest_path: ?[]const u8,
+) void {
+    preflight.kernel_check();
+    // Before reading the export, which may be large: the data file must be new. The
+    // import writes `<path>.importing` and links it to `<path>` once its checks pass,
+    // so a failed or killed import never leaves a file a replica would start from (#78).
+    if (std.fs.cwd().access(args.path, .{})) {
+        diagnostic.fail(
+            "NRV-E0004",
+            command ++ ": {s} exists",
+            .{args.path},
+            "give a new path: nerva never overwrites a data file",
+            .{},
+        );
+    } else |_| {}
+    var path_importing_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path_importing = std.fmt.bufPrint(
+        &path_importing_buffer,
+        "{s}.importing",
+        .{args.path},
+    ) catch diagnostic.fail_file(args.path, error.NameTooLong);
+    if (std.fs.cwd().access(path_importing, .{})) {
+        diagnostic.fail(
+            "NRV-E0806",
+            command ++ ": {s} is left from an import that did not finish",
+            .{path_importing},
+            "remove {s}, then {s} again",
+            .{ path_importing, command },
+        );
+    } else |_| {}
+    // The manifest first: a backup is compared with a record it did not carry.
+    var manifest: backup.Manifest = undefined;
+    if (manifest_path) |path| manifest_read(command, path, &manifest);
+    // Pass 1, before the data file exists: the whole export is checked.
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const plan = import_.plan(arena.allocator(), args.input) catch |err|
+        import_failed(command, args.input, args.path, err);
+    if (commit_keys_deduplicate and plan.flags & export_file.flag_keys_off != 0) {
+        diagnostic.fail(
+            "NRV-E0812",
+            command ++ ": {s}: the export came from a test build with commit-key " ++
+                "deduplication off, which a release build does not import",
+            .{args.input},
+            "import it with the same test build (-Dtest-commit-keys=off)",
+            .{},
+        );
+    }
+    if (manifest_path) |path| manifest_compare(command, args, path, &manifest, &plan);
+    // Pass 2. A failure removes the data file only if this invocation created it: the
+    // exclusive create can lose to another import of the same path, whose file it is (P489).
+    var created = false;
+    command_import(gpa, args, &created, path_importing, &plan) catch |err| {
+        staging_remove(created, path_importing);
+        // `Storage.init` can fail after its create (the allocation: no space), and then
+        // `created` is still false: the file may be this one's and is left (P489).
+        if (!created and err != error.PathAlreadyExists) {
+            log.warn("{s} may be left behind by this failed {s}; remove it if no import of " ++
+                "this path is running, or the next {s} stops at it", .{
+                path_importing, command, command,
+            });
+        }
+        import_failed(command, args.input, path_importing, err);
+    };
+    // Every write is on disk: the data file is complete, and takes its name.
+    const cwd = std.posix.AT.FDCWD;
+    std.posix.linkat(cwd, path_importing, cwd, args.path, 0) catch |err| {
+        std.fs.cwd().deleteFile(path_importing) catch {};
+        switch (err) {
+            // Something took `args.path` after this one's check above: another import that
+            // finished first, or a file of any other kind. This one's staging file is gone.
+            error.PathAlreadyExists => diagnostic.fail(
+                "NRV-E0004",
+                command ++ ": {s} appeared while this {s} ran",
+                .{ args.path, command },
+                "give a new path: nerva never overwrites a data file; nothing was named {s}",
+                .{args.path},
+            ),
+            else => diagnostic.fail_file(args.path, err),
+        }
+    };
+    std.fs.cwd().deleteFile(path_importing) catch |err| {
+        diagnostic.fail_file(path_importing, err);
+    };
+    directory_sync(args.path) catch |err| {
+        diagnostic.fail_file(args.path, err);
+    };
+    if (manifest_path != null) {
+        var counts_buffer: [64]u8 = undefined;
+        std.io.getStdOut().writer().print(
+            "restored replica {} from backup {} at op {}: {s} match the manifest\n",
+            .{
+                args.replica,
+                std.fmt.fmtSliceHexLower(&plan.origin),
+                plan.summary.as_of,
+                backup.counts_text(&counts_buffer, &manifest),
+            },
+        ) catch {};
+    }
+}
+
+/// Reads and parses the manifest at `path`; exits with NRV-E0808 if it is not one.
+fn manifest_read(comptime command: []const u8, path: []const u8, manifest: *backup.Manifest) void {
+    const fix = "give the .manifest.json that nerva backup wrote beside the backup";
+    const file = std.fs.cwd().openFile(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => diagnostic.fail(
+            "NRV-E0808",
+            command ++ ": {s}: the manifest does not exist",
+            .{path},
+            fix,
+            .{},
+        ),
+        else => diagnostic.fail_file(path, err),
+    };
+    defer file.close();
+    // One byte more than the bound, to tell a manifest at the bound from one past it.
+    var buffer: [backup.manifest_size_max + 1]u8 = undefined;
+    const size = file.readAll(&buffer) catch |err| diagnostic.fail_file(path, err);
+    backup.parse(buffer[0..size], manifest) catch |err| diagnostic.fail(
+        "NRV-E0808",
+        command ++ ": {s}: {s}",
+        .{ path, switch (err) {
+            error.Malformed => "it is not a manifest this release writes",
+            error.TooLarge => "it is larger than a manifest can be",
+            error.UnknownVersion => "its version is not one this release reads",
+        } },
+        fix,
+        .{},
+    );
+}
+
+/// Exits with NRV-E0809 unless the verified export (`plan`) is the one `manifest` describes.
+fn manifest_compare(
+    comptime command: []const u8,
+    args: *const cli.Command.Import,
+    manifest_path: []const u8,
+    manifest: *const backup.Manifest,
+    plan: *const import_.Plan,
+) void {
+    const stat = std.fs.cwd().statFile(args.input) catch |err|
+        diagnostic.fail_file(args.input, err);
+    const actual = backup.from_plan(plan, manifest.release_slice(), manifest.cluster, stat.size);
+    var difference_buffer: [512]u8 = undefined;
+    const difference = backup.first_difference(&difference_buffer, manifest, &actual) orelse
+        return;
+    diagnostic.fail(
+        "NRV-E0809",
+        command ++ ": {s} does not match {s}: {s}",
+        .{ args.input, manifest_path, difference },
+        "use the backup the manifest names, or another backup with its own manifest",
+        .{},
+    );
+}
+
+/// `nerva backup`: an export, read back as `import` reads it, and its manifest beside it.
+fn command_backup(gpa: std.mem.Allocator, args: *const cli.Command.Backup) void {
+    var manifest_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const manifest_path = std.fmt.bufPrint(
+        &manifest_path_buffer,
+        "{s}" ++ backup.manifest_suffix,
+        .{args.output},
+    ) catch diagnostic.fail_file(args.output, error.NameTooLong);
+    // Neither file is ever overwritten; the manifest is checked first so that no backup is
+    // made that could not be completed.
+    if (std.fs.cwd().access(manifest_path, .{})) {
+        manifest_exists(manifest_path);
+    } else |_| {}
+
+    command_export("backup", gpa, args) catch |err| {
+        std.fs.cwd().deleteFile(args.output) catch {};
+        export_failed("backup", args.output, err);
+    };
+    // A backup that `restore` would refuse is refused now.
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const plan = import_.plan(arena.allocator(), args.output) catch |err| {
+        std.fs.cwd().deleteFile(args.output) catch {};
+        backup_unreadable(args.output, err);
+    };
+    const size = (std.fs.cwd().statFile(args.output) catch |err| {
+        std.fs.cwd().deleteFile(args.output) catch {};
+        diagnostic.fail_file(args.output, err);
+    }).size;
+    const release = config.process.release.triple();
+    var release_buffer: [backup.release_size_max]u8 = undefined;
+    const release_text = std.fmt.bufPrint(&release_buffer, "{}.{}.{}", .{
+        release.major,
+        release.minor,
+        release.patch,
+    }) catch unreachable; // Three u16 and two dots fit.
+    const manifest = backup.from_plan(&plan, release_text, args.cluster, size);
+    var buffer: [backup.manifest_size_max]u8 = undefined;
+    const bytes = backup.render(&manifest, &buffer);
+
+    const file = std.fs.cwd().createFile(manifest_path, .{ .exclusive = true }) catch |err| {
+        std.fs.cwd().deleteFile(args.output) catch {};
+        if (err == error.PathAlreadyExists) manifest_exists(manifest_path);
+        diagnostic.fail_file(manifest_path, err);
+    };
+    manifest_write(file, bytes, args.output) catch |err| {
+        file.close();
+        std.fs.cwd().deleteFile(manifest_path) catch {};
+        std.fs.cwd().deleteFile(args.output) catch {};
+        diagnostic.fail_file(manifest_path, err);
+    };
+    file.close();
+    log.info("backup {s}: op {}, {} bytes, SHA-256 {}", .{
+        args.output,
+        plan.summary.as_of,
+        size,
+        std.fmt.fmtSliceHexLower(&plan.origin),
+    });
+    std.io.getStdOut().writer().print("backup {s}: op {}, sha256 {}\nmanifest {s}\n", .{
+        args.output,
+        plan.summary.as_of,
+        std.fmt.fmtSliceHexLower(&plan.origin),
+        manifest_path,
+    }) catch {};
+}
+
+fn manifest_exists(manifest_path: []const u8) noreturn {
+    diagnostic.fail(
+        "NRV-E0004",
+        "backup: {s} exists",
+        .{manifest_path},
+        "give a new --output: nerva never overwrites a file",
+        .{},
+    );
+}
+
+/// Writes and syncs the manifest, then makes it and the backup durable.
+fn manifest_write(file: std.fs.File, bytes: []const u8, output: []const u8) !void {
+    try file.writeAll(bytes);
+    try file.sync();
+    try directory_sync(output);
+}
+
+/// The backup just written does not read back as `import` reads it.
+fn backup_unreadable(output: []const u8, err: anyerror) noreturn {
+    switch (err) {
+        error.Corrupt => diagnostic.fail(
+            "NRV-E0804",
+            "backup: {s}: {s}",
+            .{ output, export_file.corrupt_reason },
+            "check the disk, then back up again; nothing was named {s}",
+            .{output},
+        ),
+        error.VersionUnsupported => diagnostic.fail(
+            "NRV-E0805",
+            "backup: {s}: the export's version is not one this release reads",
+            .{output},
+            "back up again; nothing was named {s}",
+            .{output},
+        ),
+        error.Refused, error.ChecksFailed => diagnostic.fail(
+            "NRV-E0803",
+            "backup: `nerva import` would refuse this export: {s}",
+            .{refusal_reason()},
+            "fix what the log names, then back up again; nothing was named {s}",
+            .{output},
+        ),
+        else => diagnostic.fail_file(output, err),
+    }
+}
+
+/// Exits with the code for an import that failed in `plan` or while restoring.
+fn import_failed(
+    comptime command: []const u8,
+    input: []const u8,
+    output: []const u8,
+    err: anyerror,
+) noreturn {
+    switch (err) {
+        error.Corrupt => diagnostic.fail(
+            "NRV-E0804",
+            command ++ ": {s}: {s}",
+            .{ input, export_file.corrupt_reason },
+            "use an intact export, or export again",
+            .{},
+        ),
+        error.VersionUnsupported => diagnostic.fail(
+            "NRV-E0805",
+            command ++ ": {s}: the export's version is not one this release reads",
+            .{input},
+            "import it with a release that reads it, or export again with this one",
+            .{},
+        ),
+        error.Refused, error.ChecksFailed => diagnostic.fail(
+            "NRV-E0807",
+            command ++ ": the export was refused: {s}",
+            .{refusal_reason()},
+            "read the log lines above; nothing was named {s}",
+            .{output},
+        ),
+        // Another import or restore of the same path created `output` first. It is that
+        // process's file: this one touched nothing (P489).
+        error.PathAlreadyExists => diagnostic.fail(
+            "NRV-E0814",
+            command ++ ": another import or restore is writing {s}",
+            .{output},
+            "let it finish, or remove {s} if no import or restore is running, then {s} " ++
+                "again; nothing of this one was written",
+            .{ output, command },
+        ),
+        error.FileNotFound,
+        error.AccessDenied,
+        error.PermissionDenied,
+        error.IsDir,
+        => diagnostic.fail_file(input, err),
+        else => diagnostic.fail_file(output, err),
+    }
+}
+
+/// Makes a new directory entry durable: the directory holding `path` is synced.
+fn directory_sync(path: []const u8) !void {
+    // Read-only, not `openDir`'s default `O_PATH`, which `fsync` refuses.
+    const fd = try std.posix.open(std.fs.path.dirname(path) orelse ".", .{ .DIRECTORY = true }, 0);
+    defer std.posix.close(fd);
+    try std.posix.fsync(fd);
+}
+
+/// Removes the data file a failed pass 2 leaves, if this invocation created it (P489).
+fn staging_remove(created: bool, path: []const u8) void {
+    if (created) std.fs.cwd().deleteFile(path) catch {};
+}
+
+/// Formats the data file at `path`, then restores the export into it (N80). `created` is set
+/// once this call has created the file, the exclusive create having won, and only then is the
+/// file this call's to remove. A create that lost (`error.PathAlreadyExists`) touches nothing.
+fn command_import(
+    gpa: std.mem.Allocator,
+    args: *const cli.Command.Import,
+    created: *bool,
+    path: []const u8,
+    plan: *const import_.Plan,
+) !void {
+    var io = try IO.init(2048, 0);
+    defer io.deinit();
+    var time_os: stdx.TimeOS = .{};
+    const time = time_os.interface();
+    var tracer = try Tracer.init(gpa, time, .unknown, .{});
+    defer tracer.deinit(gpa);
+
+    var storage = try Storage.init(&io, &tracer, .{
+        .path = path,
+        .size_min = data_file_size_min,
+        .purpose = .format,
+        .direct_io = if (!constants.direct_io)
+            .direct_io_disabled
+        else if (args.development)
+            .direct_io_optional
+        else
+            .direct_io_required,
+    });
+    defer storage.deinit();
+    created.* = true;
+
+    try vsr.format(Storage, gpa, &storage, .{
+        .cluster = args.cluster,
+        .replica = args.replica,
+        .replica_count = args.replica_count,
+        .release = config.process.release,
+        .view = null,
+        .origin = plan.origin,
+    });
+    try import_.ImporterType(Storage).run(gpa, time, &tracer, &storage, .{
+        .cluster = args.cluster,
+        .release = config.process.release,
+        .input = args.input,
+    }, plan);
+    // Import cannot see the cluster, so it says what it needs (P90): a replica imported alone
+    // into a cluster that ran on has forgotten the prepares the replica it replaces acknowledged.
+    log.warn("{}: start this replica only with every replica imported from {s}, before the " ++
+        "cluster runs; to replace a replica of a running cluster, export it again and import " ++
+        "every replica", .{ args.replica, args.input });
+    log.info("{}: imported {s}: cluster={} replica_count={} op={} export={s}", .{
+        args.replica,
+        args.input,
+        args.cluster,
+        args.replica_count,
+        plan.summary.as_of,
+        release_peers.origin_name(&plan.origin),
+    });
+}
+
+/// Writes the export to a new file; a failure leaves the caller to remove it (N80).
+fn command_export(
+    comptime command: []const u8,
+    gpa: std.mem.Allocator,
+    args: *const cli.Command.Export,
+) !void {
+    // Never an existing file: a path given by mistake would be truncated.
+    const file = std.fs.cwd().createFile(args.output, .{ .exclusive = true }) catch |err|
+        switch (err) {
+            error.PathAlreadyExists => diagnostic.fail(
+                "NRV-E0004",
+                command ++ ": {s} exists",
+                .{args.output},
+                "give a new path: nerva never overwrites a file",
+                .{},
+            ),
+            else => diagnostic.fail_file(args.output, err),
+        };
+    defer file.close();
+
+    var client: Client = undefined;
+    try client.init(gpa, .{
+        .cluster = args.cluster,
+        .addresses = args.addresses.slice(),
+        .timeout = stdx.Duration.seconds(30),
+    });
+    defer client.deinit();
+
+    var buffered = std.io.bufferedWriter(file.writer());
+    // Version 1 unless the cluster holds records or indexes (P123b), so that the release
+    // before can import it.
+    var writer = try export_file.WriterType(@TypeOf(buffered).Writer).init(
+        buffered.writer(),
+        try export_.format_version(&client),
+        // P426: a keys-off build says so, a release build writes 0.
+        if (commit_keys_deduplicate) 0 else export_file.flag_keys_off,
+    );
+    const summary = try export_.run(gpa, &client, &writer, args.as_of);
+    try buffered.flush();
+    try file.sync();
+    log.info("exported to {s}: op {}, {} changes, {} views, {} ledgers, {} tables, " ++
+        "export {s}", .{
+        args.output,
+        summary.as_of,
+        summary.change_count,
+        summary.view_count,
+        summary.ledger_count,
+        summary.table_count,
+        release_peers.origin_name(&writer.digest),
+    });
+}
+
+fn command_start(
+    base_allocator: std.mem.Allocator,
+    io: *IO,
+    time: stdx.Time,
+    tracer: *Tracer,
+    storage: *Storage,
+    args: *const cli.Command.Start,
+    multiversion: Multiversion,
+    multiversion_os: ?*MultiversionOS,
+) !void {
+    const peer_keys = cluster_keys(args);
+
+    var counting_allocator = vsr.CountingAllocator.init(base_allocator);
+    const gpa = counting_allocator.allocator();
+
+    var message_pool = try MessagePool.init(gpa, .{ .replica = .{
+        .members_count = args.addresses.members_count(),
+        .pipeline_requests_limit = args.pipeline_requests_limit,
+        .message_bus = .tcp,
+    } });
+    defer message_pool.deinit(gpa);
+
+    var replica: Replica = undefined;
+    replica.open(gpa, time, storage, &message_pool, .{
+        .node_count = args.addresses.members_count(),
+        .release = config.process.release,
+        .release_client_min = config.process.release_client_min,
+        .multiversion = multiversion,
+        // Peers of a release this binary cannot run are ignored (N61, P259).
+        .release_peers_strict = true,
+        // Replicas prove to each other that they hold the cluster key (P102).
+        .peer_keys = peer_keys,
+        .pipeline_requests_limit = args.pipeline_requests_limit,
+        .storage_size_limit = args.storage_size_limit,
+        .aof = null,
+        .aof_recovery = false,
+        .random_nonce = stdx.crypto_u128(),
+        .timeout_prepare_ticks = null,
+        .timeout_grid_repair_message_ticks = null,
+        .commit_stall_probability = args.commit_stall_probability,
+        .commit_stall_lag_min = null,
+        .commit_stall_lag_max = null,
+        .commit_stall_multiple_max = null,
+        .state_machine_options = .{
+            .batch_size_limit = args.request_size_limit - @sizeOf(vsr.Header),
+            .lsm_forest_compaction_block_count = args.lsm_forest_compaction_block_count,
+            .lsm_forest_node_count = args.lsm_forest_node_count,
+            .cache_entries_rows = args.cache_rows_count,
+            .commit_keys_deduplicate = commit_keys_deduplicate,
+        },
+        .message_bus_options = .{
+            .configuration = args.addresses.slice(),
+            .io = io,
+            .trace = tracer,
+            .time = time,
+            .clients_limit = constants.pipeline_prepare_queue_max + args.pipeline_requests_limit,
+        },
+        .grid_cache_blocks_count = args.cache_grid_blocks,
+        .tracer = tracer,
+    }) catch |err| switch (err) {
+        error.NoAddress => diagnostic.fail(
+            "NRV-E0710",
+            "start: all --addresses must be provided",
+            .{},
+            "give every replica's address, in replica order",
+            .{},
+        ),
+        else => |e| return e,
+    };
+
+    // Poll the binary on disk for a newer bundle, as upstream does after opening.
+    if (builtin.target.os.tag == .linux) {
+        if (multiversion_os) |os| os.timeout_start(replica.replica);
+    }
+
+    // Startup succeeded: the trace file is the operator's now, whatever happens later.
+    diagnostic.cleanup_clear();
+
+    log.info("{}: allocated {}MiB during replica init", .{
+        replica.replica,
+        @divFloor(counting_allocator.live_size(), MiB),
+    });
+    log.info("{}: cluster={}: listening on {}; data file from export {s}", .{
+        replica.replica,
+        replica.cluster,
+        replica.message_bus.accept_address.?,
+        release_peers.origin_name(&replica.superblock.working.vsr_state.origin),
+    });
+
+    // `--addresses=0`: the OS picks a free port, which is printed (alone) to stdout so a parent
+    // process can learn it, and the replica exits when its stdin closes. For tests.
+    if (args.addresses.zero) {
+        const stdout = std.io.getStdOut();
+        try stdout.writer().print("{}\n", .{replica.message_bus.accept_address.?.port});
+        stdout.close();
+
+        const watchdog = try std.Thread.spawn(.{}, struct {
+            fn thread_main() void {
+                var buffer: [1]u8 = .{0};
+                _ = std.io.getStdIn().read(&buffer) catch {};
+                log.info("stdin closed, exiting", .{});
+                std.process.exit(0);
+            }
+        }.thread_main, .{});
+        watchdog.detach();
+    }
+
+    if (config.process.release.testing() and replica.cluster != 0) {
+        // Guard against running test binaries against production clusters.
+        @panic("This is a test binary, but the cluster id is non-zero.");
+    }
+
+    var gauge_ticks: u64 = 0;
+    while (true) {
+        replica.tick();
+        // The release this replica runs and the highest it offers, once a second.
+        if (gauge_ticks % (std.time.ms_per_s / constants.tick_ms) == 0) {
+            tracer.gauge(.replica_release, replica.release.value);
+            // Read each time: replacing the binary on disk changes what a bundled replica
+            // offers. An unbundled one polls nothing and keeps offering its own release (P415d).
+            tracer.gauge(.replica_releases_offered, releases_offered(multiversion));
+        }
+        gauge_ticks +%= 1;
+        try io.run_for_ns(constants.tick_ms * std.time.ns_per_ms);
+    }
+}
+
+/// The highest release `multiversion` offers: the gauge `replica_releases_offered`, which says
+/// when every replica carries the next release (not how many releases it bundles).
+fn releases_offered(multiversion: Multiversion) u32 {
+    return multiversion.releases_bundled().last().value;
+}
+
+/// Opens the release bundle of this binary into `multiversion_os`: true when it has one. An
+/// unbundled binary (a build, or the first release) runs only itself. A bundle that cannot be
+/// read is refused (NRV-E0719), and so is a binary that cannot be read at all (NRV-E0726):
+/// running as one release would strand a cluster that upgrades (P415).
+fn bundle_open(
+    gpa: std.mem.Allocator,
+    io: *IO,
+    multiversion_os: *MultiversionOS,
+    /// Borrowed by `multiversion_os` for as long as it runs: the caller frees it after
+    /// `MultiversionOS.deinit`, never before.
+    exe_path: [:0]const u8,
+    data_path: []const u8,
+) bool {
+    const present = bundle_present(gpa, exe_path) catch |err| switch (err) {
+        error.BinaryTooLarge => bundle_fail("the binary is larger than a bundle-carrying binary can be"),
+        error.BundleDamaged => bundle_fail(bundle_cause(error.BundleDamaged)),
+        error.OutOfMemory => bundle_unreadable("out of memory"),
+        error.BinaryUnreadable => bundle_unreadable("the file could not be opened or read"),
+    };
+    if (!present) return false;
+
+    // Before `MultiversionOS.init`, whose `memfd` a hardened kernel seals non-executable or
+    // refuses (`vm.memfd_noexec` 1 or 2, P415c). The sysctl path is overridable in the test build only (`-Dtest-commit-keys=off`): a release
+    // binary cannot be told to skip the refusal.
+    const memfd_noexec_path = if (!commit_keys_deduplicate)
+        std.posix.getenv("NERVA_MEMFD_NOEXEC_PATH") orelse preflight.memfd_noexec_path
+    else
+        preflight.memfd_noexec_path;
+    preflight.memfd_check(data_path, memfd_noexec_path);
+
+    multiversion_os.* = MultiversionOS.init(gpa, io, exe_path, .native) catch |err|
+        bundle_fail(bundle_cause(err));
+    multiversion_os.open_sync() catch |err| bundle_fail(bundle_cause(err));
+    return true;
+}
+
+/// The words for why a bundle that exists could not be opened; never a Zig error name.
+fn bundle_cause(err: anyerror) []const u8 {
+    return switch (err) {
+        error.OutOfMemory => "out of memory",
+        error.RunningVersionNotIncluded => "it does not include the release it is running",
+        else => "its sections are damaged, inconsistent or could not be read",
+    };
+}
+
+fn bundle_fail(cause: []const u8) noreturn {
+    diagnostic.fail(
+        "NRV-E0719",
+        "start: this binary's bundle of releases cannot be read: {s}",
+        .{cause},
+        "download the release again; nothing was changed",
+        .{},
+    );
+}
+
+fn bundle_unreadable(cause: []const u8) noreturn {
+    diagnostic.fail(
+        "NRV-E0726",
+        "start: this binary cannot be read to look for its bundle of releases: {s}",
+        .{cause},
+        "check that the process may read its own executable and has file descriptors to spare, " ++
+            "then start it again; nothing was changed",
+        .{},
+    );
+}
+
+/// The largest binary `MultiversionOS` accepts for the native platform.
+const bundle_size_max = constants.multiversion_binary_platform_size_max(.{
+    .macos = builtin.target.os.tag == .macos,
+    .debug = builtin.mode == .Debug,
+});
+
+const BundleReadError = error{ BinaryTooLarge, BundleDamaged, BinaryUnreadable, OutOfMemory };
+
+/// Whether the executable at `exe_path` carries the multiversion sections. Only a binary without
+/// them is unbundled; a failure to read it says nothing, and is an error (P415). Bounded by the
+/// native platform's `multiversion_binary_platform_size_max`.
+fn bundle_present(gpa: std.mem.Allocator, exe_path: [:0]const u8) BundleReadError!bool {
+    // Only Linux switches release (P259); a Mach-O binary has no ELF sections to read.
+    if (builtin.target.os.tag != .linux) return false;
+    const file = std.fs.openFileAbsolute(exe_path, .{}) catch return error.BinaryUnreadable;
+    defer file.close();
+    const size = file.getEndPos() catch return error.BinaryUnreadable;
+    if (size > bundle_size_max) return error.BinaryTooLarge;
+    const buffer = gpa.alignedAlloc(u8, @alignOf(std.elf.Elf64_Ehdr), size) catch
+        return error.OutOfMemory;
+    defer gpa.free(buffer);
+    const read = file.readAll(buffer) catch return error.BinaryUnreadable;
+    if (read != size) return error.BinaryUnreadable;
+    _ = mv.parse_elf(buffer) catch |err| switch (err) {
+        // Unbundled only when nothing of a bundle is left: `version` says the same (P417).
+        error.MultiversionHeaderOrBodyNotFound => {
+            if (bundle.damaged_when_unbundled(buffer)) return error.BundleDamaged;
+            return false;
+        },
+        // Present but unreadable: open_sync reports it.
+        else => return true,
+    };
+    return true;
+}
+
+/// The cluster keys replicas authenticate each other with (P102), from `NERVA_CLUSTER_KEY` and
+/// `NERVA_CLUSTER_KEY_NEXT`. Exits, naming the variable and never a key, when they cannot be used.
+fn cluster_keys(args: *const cli.Command.Start) peer_auth.Keys {
+    const resolved = peer_auth.keys_resolve(
+        std.posix.getenv("NERVA_CLUSTER_KEY"),
+        std.posix.getenv("NERVA_CLUSTER_KEY_NEXT"),
+        args.development,
+        args.addresses.slice(),
+    );
+    return switch (resolved) {
+        .keys => |keys| keys,
+        .development => keys: {
+            log.warn("NERVA_CLUSTER_KEY is unset: replicas authenticate each other with the " ++
+                "public development key (--development, loopback addresses only)", .{});
+            break :keys .{ .current = peer_auth.development_key };
+        },
+        .refused => |reason| diagnostic.fail(
+            "NRV-E0901",
+            "start: {s}",
+            .{reason},
+            "set NERVA_CLUSTER_KEY (and NERVA_CLUSTER_KEY_NEXT during a rotation) as the message says",
+            .{},
+        ),
+    };
+}
+
+/// `--listen-remote` on an address that is not loopback: once, before listening (NRV-W0010;
+/// README, "Network"). On a loopback address nothing crosses the network, so nothing is said.
+fn listen_remote_warn(comptime command: []const u8, args: anytype) void {
+    if (!args.listen_remote or cli.listen_is_loopback(args.listen)) return;
+    log.warn("NRV-W0010 " ++ command ++ ": --listen-remote serves plain HTTP: the key and every " ++
+        "reply cross the network unencrypted; put TLS in front, or use a loopback address " ++
+        "beside the client", .{});
+}
+
+/// The past release this executable carries (R6 slice 3), checked as `start` will check it:
+/// null when it carries none. A damaged one, or one that cannot be read, is NRV-E0719, and
+/// `version` says so rather than naming a release it could not run. Only a binary that is not
+/// an ELF executable (the Mac builds) bundles nothing without being read; once its magic is
+/// ELF, any failure to read the rest is not an answer to "does it bundle?". The one buffer
+/// lives as long as the process.
+fn bundle_of_self() ?bundle.Bundle {
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fs.selfExePath(&path_buffer) catch return bundle_damaged();
+    const file = std.fs.openFileAbsolute(path, .{}) catch return bundle_damaged();
+    defer file.close();
+    var magic: [4]u8 = undefined;
+    const magic_read = file.readAll(&magic) catch return bundle_damaged();
+    if (magic_read != magic.len or !std.mem.eql(u8, &magic, std.elf.MAGIC)) return null;
+    file.seekTo(0) catch return bundle_damaged();
+    const size = file.getEndPos() catch return bundle_damaged();
+    if (size > constants.multiversion_binary_size_max) return bundle_damaged();
+    const bytes = std.heap.page_allocator.alignedAlloc(u8, 8, size) catch return bundle_damaged();
+    if ((file.readAll(bytes) catch return bundle_damaged()) != size) return bundle_damaged();
+    return bundle.verify(bytes) catch bundle_damaged();
+}
+
+fn bundle_damaged() noreturn {
+    diagnostic.fail(
+        "NRV-E0719",
+        "version: this binary's bundled release is damaged or cannot be read",
+        .{},
+        "download the release again and check it against SHA256SUMS",
+        .{},
+    );
+}
+
+/// `nerva version`: the first line is the one the release workflow and scripts read; the rest
+/// say what an upgrade needs to compare (R6, P259b). `bundles` names the past release this
+/// binary can also run, `none` when it carries none. `--verbose` adds what the digest is made of
+/// and the commit.
+fn version_write(writer: anytype, verbose: bool) !void {
+    const release = config.process.release.triple();
+    const release_client_min = config.process.release_client_min.triple();
+    try writer.print("Nerva version {}{s}\n", .{
+        constants.semver,
+        if (commit_keys_deduplicate) "" else "+keys-off",
+    });
+    try writer.print("release {}.{}.{}\n", .{ release.major, release.minor, release.patch });
+    try writer.print("release_client_min {}.{}.{}\n", .{
+        release_client_min.major,
+        release_client_min.minor,
+        release_client_min.patch,
+    });
+    try writer.print("format {s}\n", .{format_digest.hex(&format_digest.format_digest)});
+    try bundle.bundles_text(writer, bundle_of_self());
+    // The release a person downloaded, from `VERSION` (v0.7.1, P284); not in the format digest.
+    try writer.print("version {s}\n", .{release_version});
+    if (!verbose) return;
+    try writer.print("format_epoch {}\n", .{format_digest.format_epoch});
+    try writer.print("superblock_version {}\n", .{format_digest.build_inputs.superblock});
+    if (config.process.git_commit) |commit| {
+        try writer.print("commit {s}\n", .{commit});
+    } else {
+        try writer.writeAll("commit none\n");
+    }
+    // Last, so that the lines before it keep their places. release.yml refuses a binary without
+    // `commit_keys deduplicate` (#271): the test build `-Dtest-commit-keys=off` is never shipped.
+    try writer.print("commit_keys {s}\n", .{if (commit_keys_deduplicate) "deduplicate" else "off"});
+    // Then, last again (P490): what `bundle.refusal` reads of a past release. Absent from v0.7.1
+    // and earlier, from `test:release`'s `nerva_past_single` (`multiversion_start` false), and
+    // from non-Linux builds, whose `start` never opens a bundle (`bundle_present`).
+    if (multiversion_start and builtin.target.os.tag == .linux) {
+        try writer.print("{s}\n", .{bundle.Facts.capability_line});
+    }
+}
+
+fn command_view(gpa: std.mem.Allocator, args: *const cli.Command.View) !void {
+    const keys = gateway_keys("view");
+    listen_remote_warn("view", args);
+
+    var client: Client = undefined;
+    try client.init(gpa, .{
+        .cluster = args.cluster,
+        .addresses = args.addresses.slice(),
+        .timeout = stdx.Duration.ms(args.request_timeout_ms),
+    });
+    defer client.deinit();
+
+    try view_server.serve(gpa, &client, .{
+        .listen = args.listen,
+        .keys = keys,
+        .on_listening = on_listening,
+    });
+}
+
+fn command_api(gpa: std.mem.Allocator, args: *const cli.Command.Api) !void {
+    const keys = gateway_keys("api");
+    listen_remote_warn("api", args);
+
+    // Outside the client, which is replaced when it breaks: what the gateway reports survives it.
+    var tally: timings.Tally = .{};
+    // Before the client registers a session: a bad `--statsd` must not wait for the cluster, nor
+    // burn a session per start (P176d).
+    var emitter: ?metrics.Emitter = null;
+    if (args.statsd) |address| {
+        emitter = metrics.Emitter.open(address, args.cluster) catch |err| diagnostic.fail(
+            "NRV-E0010",
+            "api: cannot send statsd to {}: {s}",
+            .{ address.to_std(), metrics.init_reason(err) },
+            "give --statsd an address this host can send UDP to, or leave it out",
+            .{},
+        );
+    }
+    defer if (emitter) |*sender| sender.deinit();
+
+    var client: Client = undefined;
+    try client.init(gpa, .{
+        .cluster = args.cluster,
+        .addresses = args.addresses.slice(),
+        .timeout = stdx.Duration.ms(args.request_timeout_ms),
+        .tally = &tally,
+    });
+    defer client.deinit();
+
+    try api_server.serve(gpa, &client, .{
+        .listen = args.listen,
+        .keys = keys,
+        .on_listening = on_listening,
+        .emitter = if (emitter) |*sender| sender else null,
+        .tally = &tally,
+    });
+}
+
+/// `NERVA_KEY` and, during a rotation, `NERVA_KEY_NEXT` (P96). Exits if they cannot be used; the
+/// message never names a key.
+fn gateway_keys(comptime command: []const u8) http_connection.Keys {
+    const current = std.posix.getenv("NERVA_KEY") orelse "";
+    const next = std.posix.getenv("NERVA_KEY_NEXT");
+    if (http_connection.Keys.invalid(current, next)) |reason| {
+        diagnostic.fail(
+            "NRV-E0008",
+            command ++ ": {s}",
+            .{reason},
+            "set NERVA_KEY; during a rotation NERVA_KEY_NEXT differs from it",
+            .{},
+        );
+    }
+    if (next != null) log.info(command ++ ": accepting NERVA_KEY and NERVA_KEY_NEXT", .{});
+    return .{ .current = current, .next = next };
+}
+
+/// For `--listen=…:0`: print the bound port, alone, so a parent process can learn it.
+fn on_listening(address: std.net.Address) void {
+    const stdout = std.io.getStdOut().writer();
+    stdout.print("{}\n", .{address.getPort()}) catch {};
+}
+
+test "releases_offered is the highest release bundled, not how many" {
+    const Release = vsr.Release;
+    const two = struct {
+        fn releases_bundled(_: *anyopaque) mv.ReleaseList {
+            var list: mv.ReleaseList = .empty;
+            list.push(Release.from(.{ .major = 0, .minor = 7, .patch = 0 }));
+            list.push(Release.from(.{ .major = 0, .minor = 7, .patch = 1 }));
+            return list;
+        }
+        fn release_execute(_: *anyopaque, _: Release) void {}
+        fn tick(_: *anyopaque) void {}
+    };
+    const vtable: Multiversion.VTable = .{
+        .releases_bundled = two.releases_bundled,
+        .release_execute = two.release_execute,
+        .tick = two.tick,
+    };
+    const multiversion: Multiversion = .{ .context = @constCast(&{}), .vtable = &vtable };
+    try std.testing.expectEqual(
+        Release.from(.{ .major = 0, .minor = 7, .patch = 1 }).value,
+        releases_offered(multiversion),
+    );
+    try std.testing.expectEqual(@as(u16, 2), multiversion.releases_bundled().count);
+}
+
+test "bundle_present: unreadable, too large, out of memory, unbundled" {
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try tmp.dir.realpath(".", &dir_buffer);
+
+    // A path that does not exist is the cause of NRV-E0726, never "unbundled".
+    var missing_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const missing = try std.fmt.bufPrintZ(&missing_buffer, "{s}/missing", .{dir});
+    try testing.expectError(error.BinaryUnreadable, bundle_present(testing.allocator, missing));
+
+    // One byte past the bound is refused before anything is allocated; a sparse file costs no disk.
+    {
+        const file = try tmp.dir.createFile("large", .{});
+        defer file.close();
+        try file.setEndPos(bundle_size_max + 1);
+    }
+    var large_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const large = try std.fmt.bufPrintZ(&large_buffer, "{s}/large", .{dir});
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.BinaryTooLarge, bundle_present(failing.allocator(), large));
+    try testing.expectEqual(@as(usize, 0), failing.allocations);
+
+    // At the bound it is read: the allocation is reached, and its failure is out of memory.
+    {
+        const file = try tmp.dir.openFile("large", .{ .mode = .read_write });
+        defer file.close();
+        try file.setEndPos(bundle_size_max);
+    }
+    failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    try testing.expectError(error.OutOfMemory, bundle_present(failing.allocator(), large));
+
+    // This test binary has no multiversion sections.
+    try testing.expect(!(try bundle_present(testing.allocator, "/proc/self/exe")));
+}
+
+test "import: an exclusive create that loses touches nothing (P489)" {
+    if (builtin.target.os.tag != .linux) return error.SkipZigTest;
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try tmp.dir.realpath(".", &dir_buffer);
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, "{s}/d.nerva.importing", .{dir});
+
+    // The other import: it passed the same existence check, then won the exclusive create.
+    try tmp.dir.writeFile(.{ .sub_path = "d.nerva.importing", .data = "the winner's file" });
+
+    const args: cli.Command.Import = .{
+        .cluster = 0,
+        .replica = 0,
+        .replica_count = 1,
+        .input = "unused",
+        .development = true,
+        .log_debug = false,
+        .path = "d.nerva",
+    };
+    // The create fails before the plan is read.
+    const plan = std.mem.zeroes(import_.Plan);
+    var created = false;
+    try testing.expectError(
+        error.PathAlreadyExists,
+        command_import(testing.allocator, &args, &created, path, &plan),
+    );
+    try testing.expect(!created);
+
+    // What `import_run` does with that: nothing is removed, and the file is the winner's.
+    staging_remove(created, path);
+    var contents: [64]u8 = undefined;
+    const kept = try tmp.dir.readFile("d.nerva.importing", &contents);
+    try testing.expectEqualStrings("the winner's file", kept);
+}

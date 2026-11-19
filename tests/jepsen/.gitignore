@@ -1,0 +1,7 @@
+# Leiningen's build output, Jepsen's results (store/), and run.sh's SSH key.
+/target/
+/store/
+/.ssh/
+/.lein-*
+/.nrepl-port
+/.tools/

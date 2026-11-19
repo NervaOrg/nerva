@@ -1,0 +1,573 @@
+const std = @import("std");
+const stdx = @import("stdx");
+const builtin = @import("builtin");
+const assert = std.debug.assert;
+
+const constants = @import("../constants.zig");
+
+const ProcessID = @import("../trace.zig").ProcessID;
+const IO = @import("../io.zig").IO;
+
+const EventMetric = @import("event.zig").EventMetric;
+const EventMetricAggregate = @import("event.zig").EventMetricAggregate;
+const EventTiming = @import("event.zig").EventTiming;
+const EventTimingAggregate = @import("event.zig").EventTimingAggregate;
+
+const log = std.log.scoped(.statsd);
+
+/// A reasonable value to keep the total length of the packet under a single MTU, for a local
+/// network.
+///
+/// https://github.com/statsd/statsd/blob/master/docs/metric_types.md#multi-metric-packets
+const packet_size_max = 1400;
+
+/// No single metric may be larger than this value. If it is, it'll be dropped with an error
+/// message. Since this is calculated at comptime, that means there's a bug in the calculation
+/// logic.
+const statsd_line_size_max = line_size_max: {
+    // For each type of event, build a payload containing the maximum possible values for that
+    // event. This is essentially maxInt for unsigned integer payloads, minInt for signed integer
+    // payloads, and the longest enum tag name for enum payloads.
+    var events_metric: [std.meta.fieldNames(EventMetric).len]EventMetricAggregate = undefined;
+    for (&events_metric, std.meta.fields(EventMetric)) |*event_metric, EventMetricInner| {
+        event_metric.* = .{
+            .event = @unionInit(
+                EventMetric,
+                EventMetricInner.name,
+                struct_size_max(EventMetricInner.type),
+            ),
+            .value = if (@typeInfo(EventMetricAggregate.ValueType).int.signedness == .signed)
+                std.math.minInt(EventMetricAggregate.ValueType)
+            else
+                std.math.maxInt(EventMetricAggregate.ValueType),
+        };
+    }
+
+    var events_timing: [std.meta.fieldNames(EventTiming).len]EventTimingAggregate = undefined;
+    for (&events_timing, std.meta.fields(EventTiming)) |*event_timing, EventTimingInner| {
+        event_timing.* = .{
+            .event = @unionInit(
+                EventTiming,
+                EventTimingInner.name,
+                struct_size_max(EventTimingInner.type),
+            ),
+            .values = .{
+                .duration_min = .{ .ns = std.math.maxInt(u64) },
+                .duration_max = .{ .ns = std.math.maxInt(u64) },
+                .duration_sum = .{ .ns = std.math.maxInt(u64) },
+                .count = std.math.maxInt(u64),
+            },
+        };
+    }
+
+    var buffer: [packet_size_max]u8 = undefined;
+    var buffer_stream = std.io.fixedBufferStream(&buffer);
+    const buffer_writer = buffer_stream.writer();
+
+    var line_size_max: u32 = 0;
+    for (events_metric) |event| {
+        buffer_stream.reset();
+        format_metric(
+            buffer_writer,
+            .{ .metric = .{ .aggregate = event } },
+            .{ .cluster = std.math.maxInt(u128), .replica = constants.members_max - 1 },
+        ) catch unreachable;
+        line_size_max = @max(line_size_max, buffer_stream.getPos() catch unreachable);
+    }
+    for (events_timing) |event| {
+        for (std.enums.values(TimingStat)) |stat| {
+            buffer_stream.reset();
+            format_metric(
+                buffer_writer,
+                .{ .timing = .{ .aggregate = event, .stat = stat } },
+                .{ .cluster = std.math.maxInt(u128), .replica = constants.members_max - 1 },
+            ) catch unreachable;
+            line_size_max = @max(line_size_max, buffer_stream.getPos() catch unreachable);
+        }
+    }
+    break :line_size_max line_size_max;
+};
+
+const packet_messages_max = @divFloor(packet_size_max, statsd_line_size_max);
+
+comptime {
+    assert(statsd_line_size_max <= packet_size_max);
+    assert(packet_messages_max > 0);
+}
+
+/// This implementation emits on an open-loop: on the emit interval, it fires off up to
+/// packet_count_max UDP packets, without waiting for completions.
+///
+/// The emit interval needs to be large enough that the kernel will have finished processing them
+/// before emitting again. If not, an error will be logged.
+const packet_count_max = stdx.div_ceil(
+    EventMetric.slot_count + (EventTiming.slot_count * std.enums.values(TimingStat).len),
+    packet_messages_max,
+);
+
+comptime {
+    // Sanity-check:
+    assert(packet_count_max > 0);
+    assert(packet_count_max < 512);
+}
+
+pub const StatsD = struct {
+    process_id: ProcessID,
+    implementation: union(enum) {
+        udp: struct {
+            socket: std.posix.socket_t,
+            io: *IO,
+            send_callback_error_count: u64 = 0,
+            /// Nerva (P427): the socket is not connected, so a destination with no route does
+            /// not fail `init_udp`; each packet is sent to `address`, and a failure is counted.
+            address: std.net.Address,
+            /// A route failure is warned about once (NRV-W0733); later ones only count, until an
+            /// emit with no failure re-arms the warning.
+            send_failure_warned: bool = false,
+            send_failure_errno: std.posix.E = .SUCCESS,
+            /// A full socket buffer (`EAGAIN`/`ENOBUFS`) is not a route failure: the rest of the
+            /// emit is dropped, counted here, and never warned about.
+            send_buffer_full: bool = false,
+            send_dropped_count: u64 = 0,
+            /// Packets the kernel took (`send_outcome` is `.sent`); `emit` returns the growth.
+            send_sent_count: u64 = 0,
+        },
+        log,
+    },
+
+    send_buffer: *[packet_count_max * packet_size_max]u8,
+    send_completions: [packet_count_max]IO.Completion = undefined,
+    send_in_flight_count: u32 = 0,
+
+    log_buffer: ?std.ArrayListUnmanaged(u8) = null,
+
+    /// Creates a statsd instance, which will send UDP packets via the IO instance provided.
+    pub fn init_udp(
+        allocator: std.mem.Allocator,
+        process_id: ProcessID,
+        io: *IO,
+        address: stdx.SocketAddress,
+    ) !StatsD {
+        const socket = try io.open_socket_udp(address.ip.family());
+        errdefer io.close_socket(socket);
+
+        const send_buffer = try allocator.create([packet_count_max * packet_size_max]u8);
+        errdefer allocator.destroy(send_buffer);
+
+        // Nerva (P427): not connected. `connect` fails with NetworkUnreachable when the host has
+        // no route to the collector, which stopped `nerva start`; packets are sent to the address.
+        log.info("{}: sending statsd metrics to {}", .{ process_id, address });
+
+        return .{
+            .process_id = process_id,
+            .implementation = .{
+                .udp = .{
+                    .socket = socket,
+                    .io = io,
+                    .address = address.to_std(),
+                },
+            },
+            .send_buffer = send_buffer,
+        };
+    }
+
+    // Creates a statsd instance, which will log out the packets that would have been sent. Useful
+    // so that all of the other code can run and be tested in the simulator.
+    pub fn init_log(
+        allocator: std.mem.Allocator,
+        process_id: ProcessID,
+    ) !StatsD {
+        const send_buffer = try allocator.create([packet_count_max * packet_size_max]u8);
+        errdefer allocator.destroy(send_buffer);
+
+        const log_buffer = try std.ArrayListUnmanaged(u8).initCapacity(
+            allocator,
+            packet_count_max * packet_size_max,
+        );
+        errdefer log_buffer.deinit(allocator);
+
+        return .{
+            .process_id = process_id,
+            .implementation = .log,
+            .send_buffer = send_buffer,
+            .log_buffer = log_buffer,
+        };
+    }
+
+    pub fn deinit(self: *StatsD, allocator: std.mem.Allocator) void {
+        if (self.implementation == .udp) {
+            self.implementation.udp.io.close_socket(self.implementation.udp.socket);
+        }
+
+        if (self.log_buffer) |*log_buffer| {
+            log_buffer.deinit(allocator);
+        }
+
+        allocator.destroy(self.send_buffer);
+
+        self.* = undefined;
+    }
+
+    pub fn emit(
+        self: *StatsD,
+        events_metric: []const ?EventMetricAggregate,
+        events_timing: []const ?EventTimingAggregate,
+    ) error{ Busy, UnknownProcess }!u32 {
+        const cluster, const replica = switch (self.process_id) {
+            .unknown => {
+                log.err("{}: process id unknown; skipping emit", .{self.process_id});
+                return error.UnknownProcess;
+            },
+            .replica => |replica| .{ replica.cluster, replica.replica },
+        };
+
+        // This really should not happen; it means we're emitting so many packets, on a short
+        // enough emit timeout, that the kernel hasn't been able to process them all (UDP doesn't
+        // block or provide back-pressure like a TCP socket).
+        //
+        // Keep it as a log, rather than assert, to avoid the common pitfall of metrics killing
+        // the whole system.
+        //
+        // This is also a load-bearing check: see send_callback().
+        if (self.send_in_flight_count != 0) {
+            log.err("{}: {} / {} packets still in flight; skipping emit", .{
+                self.process_id,
+                self.send_in_flight_count,
+                packet_count_max,
+            });
+            return error.Busy;
+        }
+
+        // If there's a log buffer, clear it out before starting to emit.
+        if (self.log_buffer) |*log_buffer| {
+            log_buffer.clearRetainingCapacity();
+        }
+
+        if (self.implementation == .udp) {
+            const udp = &self.implementation.udp;
+            udp.send_buffer_full = false;
+            if (udp.send_callback_error_count > 0) {
+                if (!udp.send_failure_warned) {
+                    udp.send_failure_warned = true;
+                    log.warn("NRV-W0733 {}: cannot send statsd to {}: {s}; the metrics sent " ++
+                        "there are dropped, and the replica keeps running", .{
+                        self.process_id,
+                        udp.address,
+                        send_failure_reason(udp.send_failure_errno),
+                    });
+                }
+                udp.send_callback_error_count = 0;
+            } else {
+                // A clean emit re-arms the warning: a transient failure (a full buffer) does not
+                // use up the only warning, and a later one names its own cause.
+                udp.send_failure_warned = false;
+                udp.send_failure_errno = .SUCCESS;
+            }
+        }
+
+        var send_ready: u32 = 0;
+        var send_sizes = stdx.BoundedArrayType(u32, packet_count_max){};
+        var send_stream = std.io.fixedBufferStream(self.send_buffer);
+        const send_writer = send_stream.writer();
+        inline for (.{ events_metric, events_timing }) |events| {
+            for (events) |event_new_maybe| {
+                const event_new = event_new_maybe orelse continue;
+                const stats = switch (@TypeOf(event_new)) {
+                    EventMetricAggregate => [_]Stat{.{ .metric = .{ .aggregate = event_new } }},
+                    EventTimingAggregate => [_]Stat{
+                        .{ .timing = .{ .aggregate = event_new, .stat = .min } },
+                        .{ .timing = .{ .aggregate = event_new, .stat = .max } },
+                        .{ .timing = .{ .aggregate = event_new, .stat = .avg } },
+                        .{ .timing = .{ .aggregate = event_new, .stat = .sum } },
+                        .{ .timing = .{ .aggregate = event_new, .stat = .count } },
+                    },
+                    else => unreachable,
+                };
+
+                for (stats) |stat| {
+                    const send_position_before = send_stream.getPos() catch unreachable;
+                    format_metric(send_writer, stat, .{
+                        .cluster = cluster,
+                        .replica = replica,
+                    }) catch |err| switch (err) {
+                        // This shouldn't ever happen, but don't allow metrics to kill the system.
+                        error.NoSpaceLeft => {
+                            log.err("{}: insufficient buffer space", .{self.process_id});
+                            break;
+                        },
+                    };
+
+                    const send_position_after = send_stream.getPos() catch unreachable;
+                    const send_size: u32 = @intCast(send_position_after - send_position_before);
+                    assert(send_size > 0);
+                    if (send_ready + send_size > packet_size_max) {
+                        assert(send_ready > 0);
+                        if (send_sizes.full()) {
+                            log.err("{}: insufficient packet count", .{self.process_id});
+                            break;
+                        } else {
+                            send_sizes.push(send_ready);
+                        }
+                        send_ready = send_size;
+                    } else {
+                        send_ready += send_size;
+                    }
+                }
+            }
+        }
+        if (send_ready > 0) {
+            if (send_sizes.full()) {
+                log.err("{}: insufficient packet count", .{self.process_id});
+            } else {
+                send_sizes.push(send_ready);
+            }
+        }
+
+        const sent_before = if (self.implementation == .udp)
+            self.implementation.udp.send_sent_count
+        else
+            0;
+        const dropped_before = if (self.implementation == .udp)
+            self.implementation.udp.send_dropped_count
+        else
+            0;
+        if (self.implementation == .udp) {
+            // Zeroed above: after the loop it holds exactly this emit's failures.
+            assert(self.implementation.udp.send_callback_error_count == 0);
+        }
+        var send_offset: u32 = 0;
+        for (send_sizes.const_slice()) |send_size| {
+            if (self.send_in_flight_count >= self.send_completions.len) {
+                // This shouldn't ever happen, but don't allow metrics to kill the system.
+                log.err("{}: insufficient packets to emit any metrics", .{self.process_id});
+                return 0;
+            }
+            const completion = &self.send_completions[self.send_in_flight_count];
+            self.send_in_flight_count += 1;
+            self.emit_buffer(completion, self.send_buffer[send_offset..][0..send_size]);
+            send_offset += send_size;
+        }
+
+        // Nerva (P427): only packets the kernel took are packets sent: not those dropped for a
+        // full socket buffer, nor those it refused (no route, not allowed).
+        if (self.implementation == .udp) {
+            const sent = self.implementation.udp.send_sent_count - sent_before;
+            const dropped = self.implementation.udp.send_dropped_count - dropped_before;
+            const failed = self.implementation.udp.send_callback_error_count;
+            // Every packet ends in exactly one place: sent, dropped for a full buffer, or failed.
+            assert(sent + dropped + failed == send_sizes.count());
+            return @intCast(sent);
+        }
+        return @intCast(send_sizes.count());
+    }
+
+    const SendOutcome = enum { sent, buffer_full, failed };
+
+    /// Nerva (P427): classifies one `sendto` result. A full socket buffer is not a route failure.
+    fn send_outcome(errno: std.posix.E, result: usize, len: usize) SendOutcome {
+        if (errno == .SUCCESS and result == len) return .sent;
+        if (errno == .AGAIN or errno == .NOBUFS) return .buffer_full;
+        return .failed;
+    }
+
+    /// What an operator can act on, not an errno tag (NRV-W0733).
+    fn send_failure_reason(errno: std.posix.E) []const u8 {
+        return switch (errno) {
+            .ACCES, .PERM => "not allowed to send there (a broadcast address?)",
+            .NETUNREACH, .HOSTUNREACH, .NETDOWN => "no route to it",
+            else => "the send failed",
+        };
+    }
+
+    fn emit_buffer(self: *StatsD, send_completion: *IO.Completion, send_buffer: []const u8) void {
+        switch (self.implementation) {
+            .udp => |*udp| {
+                // Nerva (P427): `IO.send` has no destination, and sends on an unconnected socket
+                // fail. A datagram is taken whole or not at all, so the send is immediate and
+                // never blocks. A failure is counted by `send_callback`; a full buffer is counted
+                // apart.
+                const flags: u32 = switch (builtin.os.tag) {
+                    .linux => std.posix.MSG.DONTWAIT | std.posix.MSG.NOSIGNAL,
+                    .macos, .ios, .tvos, .watchos, .visionos => 0x80, // MSG_DONTWAIT
+                    else => @compileError("statsd send: unsupported OS"),
+                };
+                if (udp.send_buffer_full) {
+                    udp.send_dropped_count += 1;
+                    return StatsD.send_callback(self, send_completion, send_buffer.len);
+                }
+                const result = std.posix.system.sendto(
+                    udp.socket,
+                    send_buffer.ptr,
+                    send_buffer.len,
+                    flags,
+                    &udp.address.any,
+                    udp.address.getOsSockLen(),
+                );
+                const errno = std.posix.errno(result);
+                // Libc returns isize, a raw syscall usize: classify on a usize either way.
+                const sent: usize = if (errno == .SUCCESS) @intCast(result) else 0;
+                switch (send_outcome(errno, sent, send_buffer.len)) {
+                    .sent => {
+                        udp.send_sent_count += 1;
+                        StatsD.send_callback(self, send_completion, send_buffer.len);
+                    },
+                    .buffer_full => {
+                        // Upstream's blocking send waited for space; this drops the rest of the
+                        // emit quietly instead of logging a route failure that does not exist.
+                        udp.send_buffer_full = true;
+                        udp.send_dropped_count += 1;
+                        StatsD.send_callback(self, send_completion, send_buffer.len);
+                    },
+                    .failed => {
+                        if (udp.send_failure_errno == .SUCCESS) udp.send_failure_errno = errno;
+                        StatsD.send_callback(self, send_completion, error.ConnectionRefused);
+                    },
+                }
+            },
+            .log => {
+                self.log_buffer.?.appendSliceAssumeCapacity(send_buffer);
+                StatsD.send_callback(self, send_completion, send_buffer.len);
+            },
+        }
+    }
+
+    /// The UDP packets containing the metrics are sent in a fire-and-forget manner.
+    fn send_callback(self: *StatsD, completion: *IO.Completion, result: IO.SendError!usize) void {
+        _ = result catch {
+            // Errors are only supported when using UDP; not if calling this loopback.
+            assert(self.implementation == .udp);
+            self.implementation.udp.send_callback_error_count += 1;
+        };
+
+        // Completions can be returned in any order: this is _only_ safe because their emitting is
+        // guarded on `self.send_in_flight_count != 0`.
+        self.send_in_flight_count -= 1;
+        completion.* = undefined;
+    }
+};
+
+test "send_outcome: a full buffer is not a route failure" {
+    const E = std.posix.E;
+    const Outcome = StatsD.SendOutcome;
+    try std.testing.expectEqual(Outcome.sent, StatsD.send_outcome(.SUCCESS, 10, 10));
+    try std.testing.expectEqual(Outcome.failed, StatsD.send_outcome(.SUCCESS, 5, 10));
+    try std.testing.expectEqual(Outcome.buffer_full, StatsD.send_outcome(E.AGAIN, 0, 10));
+    try std.testing.expectEqual(Outcome.buffer_full, StatsD.send_outcome(E.NOBUFS, 0, 10));
+    try std.testing.expectEqual(Outcome.failed, StatsD.send_outcome(E.NETUNREACH, 0, 10));
+    try std.testing.expectEqual(Outcome.failed, StatsD.send_outcome(E.ACCES, 0, 10));
+}
+
+const TimingStat = enum { min, max, avg, sum, count };
+const Stat = union(enum) {
+    metric: struct { aggregate: EventMetricAggregate },
+    timing: struct { aggregate: EventTimingAggregate, stat: TimingStat },
+};
+
+fn format_metric(
+    writer: anytype,
+    stat: Stat,
+    options: struct { cluster: u128, replica: u8 },
+) error{NoSpaceLeft}!void {
+    const stat_name = switch (stat) {
+        inline else => |stat_data| @tagName(stat_data.aggregate.event),
+    };
+
+    const stat_suffix, const stat_type, const stat_value = switch (stat) {
+        .metric => |data| .{ "", "g", data.aggregate.value },
+        .timing => |data| switch (data.stat) {
+            .count => .{ "_us.count", "c", data.aggregate.values.count },
+            .sum => .{ "_us.sum", "c", data.aggregate.values.duration_sum.to_us() },
+            .min => .{ "_us.min", "g", data.aggregate.values.duration_min.to_us() },
+            .max => .{ "_us.max", "g", data.aggregate.values.duration_max.to_us() },
+            .avg => .{ "_us.avg", "g", @divFloor(
+                data.aggregate.values.duration_sum.to_us(),
+                data.aggregate.values.count,
+            ) },
+        },
+    };
+
+    try writer.print("tb.{[name]s}{[name_suffix]s}:{[value]d}|{[statsd_type]s}" ++
+        "|#cluster:{[cluster]x:0>32},replica:{[replica]d}", .{
+        .name = stat_name,
+        .name_suffix = stat_suffix,
+        .statsd_type = stat_type,
+        .value = stat_value,
+        .cluster = options.cluster,
+        .replica = options.replica,
+    });
+
+    switch (stat) {
+        inline else => |stat_data| {
+            switch (stat_data.aggregate.event) {
+                inline else => |data| {
+                    const Tags = @TypeOf(data);
+                    if (@typeInfo(Tags) == .@"struct") {
+                        const fields = std.meta.fields(@TypeOf(data));
+                        inline for (fields) |data_field| {
+                            comptime assert(!std.mem.eql(u8, data_field.name, "cluster"));
+                            comptime assert(!std.mem.eql(u8, data_field.name, "replica"));
+                            comptime assert(@typeInfo(data_field.type) == .int or
+                                @typeInfo(data_field.type) == .@"enum" or
+                                @typeInfo(data_field.type) == .@"union");
+
+                            const data_field_value = @field(data, data_field.name);
+                            try writer.writeByte(',');
+                            try writer.writeAll(data_field.name);
+                            try writer.writeByte(':');
+
+                            if (@typeInfo(data_field.type) == .@"enum" or
+                                @typeInfo(data_field.type) == .@"union")
+                            {
+                                try writer.print("{s}", .{@tagName(data_field_value)});
+                            } else {
+                                try writer.print("{}", .{data_field_value});
+                            }
+                        }
+                    } else {
+                        assert(@TypeOf(data) == void);
+                    }
+                },
+            }
+        },
+    }
+    try writer.writeByte('\n');
+}
+
+/// Returns an instance of a Struct (or void) with all fields set to what would result in the
+/// longest length when formatted.
+///
+/// Integers get maxInt, and Enums get a value corresponding to `enum_size_max()`.
+fn struct_size_max(StructOrVoid: type) StructOrVoid {
+    if (@typeInfo(StructOrVoid) == .void) return {};
+
+    assert(@typeInfo(StructOrVoid) == .@"struct");
+    const Struct = StructOrVoid;
+
+    var output: Struct = undefined;
+
+    for (std.meta.fields(Struct)) |field| {
+        const type_info = @typeInfo(field.type);
+        assert(type_info == .int or type_info == .@"enum");
+        assert(type_info != .int or type_info.int.signedness == .unsigned);
+        switch (type_info) {
+            .int => @field(output, field.name) = std.math.maxInt(field.type),
+            .@"enum" => @field(output, field.name) =
+                std.enums.nameCast(field.type, enum_size_max(field.type)),
+            else => @compileError("unsupported type"),
+        }
+    }
+
+    return output;
+}
+
+/// Returns the longest @tagName for a given Enum.
+fn enum_size_max(Enum: type) []const u8 {
+    @setEvalBranchQuota(10_000);
+    var tag_longest: []const u8 = "";
+    for (std.meta.fieldNames(Enum)) |field_name| {
+        if (tag_longest.len < field_name.len) {
+            tag_longest = field_name;
+        }
+    }
+    return tag_longest;
+}

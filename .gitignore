@@ -1,0 +1,18 @@
+# Toolchain installed by ./zig/download.sh
+/zig/*
+!/zig/download.sh
+
+.zig-cache/
+zig-cache/
+zig-out/
+
+# Data files and simulator logs.
+*.nerva
+*.vopr
+
+.DS_Store
+
+# Python bytecode from tests/.
+__pycache__/
+
+.zig-global-cache/
