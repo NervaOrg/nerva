@@ -68,7 +68,7 @@ mkdir -p "$tmp/badpy"
 printf '#!/bin/sh\necho "Traceback: boom" >&2\nexit 1\n' >"$tmp/badpy/python3"
 chmod +x "$tmp/badpy/python3"
 refuses NRV-E1223 "io_uring probe that breaks (exit 1)" env PATH="$tmp/badpy:$PATH" ci/io_uring_check.sh
-refuses "Traceback: boom" "io_uring probe's error is in the message" env PATH="$tmp/badpy:$PATH" ci/io_uring_check.sh
+refuses "probe itself failed (Traceback: boom)" "io_uring probe's error is in the message" env PATH="$tmp/badpy:$PATH" ci/io_uring_check.sh
 
 # --- ci/docker_client.sh: NRV-E1204, E1205 ---
 mkdir -p "$tmp/dc/src/docker"
@@ -157,6 +157,18 @@ is "main untouched by a branch" seed "$(cat "$c/main/zig/p/entry")"
     echo "$CI_BRANCH_DIR" >"$tmp/dir2"
 )
 is "oversize main is not copied" "" "$(ls -A "$(cat "$tmp/dir2")/zig")"
+# A failed copy leaves no partial zig/p (a stub cp early in PATH that half-copies and fails, so
+# the case runs as root too).
+mkdir -p "$tmp/badcp"
+printf '#!/bin/sh\nfor a; do last=$a; done\nmkdir -p "${last}p"\nexit 1\n' >"$tmp/badcp/cp"
+chmod +x "$tmp/badcp/cp"
+out=$(
+    . ci/cache.sh
+    PATH="$tmp/badcp:$PATH" ci_branch_prepare "$c" feature/badseed 2>&1
+    echo "$CI_BRANCH_DIR" >"$tmp/dirbs"
+)
+grep -q "seed copy failed: branch" <<<"$out" || { echo "FAIL failed seed: no message in: $out" >&2; fail=1; }
+is "a failed seed copy leaves no zig/p" "" "$(ls -A "$(cat "$tmp/dirbs")/zig")"
 # Bounded: only the newest CI_BRANCH_CACHES others stay, and one a job holds is never removed.
 for i in 1 2 3 4 5 6; do
     mkdir "$c/branches/b-old$i-0000000$i"

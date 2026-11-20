@@ -5,6 +5,8 @@
 #   bash io_uring_probe.sh          pull the pinned ubuntu image, run the probe in a throwaway container
 #   bash io_uring_probe.sh local    run the probe on this host, with no container (the test)
 #
+# (The statuses differ from the inner python probe of ci/io_uring_check.sh, where 3 is refused: here
+# the exit status is this script's own, and 1 is refused, 3 is broken.)
 # Exit 0: an io_uring was created. Exit 1: refused (NRV-E1201), with the kernel's reason. Exit 2:
 # the image could not be pulled (NRV-E1211). Exit 3: the probe itself failed, so nothing is known
 # about the profile (NRV-E1212). One line on stderr says which, and why. The probe's perl exits 0

@@ -33,7 +33,7 @@ container on that daemon without a profile of its own; the box runs CI and nothi
   (another branch, a manual run, a cron run, a run of main that is not a push) mounts `main/`
   read-only (`:ro`) and `branches/` writable. The two steps of each workflow are exclusive by
   `when:` (`event: push, branch: main` against its negation), so no pipeline gets both.
-- A branch has its own caches: a plain copy of main's global Zig cache (`zig/`; not `zig-local/`,
+- A branch has its own caches: a plain copy of main's fetched packages (`zig/p` only; not the rest of `zig/`, not `zig-local/`,
   which a build of main may be writing, so a branch starts it empty) made when the branch's cache is
   first needed (not made if main's is over 6 GiB; the branch then starts empty), bounded in count
   (8), age (7 days) and size (12 GiB each), pruned under a lock that skips a cache another job is
@@ -89,7 +89,7 @@ repository, and that is the trust boundary of this box.
 
 ## What it costs
 
-- A cold branch's first run copies main's global Zig cache `zig/` (up to 6 GiB) and starts with an
+- A cold branch's first run copies main's fetched packages `zig/p` (up to 6 GiB) and starts with an
   empty `zig-local/`, where most build artifacts go: its first run is close to cold, and its second
   is as warm as the branch's own first.
 - Disk: at most 8 branch caches of 12 GiB beside main's. `ci/woodpecker_step.sh` empties the unused

@@ -63,7 +63,7 @@ check_scripts() {
     # The release scripts: the bill of materials (N63) and the refusals (NRV-E1112 to E1117,
     # E1130 to E1138, E1152, E1164). Needs ci/install_repo_tools.sh first.
     ci/changes_test.sh # Woodpecker's docs-only skip, only over a pipeline that succeeded
-    ci/ci_test.sh # the CI scripts' refusals, NRV-E1201 to E1221 but E1203, E1209 and E1210, NRV-B1201, W1201 and W1202
+    ci/ci_test.sh # the CI scripts' refusals and cache rules (its header lists the codes it triggers)
     python3 .github/scripts/test_sbom.py
     python3 .github/scripts/test_release_check.py
     python3 .github/scripts/test_mac_sign.py

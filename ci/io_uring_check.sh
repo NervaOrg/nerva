@@ -3,6 +3,9 @@
 # default seccomp profile refuses it (Docker 25 and later), and a replica then exits 70 with its
 # reason in a log the tests discard: say so here instead. Steps are not privileged (decision O4):
 # the host's Docker daemon carries a profile that allows it (ops/ci/docker/README.md).
+# Statuses: the in-container python probe exits 0 (created), 3 (refused: NRV-E1201) or anything else
+# (broken: NRV-E1223); this script itself exits 0 or 1. The host probe, ops/ci/io_uring_probe.sh,
+# has its own convention, as its header says: there 1 is refused and 3 is broken.
 # `--pretend-refused` fails as if the kernel had said EPERM (the table test).
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"

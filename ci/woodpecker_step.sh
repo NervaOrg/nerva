@@ -9,10 +9,10 @@
 #     "permission denied" must not pass as root.
 #   - /cache holds the host's /var/cache/nerva-ci, laid out and enforced as ci/cache.sh says:
 #     main/ is written by pipelines for main only (the YAML mounts it :ro for any other branch);
-#     a branch has its own caches under branches/, zig/ seeded from main's when created, bounded and
+#     a branch has its own caches under branches/, zig/p seeded from main's when created, bounded and
 #     pruned. Every job holds a shared lock on main/.lock; below CI_FREE_MIN_GIB free (default 60),
-#     a main job waits up to CI_PRUNE_WAIT seconds (600) to hold it alone and empties main's Zig
-#     caches (never the pinned toolchain), and a branch job empties the branch caches nobody uses.
+#     a main job waits up to CI_PRUNE_WAIT seconds (5) to hold it alone, measures free space again, and if still low
+#     empties main's Zig caches (never the pinned toolchain), and a branch job empties the branch caches nobody uses.
 #   - Each job has a timeout (75 minutes; 330 for the long searches; CI_STEP_MINUTES replaces it),
 #     see the `case` below; one that runs past it fails NRV-E1215.
 set -euo pipefail

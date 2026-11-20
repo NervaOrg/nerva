@@ -322,9 +322,9 @@ set:
    `main/` holds the pinned Zig's archive (`tools/<sha256>.tar.xz`, checked on every use), Zig's
    global cache and a `.zig-cache` copy, written only by a push to `main` (its steps mount it
    writable; every other step mounts it `:ro`). `branches/<key>/` is one branch's own copy,
-   seeded with a copy of main's global Zig cache (`zig/`; `zig-local/` starts empty), at most 8 of them (the job's own included), 12 GiB and 7 days each. Jobs hold a shared `flock`
-   on what they use. Below 60 GiB free (`CI_FREE_MIN_GIB`), a job for `main` waits up to 10
-   minutes (`CI_PRUNE_WAIT`) to hold `main/` alone and empties its Zig caches (never the
+   seeded with a copy of main's fetched packages (`zig/p` only; the rest of `zig/` and `zig-local/` start empty), at most 8 of them (the job's own included), 12 GiB and 7 days each. Jobs hold a shared `flock`
+   on what they use. Below 60 GiB free (`CI_FREE_MIN_GIB`), a job for `main` waits up to
+   `CI_PRUNE_WAIT` (5 s), measures free space again, and if it is still low holds `main/` alone and empties its Zig caches (never the
    toolchain), and a branch job empties every branch cache no job is using. A lock that stays busy
    is never waited on for good: the job warns (NRV-W1202) and runs.
 

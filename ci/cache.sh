@@ -85,7 +85,7 @@ ci_branch_prune() {
     done < <(ls -1dt "$b"/b-*/ 2>/dev/null)
 }
 
-# ci_branch_prepare ROOT BRANCH: creates this branch's cache (zig/ a copy of main's, if that is no
+# ci_branch_prepare ROOT BRANCH: creates this branch's cache (zig/p, the fetched packages, a copy of main's, if that is no
 # larger than CI_BRANCH_SEED_MAX_GIB; zig-local/ empty), prunes the others, and holds a shared lock on its own on
 # fd 6 for the rest of the process, so a prune by another job leaves it alone. Sets CI_BRANCH_DIR.
 # The count, age and size of branch caches are bounded: CI_BRANCH_CACHES (8), CI_BRANCH_CACHE_DAYS
@@ -135,7 +135,11 @@ ci_branch_prepare() {
             if [ ! -d "$root/main/zig/p" ]; then
                 echo "main has no package cache yet: branch $key starts empty" >&2
             elif [ "$(ci_dir_gib "$root/main/zig/p")" -le "$seedgib" ]; then
-                cp -a "$root/main/zig/p" "$partial/zig/" 2>/dev/null || true
+                # A failed copy must not leave a partial zig/p (a half-written package would be trusted).
+                cp -a "$root/main/zig/p" "$partial/zig/" 2>/dev/null || {
+                    echo "seed copy failed: branch $key starts empty" >&2
+                    rm -rf "$partial/zig/p"
+                }
             else
                 echo "main's package cache is over $seedgib GiB: branch $key starts empty" >&2
             fi
