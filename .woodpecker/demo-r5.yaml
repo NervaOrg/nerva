@@ -14,5 +14,8 @@ steps:
     image: docker.io/library/ubuntu:24.04@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8
     commands:
       - ci/woodpecker_step.sh demo-r5
+    # Docker's default seccomp profile refuses io_uring (Docker 25 and later), which Nerva's IO
+    # needs; privileged lifts it. The job itself runs as `ci` with no capabilities.
+    privileged: true
     volumes:
       - /var/cache/nerva-ci:/cache
