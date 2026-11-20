@@ -510,8 +510,10 @@ POST /v1/documents/commit {"namespace":"7","reads":[{"key":"plan","version":"0"}
 Query: `namespace`, `limit` (required), `cursor`. Reply: `{"documents":[…],"more","cursor","op"}`.
 A page may be empty while `more` is true: follow `cursor`. As for `changes`, the `cursor` of the
 last page is where to resume, not `null`. A cursor that is not one Nerva gave is `400` NRV-E0408.
-A page ends at an op boundary: an op with more changes than `limit` is read to its end, in the
-largest requests the cluster allows, so a small `limit` does not make a large op slower to read.
+A page ends at an op boundary and holds its first op whole, then only the whole ops that fit in
+`limit - 1` more changes. An op with more changes than `limit` is read to its end in the largest
+requests the cluster allows, so a small `limit` does not make a large op slower to read; the
+page is still that op alone, and `more` is true when ops follow it.
 
 ```
 GET /v1/documents/changes?namespace=7&limit=10

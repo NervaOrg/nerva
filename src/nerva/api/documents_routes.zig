@@ -26,7 +26,8 @@
 //!   (`put` or `delete`), and `value_hex` for a put. Paging is as in `/v1/changes`: `limit`
 //!   bounds the underlying changes scanned, so a page may hold fewer documents, or none, while
 //!   `more` is true. A page always ends at an op boundary: an op with more changes than `limit`
-//!   is read to its end (in larger requests, so its cost does not grow as `limit` shrinks).
+//!   is read to its end (in larger requests, so its cost does not grow as `limit` shrinks), and
+//!   is then the whole page.
 //! - A delete writes a tombstone (`documents.zig`). A put that shrinks a document, and a delete,
 //!   leave its old trailing chunks in place, unread: an accepted cost (N41).
 
@@ -388,6 +389,22 @@ pub fn changes(arena: std.mem.Allocator, client: anytype, query: []const u8) !Re
         try accumulated.appendSlice(arena, page[0 .. count - 1]);
         cursor = end.timestamp;
         more = end.flags.more;
+        if (iteration > 0) {
+            // The first request held one op that continues, so the page is that op, whole. What
+            // the larger requests read past it is left for the next page: `limit` still bounds
+            // a page to its first op and at most `limit - 1` changes more.
+            const items = accumulated.items;
+            const op_first = items[0].op;
+            const cut = for (items, 0..) |change, index| {
+                if (change.op != op_first) break index;
+            } else null;
+            if (cut) |index| {
+                cursor = items[index].timestamp;
+                more = true; // The page stops before the feed's end, even if the request did not.
+                accumulated.shrinkRetainingCapacity(index);
+                break;
+            }
+        }
         if (!more) {
             op_through = end.op;
             break;
@@ -552,35 +569,111 @@ test "documents feed: an op's changes decode to its documents, each as the op le
     for (found) |document| try testing.expectEqual(@as(u64, 9), document.version);
 }
 
-/// A feed in memory, answering `get_changes` as the state machine does, and counting requests.
+/// A feed in memory (change `i` has timestamp `i + 1`), answering `get_changes` as the state
+/// machine does (`execute_get_changes`), and counting requests.
 const FeedClient = struct {
     feed: []const Change,
+    /// The op of the query itself: later than every change in the feed.
+    query_op: u64,
     requests: u32 = 0,
+
+    fn init(feed: []const Change) FeedClient {
+        const query_op = if (feed.len == 0) 1 else feed[feed.len - 1].op + 1;
+        return .{ .feed = feed, .query_op = query_op };
+    }
 
     pub fn get_changes(client: *FeedClient, filter: nerva.ChangesFilter, out: []Change) !usize {
         client.requests += 1;
         const limit = @min(filter.limit, changes_request_max);
         assert(out.len >= limit + 1);
-        var count: usize = 0;
-        for (client.feed) |change| {
-            if (change.timestamp < filter.timestamp_min) continue;
-            if (count == limit) break;
-            out[count] = change;
-            count += 1;
-        }
+        const start = @min(filter.timestamp_min -| 1, client.feed.len);
+        const count = @min(limit, client.feed.len - start);
+        @memcpy(out[0..count], client.feed[start..][0..count]);
         const more = count == limit;
         out[count] = .{
             .id = 0,
             .table = 0,
             .kind = .end,
             .flags = .{ .more = more },
-            .op = if (more) 0 else client.feed[client.feed.len - 1].op,
+            .op = if (more) 0 else client.query_op,
             .timestamp = if (count == 0) filter.timestamp_min else out[count - 1].timestamp + 1,
             .value = @splat(0),
         };
         return count + 1;
     }
 };
+
+/// Appends the chunks of one document written by `op`, with the next timestamps.
+fn feed_put(
+    arena: std.mem.Allocator,
+    feed: *std.ArrayListUnmanaged(Change),
+    op: u64,
+    key: []const u8,
+    size: usize,
+) !void {
+    const value = try arena.alloc(u8, size);
+    @memset(value, 'v');
+    const chunks = try documents.chunks_encode(arena, 7, key, value);
+    for (chunks, 0..) |chunk, index| {
+        try feed.append(arena, .{
+            .id = documents.chunk_id(7, key, @intCast(index)),
+            .table = table,
+            .kind = .put,
+            .flags = .{},
+            .op = op,
+            .timestamp = feed.items.len + 1,
+            .value = chunk,
+        });
+    }
+}
+
+/// Reads `feed` from the start in pages of `limit`, checking each page against what `limit`
+/// promises: it ends at an op boundary, and holds its first op and no more than `limit - 1`
+/// changes beyond it. A page costs at most `2 + ceil(changes in its first op / request max)`
+/// requests, a bound that does not depend on how many pages there are. Returns the documents.
+fn feed_pages_check(arena: std.mem.Allocator, feed: []const Change, limit: u32) !usize {
+    var client = FeedClient.init(feed);
+    var cursor: u64 = 0;
+    var documents_total: usize = 0;
+    while (true) {
+        const start: usize = @intCast(@max(cursor, 1) - 1);
+        const requests_before = client.requests;
+        const query = try std.fmt.allocPrint(
+            arena,
+            "namespace=7&cursor={}&limit={}",
+            .{ cursor, limit },
+        );
+        const reply = try changes(arena, &client, query);
+        try testing.expectEqual(@as(u16, 200), reply.status);
+        const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, reply.body, .{});
+        documents_total += parsed.object.get("documents").?.array.items.len;
+        const cursor_next = try std.fmt.parseInt(u64, parsed.object.get("cursor").?.string, 10);
+        const more = parsed.object.get("more").?.bool;
+        try testing.expect(cursor_next > cursor);
+
+        const end: usize = @intCast(cursor_next - 1); // Index of the next change to read.
+        const first_op = feed[start].op;
+        var first_op_changes: usize = 0;
+        while (start + first_op_changes < feed.len and
+            feed[start + first_op_changes].op == first_op) first_op_changes += 1;
+        try testing.expect(end - start <= first_op_changes + limit - 1);
+        try testing.expect(end - start >= first_op_changes);
+        if (more) {
+            try testing.expect(parsed.object.get("op").? == .null);
+            try testing.expect(end < feed.len);
+            try testing.expect(feed[end].op != feed[end - 1].op); // Whole ops.
+        } else {
+            try testing.expectEqual(feed.len, end);
+            const op = try std.fmt.parseInt(u64, parsed.object.get("op").?.string, 10);
+            try testing.expectEqual(client.query_op, op);
+        }
+        const request_bound = 2 + (first_op_changes + changes_request_max - 1) /
+            changes_request_max;
+        try testing.expect(client.requests - requests_before <= request_bound);
+        if (!more) return documents_total;
+        cursor = cursor_next;
+    }
+}
 
 test "documents feed: an op larger than limit costs a few requests, not one per limit" {
     var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
@@ -589,59 +682,75 @@ test "documents feed: an op larger than limit costs a few requests, not one per 
 
     // Op 9 writes one document of many chunks; ops 10 and 11 write small ones.
     var feed: std.ArrayListUnmanaged(Change) = .{};
-    const writes = [_]struct { op: u64, key: []const u8, size: usize }{
-        .{ .op = 9, .key = "big", .size = value_size * 40 },
-        .{ .op = 10, .key = "small", .size = 5 },
-        .{ .op = 11, .key = "last", .size = 5 },
-    };
-    const value = try arena.alloc(u8, value_size * 40);
-    @memset(value, 'v');
-    var big_chunks: usize = 0;
-    for (writes) |write| {
-        const chunks = try documents.chunks_encode(arena, 7, write.key, value[0..write.size]);
-        if (write.op == 9) big_chunks = chunks.len;
-        for (chunks, 0..) |chunk, index| {
-            try feed.append(arena, .{
-                .id = documents.chunk_id(7, write.key, @intCast(index)),
-                .table = table,
-                .kind = .put,
-                .flags = .{},
-                .op = write.op,
-                .timestamp = feed.items.len + 1,
-                .value = chunk,
-            });
-        }
-    }
-    try testing.expect(big_chunks > 40);
+    try feed_put(arena, &feed, 9, "big", value_size * 40);
+    try testing.expect(feed.items.len > 40);
+    try feed_put(arena, &feed, 10, "small", 5);
+    try feed_put(arena, &feed, 11, "last", 5);
 
-    // Paged from the start, whatever the limit: the same documents, and no more requests than
-    // with the largest limit, plus one per page (the first, small request).
-    var requests_baseline: u32 = 0;
-    const limit_large: u32 = @min(api.page_limit_max, changes_request_max);
-    for ([_]u32{ limit_large, 1, 2, 7 }) |limit| {
-        var client: FeedClient = .{ .feed = feed.items };
-        var cursor: u64 = 0;
-        var keys: std.ArrayListUnmanaged(u8) = .{};
-        var pages: u32 = 0;
-        while (true) {
-            const query = try std.fmt.allocPrint(
-                arena,
-                "namespace=7&cursor={}&limit={}",
-                .{ cursor, limit },
-            );
-            const reply = try changes(arena, &client, query);
-            try testing.expectEqual(@as(u16, 200), reply.status);
-            const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, reply.body, .{});
-            for (parsed.object.get("documents").?.array.items) |document| {
-                try keys.appendSlice(arena, document.object.get("key").?.string);
-                try keys.append(arena, ',');
-            }
-            cursor = try std.fmt.parseInt(u64, parsed.object.get("cursor").?.string, 10);
-            pages += 1;
-            if (!parsed.object.get("more").?.bool) break;
+    for ([_]u32{ 1, 2, 7, api.page_limit_max }) |limit| {
+        try testing.expectEqual(@as(usize, 3), try feed_pages_check(arena, feed.items, limit));
+    }
+}
+
+test "documents feed: a page holds its first op and at most limit - 1 changes past it" {
+    var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+
+    // Op 1 has more changes than one request; many one-change ops follow, enough that a request
+    // of `changes_request_max` that ends op 1 holds many whole ops after it (#5).
+    var feed: std.ArrayListUnmanaged(Change) = .{};
+    try feed_put(arena, &feed, 1, "big", value_size * 40);
+    try testing.expect(feed.items.len > changes_request_max);
+    for (0..changes_request_max * 3) |index| {
+        const key = try std.fmt.allocPrint(arena, "k{}", .{index});
+        try feed_put(arena, &feed, 3 + index, key, 5);
+    }
+    const documents_expected = 1 + changes_request_max * 3;
+    for ([_]u32{ 1, 2, 7, changes_request_max, api.page_limit_max }) |limit| {
+        try testing.expectEqual(documents_expected, try feed_pages_check(arena, feed.items, limit));
+    }
+
+    // An empty feed is an empty page, complete through the query's op.
+    var client = FeedClient.init(&.{});
+    const reply = try changes(arena, &client, "namespace=7&limit=1");
+    try testing.expectEqual(@as(u16, 200), reply.status);
+    try testing.expectEqualStrings(
+        "{\"documents\":[],\"more\":false,\"cursor\":\"0\",\"op\":\"1\"}",
+        reply.body,
+    );
+}
+
+test "documents feed: an op of changes_per_op_max changes is read at the limits that matter" {
+    var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_instance.deinit();
+
+    // The largest op (one document per change), then another op. Every limit in
+    // 1..page_limit_max would take minutes; these are the extremes, and the limits after which
+    // the op's last change falls exactly on the end of a request (the loop's worst case).
+    const boundary = @max(changes_per_op_max % changes_request_max, 1);
+    const limits = [_]u32{
+        1,
+        2,
+        boundary,
+        boundary + changes_request_max,
+        changes_request_max,
+        changes_request_max + 1,
+        api.page_limit_max,
+    };
+    for (limits) |limit| {
+        _ = arena_instance.reset(.retain_capacity);
+        const arena = arena_instance.allocator();
+        var feed: std.ArrayListUnmanaged(Change) = .{};
+        for (0..changes_per_op_max) |index| {
+            const key = try std.fmt.allocPrint(arena, "k{}", .{index});
+            try feed_put(arena, &feed, 9, key, 5);
         }
-        try testing.expectEqualStrings("big,small,last,", keys.items);
-        if (limit == limit_large) requests_baseline = client.requests;
-        try testing.expect(client.requests <= requests_baseline + pages);
+        try testing.expectEqual(@as(usize, changes_per_op_max), feed.items.len);
+        try feed_put(arena, &feed, 10, "after", 5);
+        try testing.expectEqual(
+            @as(usize, changes_per_op_max + 1),
+            try feed_pages_check(arena, feed.items, @min(limit, api.page_limit_max)),
+        );
     }
 }
