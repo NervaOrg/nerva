@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Table test for the CI scripts' own refusals and cache rules (NRV-E1201 to E1211, NRV-W1201 and
+# Table test for the CI scripts' own refusals and cache rules (NRV-E1201 to E1214, NRV-W1201 and
 # W1202, docs/ERRORS.md; decision O4). Needs flock. Takes a few seconds; touches only a scratch
 # directory. Not covered, as they need a Woodpecker step or a daemon: NRV-E1203 (the Docker socket
 # is not mounted), the io_uring check on a real refusing daemon, and "main's cache is not writable
@@ -184,6 +184,16 @@ d6=$(cat "$tmp/dir6")
 is "a seed does not nest in an existing cache" "" "$(find "$d6" -name '*.partial.*')"
 is "no seed directory is left behind" "" "$(find "$c/branches" -maxdepth 1 -name '*.partial.*')"
 
+# NRV-E1214: a branch's cache path that is a regular file is refused, not used.
+branch_file() {
+    . ci/cache.sh
+    ci_branch_prepare "$c" feature/seven
+}
+seven=$(. ci/cache.sh; ci_branch_key feature/seven)
+: >"$c/branches/$seven"
+refuses NRV-E1214 "branch cache path is a file" branch_file
+rm -f "$c/branches/$seven"
+
 # --- ops/ci/io_uring_probe.sh: the probe's perl never dies (exit 255); NRV-E1201 and E1211 ---
 if command -v perl >/dev/null; then
     rc=0
@@ -197,7 +207,8 @@ mkdir "$tmp/fakedocker"
 cat >"$tmp/fakedocker/docker" <<'EOS'
 #!/bin/sh
 case "$1" in
-    pull) [ "$FAKE_PULL" = ok ] || { echo "toomanyrequests: pull rate limit" >&2; exit 1; } ;;
+    pull) [ "$FAKE_PULL" != down ] || { echo "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?" >&2; exit 1; }
+        [ "$FAKE_PULL" = ok ] || { echo "toomanyrequests: pull rate limit" >&2; exit 1; } ;;
     run) echo "${FAKE_REASON:-}" >&2; exit "$FAKE_RUN" ;;
 esac
 EOS
@@ -206,8 +217,27 @@ probe() { env PATH="$tmp/fakedocker:$PATH" "$@" bash ops/ci/io_uring_probe.sh; }
 refuses NRV-E1211 "probe: image not pulled" probe FAKE_PULL=no FAKE_RUN=0
 refuses "Operation not permitted" "probe: reason shown" probe FAKE_PULL=ok FAKE_RUN=1 FAKE_REASON="Operation not permitted"
 refuses "kernel.io_uring_disabled" "probe: other cause named" probe FAKE_PULL=ok FAKE_RUN=1
-refuses "probe itself failed" "probe: perl died" probe FAKE_PULL=ok FAKE_RUN=255 FAKE_REASON="perl: not found"
+refuses "daemon may be down" "probe: daemon down named" probe FAKE_PULL=down FAKE_RUN=0
+refuses NRV-E1212 "probe: perl died" probe FAKE_PULL=ok FAKE_RUN=255 FAKE_REASON="perl: not found"
+rc=0
+probe FAKE_PULL=ok FAKE_RUN=255 >/dev/null 2>&1 || rc=$?
+is "probe: a broken probe exits 3" 3 "$rc"
+rc=0
+probe FAKE_PULL=ok FAKE_RUN=1 >/dev/null 2>&1 || rc=$?
+is "probe: a refusal exits 1" 1 "$rc"
+rc=0
+probe FAKE_PULL=no FAKE_RUN=0 >/dev/null 2>&1 || rc=$?
+is "probe: a failed pull exits 2" 2 "$rc"
 ok "probe: io_uring allowed" probe FAKE_PULL=ok FAKE_RUN=0
+
+# NRV-E1213: nerva-woodpecker.sh copied alone (no io_uring_probe.sh beside it) says so, before it
+# touches anything. A stub `id` stands in for root.
+mkdir "$tmp/alone" "$tmp/fakeroot"
+cp ops/ci/nerva-woodpecker.sh "$tmp/alone/"
+printf '#!/bin/sh\necho 0\n' >"$tmp/fakeroot/id"
+chmod +x "$tmp/fakeroot/id"
+refuses NRV-E1213 "nerva-woodpecker.sh host without the probe" env PATH="$tmp/fakeroot:$PATH" bash "$tmp/alone/nerva-woodpecker.sh" host
+# woodpecker-bootstrap.sh needs root and Docker before its probe check; it has the same check.
 
 # ci_main_prune: empties main's Zig caches when nobody holds them; NRV-W1202 when others do.
 echo x >"$c/main/zig-local/entry"

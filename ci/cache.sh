@@ -113,6 +113,7 @@ ci_branch_prepare() {
     fi
     # Our own shared lock first, then the test: a prune by a job that holds fd 7 skips a cache whose
     # lock is held, so it cannot delete $dir between the test and the use (NRV-W1202 path too).
+    # (One empty b-<key>.lock stays per branch name the box has seen; a prune never unlinks them.)
     exec 6>>"$b/$key.lock"
     flock -s 6
     if [ ! -d "$dir" ]; then
@@ -128,8 +129,9 @@ ci_branch_prepare() {
                 echo "main's cache is over $seedgib GiB: branch $key starts empty" >&2
             fi
             mkdir -p "$partial/zig" "$partial/zig-local"
-            # -T: if a job without the lock made $dir meanwhile, replace nothing and move nothing in.
+            # -T: if a job without the lock filled $dir meanwhile, keep its directory and drop the seed.
             mv -T "$partial" "$dir" 2>/dev/null || rm -rf "$partial"
+            [ -d "$dir" ] || { ci_error "NRV-E1214: $dir is not a directory: remove it"; return 1; }
         else
             # No lock on the branches' directory: no shared partial directory a prune could remove.
             mkdir -p "$dir/zig" "$dir/zig-local"

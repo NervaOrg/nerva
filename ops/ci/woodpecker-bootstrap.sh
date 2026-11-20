@@ -238,7 +238,10 @@ if [ -f "$seccomp_src" ]; then
         step "Docker $(docker version --format '{{.Server.Version}}'): installing the io_uring seccomp profile, restarting Docker"
         systemctl restart docker
     fi
-    msg=$(bash "$(dirname "$(readlink -f "$0")")/io_uring_probe.sh" 2>&1) ||
+    probe="$(dirname "$(readlink -f "$0")")/io_uring_probe.sh"
+    [ -f "$probe" ] ||
+        fail "NRV-E1213: $probe is missing: run this from a copy of ops/ci/ that has io_uring_probe.sh and docker/ beside it (scp -r ops/ci root@BOX:)"
+    msg=$(bash "$probe" 2>&1) ||
         fail "$msg (docker info: $(docker info --format '{{json .SecurityOptions}}'))"
 else
     step "no $seccomp_src: Docker keeps its default seccomp profile, which refuses io_uring (Nerva's CI steps will fail NRV-E1201)"

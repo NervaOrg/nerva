@@ -3,7 +3,7 @@
 # Woodpecker"). Two modes:
 #
 #   On every agent box, as root:
-#     bash nerva-woodpecker.sh host
+#     bash nerva-woodpecker.sh host     (from a copy of the whole ops/ci/ directory)
 #   Checks Docker (and that its daemon carries the io_uring seccomp profile, which
 #   woodpecker-bootstrap.sh installs), /dev/fuse and /dev/kvm, and creates the cache directories
 #   under /var/cache/nerva-ci (main, branches and jepsen: decision O4).
@@ -23,7 +23,11 @@ fail() { echo "nerva-woodpecker: FAIL $*" >&2; exit 1; }
 say() { echo "nerva-woodpecker: $*"; }
 
 host() {
-    [ "$(id -u)" = 0 ] || fail "run as root: ssh -t root@BOX bash nerva-woodpecker.sh host"
+    local probe msg
+    [ "$(id -u)" = 0 ] || fail "run as root: ssh -t root@BOX bash ci/nerva-woodpecker.sh host"
+    probe="$(dirname "$(readlink -f "$0")")/io_uring_probe.sh"
+    [ -f "$probe" ] ||
+        fail "NRV-E1213: $probe is missing: run it from a copy of ops/ci/ that has io_uring_probe.sh beside it (scp -r ops/ci root@BOX:, then bash ci/nerva-woodpecker.sh host)"
     command -v docker >/dev/null || fail "no docker: run woodpecker-bootstrap.sh on this box first"
     docker info >/dev/null 2>&1 || fail "docker is installed but not running: systemctl status docker"
     docker ps --format '{{.Names}}' | grep -q woodpecker-agent ||
@@ -41,7 +45,7 @@ host() {
     fi
 
     # No step is privileged, so io_uring needs the daemon's own profile (ops/ci/docker/README.md).
-    msg=$(bash "$(dirname "$(readlink -f "$0")")/io_uring_probe.sh" 2>&1) || fail "$msg"
+    msg=$(bash "$probe" 2>&1) || fail "$msg"
 
     # The caches the workflows mount (.woodpecker/*.yaml); uid 1001 is the `ci` user the jobs run
     # as. main/ is written only by pipelines for a push to main, which mount it writable; the others

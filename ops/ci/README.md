@@ -153,12 +153,14 @@ too. Nerva has no equivalent of Zigbox's `ops/backup/` (which archives every rep
 ## 3b. Woodpecker
 
 ```bash
-scp woodpecker-bootstrap.sh root@ci.myproject.org:
+scp -r ops/ci root@ci.myproject.org:
 ```
 
 ```bash
-ssh -t root@ci.myproject.org bash woodpecker-bootstrap.sh
+ssh -t root@ci.myproject.org bash ci/woodpecker-bootstrap.sh
 ```
+
+(The whole directory: the script needs `docker/seccomp-io_uring.json` and `io_uring_probe.sh` beside it, NRV-E1213.)
 
 It asks for:
 
@@ -215,11 +217,11 @@ On the server, set a second DNS name. Rerun the script after adding `CI_GRPC_HOS
 `/etc/woodpecker/ci.env`. Then, on each new box (same steps 1 and 2, no DNS needed for the agent):
 
 ```bash
-scp woodpecker-bootstrap.sh root@NEWBOX:
+scp -r ops/ci root@NEWBOX:
 ```
 
 ```bash
-ssh -t root@NEWBOX bash woodpecker-bootstrap.sh agent
+ssh -t root@NEWBOX bash ci/woodpecker-bootstrap.sh agent
 ```
 
 It asks for the server's gRPC name and the agent secret (hidden). Read the secret on the server
@@ -263,11 +265,11 @@ Set this up once. `nerva-woodpecker.sh` does steps 1 to 4: `host` on each agent 
 `repo` from your laptop, where it also enables the repository:
 
 ```bash
-scp nerva-woodpecker.sh root@ci.myproject.org:
+scp -r ops/ci root@ci.myproject.org:
 ```
 
 ```bash
-ssh -t root@ci.myproject.org bash nerva-woodpecker.sh host
+ssh -t root@ci.myproject.org bash ci/nerva-woodpecker.sh host
 ```
 
 ```bash
@@ -296,7 +298,7 @@ set:
    (keeping every other key) and restarts Docker, only if either changed. **The restart stops the
    containers running on the box: do it with no pipeline running**; the agent and the server come
    back (`restart: unless-stopped`). `nerva-woodpecker.sh host` refuses to go on if the daemon
-   has no such profile (`io_uring_probe.sh`: it pulls the pinned ubuntu image, NRV-E1211 if it cannot, and
+   has no such profile (`io_uring_probe.sh`: it pulls the pinned ubuntu image, NRV-E1211 if it cannot, NRV-E1212 if the probe itself breaks, and
    runs `io_uring_setup` in a throwaway container), and every job checks io_uring first and fails with NRV-E1201 if it is
    refused. Without the profile there is no other way to run Nerva's IO in a step: do not make
    the steps privileged instead.
