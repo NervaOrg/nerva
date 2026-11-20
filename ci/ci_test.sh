@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Table test for the CI scripts' own refusals and cache rules (NRV-E1201 to E1221, NRV-B1201,
+# Table test for the CI scripts' own refusals and cache rules (NRV-E1201 to E1223, NRV-B1201,
 # NRV-W1201 and W1202, docs/ERRORS.md; decision O4). Needs flock and jq. Takes a few seconds;
 # touches only a scratch directory. Not covered, as they need a Woodpecker step or a daemon:
 # NRV-E1203 (the Docker socket is not mounted), NRV-E1209 and E1210 (Jepsen), the io_uring check on
@@ -64,6 +64,11 @@ refuses NRV-E1207 "jepsen without gnuplot" env PATH="$bin" JEPSEN_OUT="$tmp/out2
 
 # --- ci/io_uring_check.sh: NRV-E1201 ---
 refuses NRV-E1201 "io_uring refused" ci/io_uring_check.sh --pretend-refused
+mkdir -p "$tmp/badpy"
+printf '#!/bin/sh\necho "Traceback: boom" >&2\nexit 1\n' >"$tmp/badpy/python3"
+chmod +x "$tmp/badpy/python3"
+refuses NRV-E1223 "io_uring probe that breaks (exit 1)" env PATH="$tmp/badpy:$PATH" ci/io_uring_check.sh
+refuses "Traceback: boom" "io_uring probe's error is in the message" env PATH="$tmp/badpy:$PATH" ci/io_uring_check.sh
 
 # --- ci/docker_client.sh: NRV-E1204, E1205 ---
 mkdir -p "$tmp/dc/src/docker"
@@ -87,6 +92,8 @@ is "docker client cache repaired" "$dsha" "$(sha256sum "$tmp/dc/c3/docker-9.tgz"
 key=$(printf 'ab%.0s' {1..32})
 out=$(env -u GITHUB_ACTIONS bash -c ". ci/lib.sh; ci_mask $key; echo \"key $key and ${key:0:16}x\" | ci_redact")
 is "ci_redact" "key *** and ***x" "$out"
+out=$(env -u GITHUB_ACTIONS bash -c ". ci/lib.sh; ci_mask $key; echo \"key ${key^^}\" | ci_redact")
+is "ci_redact is case-insensitive" "key ***" "$out"
 is "ci_redact without a mask" "plain" "$(env -u GITHUB_ACTIONS bash -c '. ci/lib.sh; echo plain | ci_redact')"
 refuses NRV-B1201 "ci_redact refuses a value that is not hex" env -u GITHUB_ACTIONS bash -c '. ci/lib.sh; ci_mask not-hex; echo x | ci_redact'
 
@@ -95,6 +102,11 @@ timed() { env -u GITHUB_ACTIONS CI_KILL_AFTER=1 bash -c '. ci/lib.sh; ci_run_tim
 refuses NRV-E1215 "a job past its time limit (TERM)" timed stubjob 1 sleep 30
 refuses NRV-E1215 "a job that ignores TERM (killed)" timed stubjob 1 sh -c 'trap "" TERM; sleep 30'
 ok "a job within its limit" timed stubjob 5 true
+out=$(timed stubjob 30 sh -c 'kill -9 $$' 2>&1) || true
+grep -q NRV-E1222 <<<"$out" || { echo "FAIL kill -9: no NRV-E1222 in: $out" >&2; fail=1; }
+if grep -q NRV-E1215 <<<"$out"; then echo "FAIL kill -9: reported as NRV-E1215: $out" >&2; fail=1; fi
+out=$(timed stubjob 30 sh -c 'exit 124' 2>&1) || true
+if grep -q 'NRV-E12' <<<"$out"; then echo "FAIL exit 124 by itself: reported: $out" >&2; fail=1; fi
 rc=0
 timed stubjob 5 sh -c 'exit 7' >/dev/null 2>&1 || rc=$?
 is "a failing job keeps its own status" 7 "$rc"
@@ -120,21 +132,24 @@ if [ "$(id -u)" != 0 ]; then
     chmod u+w "$c/main"
 fi
 
-# A branch's zig/ is a plain copy of main's (not a link, and writing it leaves main's alone);
-# main's zig-local, which a build may be writing, is not copied.
+# A branch's zig/p is a plain copy of main's (not a link, and writing it leaves main's alone);
+# main's zig-local and the rest of its zig/, which a build may be writing, are not copied.
+mkdir -p "$c/main/zig/p"
 echo seed >"$c/main/zig-local/entry"
 echo seed >"$c/main/zig/entry"
+echo seed >"$c/main/zig/p/entry"
 (
     . ci/cache.sh
     ci_branch_prepare "$c" feature/one
     echo "$CI_BRANCH_DIR" >"$tmp/dir1"
 )
 d1=$(cat "$tmp/dir1")
-is "branch cache seeded" seed "$(cat "$d1/zig/entry")"
+is "branch cache seeded" seed "$(cat "$d1/zig/p/entry")"
+is "main's other zig files are not copied" "p" "$(ls -A "$d1/zig")"
 is "main's zig-local is not copied" "" "$(ls -A "$d1/zig-local")"
-is "branch cache is a copy, not a link" 1 "$(stat -c %h "$d1/zig/entry")"
-echo changed >>"$d1/zig/entry"
-is "main untouched by a branch" seed "$(cat "$c/main/zig/entry")"
+is "branch cache is a copy, not a link" 1 "$(stat -c %h "$d1/zig/p/entry")"
+echo changed >>"$d1/zig/p/entry"
+is "main untouched by a branch" seed "$(cat "$c/main/zig/p/entry")"
 # Main's cache over the seed limit: the branch starts empty (du rounds up to a whole GiB).
 (
     . ci/cache.sh
@@ -371,7 +386,7 @@ touch "$c/main/.lock"
 (
     . ci/cache.sh
     exec 9<"$c/main/.lock"
-    CI_PRUNE_WAIT=1 ci_main_prune "$c"
+    CI_PRUNE_WAIT=1 ci_main_prune "$c" 99999999
 )
 is "main pruned when idle" "" "$(ls -A "$c/main/zig-local")"
 echo x >"$c/main/zig-local/entry"
@@ -381,12 +396,31 @@ sleep 0.3
 out=$(
     . ci/cache.sh
     exec 9<"$c/main/.lock"
-    CI_PRUNE_WAIT=1 ci_main_prune "$c" 2>&1
+    CI_PRUNE_WAIT=1 ci_main_prune "$c" 99999999 2>&1
 )
 kill "$holder" 2>/dev/null || true
 wait "$holder" 2>/dev/null || true
 grep -q NRV-W1202 <<<"$out" || { echo "FAIL prune busy: no NRV-W1202 in: $out" >&2; fail=1; }
 is "main kept when busy" entry "$(ls "$c/main/zig-local")"
+# Space is no longer low once the wait ends: not pruned, and no warning even though the lock is busy.
+flock -s "$c/main/.lock" sleep 20 &
+holder=$!
+sleep 0.3
+out=$(
+    . ci/cache.sh
+    exec 9<"$c/main/.lock"
+    CI_PRUNE_WAIT=1 ci_main_prune "$c" 0 2>&1
+)
+kill "$holder" 2>/dev/null || true
+wait "$holder" 2>/dev/null || true
+if grep -q NRV-W1202 <<<"$out"; then echo "FAIL prune busy but space free: NRV-W1202 in: $out" >&2; fail=1; fi
+is "main kept when space is free again" entry "$(ls "$c/main/zig-local")"
+(
+    . ci/cache.sh
+    exec 9<"$c/main/.lock"
+    CI_PRUNE_WAIT=1 ci_main_prune "$c" 0 >/dev/null
+)
+is "main kept when idle and space is free" entry "$(ls "$c/main/zig-local")"
 
 # --- ci/install_zig.sh: the toolchain archive is checked on every use; only main writes it ---
 z="$tmp/zrepo"

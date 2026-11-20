@@ -2,17 +2,15 @@
 # Nerva's part of the Woodpecker setup, after woodpecker-bootstrap.sh (README.md, "Nerva on
 # Woodpecker"). Two modes:
 #
-# Run from the repository root; every path below is spelled from there.
-#
-#   On every agent box, as root (after `scp -r ops/ci root@BOX:`, which puts the directory at
-#   ~/ci/ on the box):
+#   `host` runs on the box, as root, from ~ (after `scp -r ops/ci root@BOX:`, which puts the
+#   directory at ~/ci/ on the box), on every agent box:
 #     bash ci/nerva-woodpecker.sh host
 #   Checks Docker (and that its daemon carries the io_uring seccomp profile, which
 #   woodpecker-bootstrap.sh installs), /dev/fuse and /dev/kvm, and creates the cache directories
 #   under /var/cache/nerva-ci (main, branches and jepsen: decision O4).
 #
-#   On your laptop (needs curl and jq), with a personal token from Woodpecker (your avatar, then
-#   Personal access token):
+#   `repo` runs from the repository root, on your laptop (needs curl and jq), with a personal
+#   token from Woodpecker (your avatar, then Personal access token):
 #     WOODPECKER_SERVER=https://ci.example.org WOODPECKER_TOKEN=... bash ops/ci/nerva-woodpecker.sh repo OWNER/NAME
 #   Enables the repository if it is not yet, then sets: pull requests off, approval for forks,
 #   a 360-minute timeout, and Trusted for volumes and network (not security: no step is

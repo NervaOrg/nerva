@@ -1,5 +1,5 @@
 # Woodpecker, on the project's own machine (ops/ci/README.md, "Nerva on Woodpecker"). Pushes to any
-# branch of NervaLog/nerva but jepsen/**, and manual runs without NERVA_RUN: never a pull request,
+# branch of NervaOrg/nerva but jepsen/**, and manual runs without NERVA_RUN: never a pull request,
 # so never a fork's code (P147e; the repository's "Allow pull requests" is off as well). The
 # commands are ci/job.sh's, the same as ci.yml's job of the same name.
 # The demos under crashes, one workflow each. The list must be the one test:demo runs (build.zig);

@@ -1,6 +1,6 @@
 # Woodpecker and Forgejo on your own boxes
 
-**Nerva's shape (2026-11):** GitHub (`NervaLog/nerva`) stays the forge. Woodpecker runs from
+**Nerva's shape (2026-11):** GitHub (`NervaOrg/nerva`) stays the forge. Woodpecker runs from
 GitHub's webhooks (`forge = github`) on one bare-metal Hetzner auction server, which has
 `/dev/kvm`, so section 1 is Robot, not `hcloud`. A separate Forgejo pull-mirrors the repository
 every 5 minutes (`mirror_interval` in `ops/forgejo/forgejo-bootstrap.sh`), as a copy that does
@@ -11,7 +11,7 @@ The scripts: `ops/ci/woodpecker-bootstrap.sh` and `ops/forgejo/forgejo-bootstrap
 
 **Every command below is run from the repository root on your laptop**, and every path in it is
 spelled from there (`ops/ci/...`, `ops/forgejo/...`). The `ssh` commands run on the box, where
-`scp ops/ci root@BOX:` has put the directory at `~/ci/` and `scp ops/forgejo/forgejo-bootstrap.sh
+`scp -r ops/ci root@BOX:` has put the directory at `~/ci/` and `scp ops/forgejo/forgejo-bootstrap.sh
 root@BOX:` the Forgejo script at `~/forgejo-bootstrap.sh`: so what runs there is `bash ci/...` and
 `bash forgejo-bootstrap.sh`, never `ops/ci/...`.
 
@@ -334,7 +334,8 @@ set:
    next jobs make them again. Do not delete `main/tools` unless the archive is damaged: a job
    checks it by its sha256 and downloads it again anyway (NRV-W1201). A pipeline killed half way
    leaves a `branches/*.partial.*` directory, which the next prune removes. A branch whose builds fail with
-   `FileNotFound` has a half-written `zig-local`: `rm -rf /var/cache/nerva-ci/branches/b-<key>-*`.
+   `FileNotFound` has a half-written `zig-local`: `rm -rf /var/cache/nerva-ci/branches/b-<safe>-<hash8>`, the exact directory the job's log
+   prints (never the `.lock` file beside it), with the agent idle (no pipeline running).
 5. **GitHub statuses:** each workflow reports as `ci/woodpecker/push/<file>`, for example
    `ci/woodpecker/push/check` or `ci/woodpecker/push/demo/1`. Whether any of them becomes a
    required check on `main` is the owner's choice. GitHub's own checks stay required either

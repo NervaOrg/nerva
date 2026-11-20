@@ -13,6 +13,7 @@
 #   ci_run_timed JOB SECONDS CMD...
 #                         runs CMD under `timeout`; NRV-E1215 if it ran past SECONDS (exit 124, or
 #                         137 when it ignored the TERM and was killed 60 s later, CI_KILL_AFTER)
+#                         and SECONDS have really passed; NRV-E1222 for a SIGKILL before that
 
 ci_error() {
     if [ "${GITHUB_ACTIONS:-}" = true ]; then echo "::error::$*"; else echo "error: $*" >&2; fi
@@ -33,16 +34,21 @@ ci_redact() {
     local script=() v
     for v in ${CI_MASKED[@]+"${CI_MASKED[@]}"}; do
         [[ "$v" =~ ^[0-9A-Fa-f]{16,}$ ]] || { ci_error "NRV-B1201: ci_redact: a masked value must be at least 16 hex characters (a bug in the script that masked it)"; return 1; }
-        script+=(-e "s/${v}/***/g" -e "s/${v:0:16}/***/g")
+        script+=(-e "s/${v}/***/gI" -e "s/${v:0:16}/***/gI")
     done
     if [ "${#script[@]}" -eq 0 ]; then cat; else sed -u "${script[@]}"; fi
 }
 
 ci_run_timed() {
-    local job="$1" seconds="$2" status=0 limit
+    local job="$1" seconds="$2" status=0 limit start="$SECONDS"
     shift 2
     timeout --kill-after="${CI_KILL_AFTER:-60}" "$seconds" "$@" || status=$?
-    if [ "$status" = 124 ] || [ "$status" = 137 ]; then
+    if [ "$status" = 137 ] && [ $((SECONDS - start)) -lt "$seconds" ]; then
+        # SIGKILL well before the limit: not our timeout (it kills only after the limit plus the
+        # grace period), so the kernel's OOM killer or someone's kill -9.
+        ci_error "NRV-E1222: $job was killed by SIGKILL after $((SECONDS - start)) s, before its limit of $seconds s: possibly the OOM killer; check dmesg or journalctl -k"
+    elif [ "$status" = 124 ] || [ "$status" = 137 ]; then
+        [ $((SECONDS - start)) -ge "$seconds" ] || return "$status" # the command's own exit 124
         limit="$seconds seconds"
         [ $((seconds % 60)) != 0 ] || limit="$((seconds / 60)) minutes"
         ci_error "NRV-E1215: $job ran past its $limit and was stopped: a hung job, or a limit too short for this box; CI_STEP_MINUTES raises it for a run"

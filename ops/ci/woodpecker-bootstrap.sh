@@ -2,7 +2,7 @@
 # Woodpecker CI on one Ubuntu 24.04 box: Docker, the Woodpecker server, one agent and Caddy (TLS
 # from Let's Encrypt), for any project on GitHub or on a Forgejo. Run it as root on the box:
 #
-# Run from the repository root, after `scp -r ops/ci root@BOX:` (the whole directory, which lands
+# It runs on the box, from ~, after `scp -r ops/ci root@BOX:` (the whole directory, which lands
 # at ~/ci/ on the box; the script needs docker/seccomp-io_uring.json and io_uring_probe.sh beside it):
 #
 #   bash ci/woodpecker-bootstrap.sh            the server and an agent on this box

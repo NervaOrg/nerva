@@ -1,5 +1,5 @@
 # Woodpecker, on the project's own machine (ops/ci/README.md, "Nerva on Woodpecker"). Pushes to any
-# branch of NervaLog/nerva but jepsen/**, and manual runs without NERVA_RUN: never a pull request,
+# branch of NervaOrg/nerva but jepsen/**, and manual runs without NERVA_RUN: never a pull request,
 # so never a fork's code (P147e; the repository's "Allow pull requests" is off as well). The commands
 # are `ci/job.sh check-scripts`: ci.yml's `checks` job runs `ci/job.sh check`, which is check-code, check-scripts
 # and check-packages in turn; here the three run side by side.

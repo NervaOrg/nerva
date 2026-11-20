@@ -107,7 +107,7 @@ if [ "$role" = main ]; then
     chown "$user:$user" "$cache/main/.lock"
     install -d -o "$user" -g "$user" "$cache/main/zig" "$cache/main/zig-local" "$cache/main/tools"
     exec 9<"$cache/main/.lock"
-    [ "$low" = no ] || { echo "Below $free_min_gib GiB free"; ci_main_prune "$cache"; }
+    [ "$low" = no ] || { echo "Below $free_min_gib GiB free"; ci_main_prune "$cache" "$free_min_gib"; }
     flock -s 9
     base="$cache/main"
     toolchain_write=1

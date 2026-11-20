@@ -3,7 +3,8 @@
 # the one rule about them (decision O4): only a pipeline for a push to main writes main's caches.
 #
 #   <root>/main/            main's: tools/ (the pinned Zig's archive, by sha256), zig/, zig-local/
-#   <root>/branches/<key>/  one branch's own zig/ and zig-local/; zig/ is seeded by a copy of main's
+#   <root>/branches/<key>/  one branch's own zig/ and zig-local/; zig/p (fetched packages) is seeded
+#                         by a copy of main's
 #
 # A branch's pipeline mounts main/ read-only (.woodpecker/*.yaml) and branches/ writable; main's
 # mounts main/ writable and not branches/. ci_cache_check refuses a mount that is the wrong way
@@ -124,13 +125,19 @@ ci_branch_prepare() {
         if [ "$locked" = yes ]; then
             partial="$dir.partial.$$"
             mkdir -p "$partial"
-            # Only the toolchain's global cache is copied (a plain copy: a hard link would let a
-            # branch write main's inode). Main's zig-local may be half written by a build running
-            # now, and the branch would keep that for days; it starts empty and fills itself.
-            if [ "$(ci_dir_gib "$root/main/zig")" -le "$seedgib" ]; then
-                cp -a "$root/main/zig" "$partial/" 2>/dev/null || true
+            # Only zig/p, the fetched packages, is copied: they are content-addressed and written
+            # once. Main's other global-cache files and its zig-local are rewritten by main's jobs,
+            # which hold main's lock shared, as this job does (the shared flock in the step script):
+            # nothing keeps them out while this copies, so a copy could keep a torn file for days.
+            # They start empty and fill themselves. A plain copy: a hard link would let a branch
+            # write main's inode.
+            mkdir -p "$partial/zig"
+            if [ ! -d "$root/main/zig/p" ]; then
+                echo "main has no package cache yet: branch $key starts empty" >&2
+            elif [ "$(ci_dir_gib "$root/main/zig/p")" -le "$seedgib" ]; then
+                cp -a "$root/main/zig/p" "$partial/zig/" 2>/dev/null || true
             else
-                echo "main's cache is over $seedgib GiB: branch $key starts empty" >&2
+                echo "main's package cache is over $seedgib GiB: branch $key starts empty" >&2
             fi
             mkdir -p "$partial/zig" "$partial/zig-local"
             # -T: if a job without the lock filled $dir meanwhile, keep its directory and drop the seed.
@@ -149,12 +156,19 @@ ci_branch_prepare() {
     CI_BRANCH_DIR="$dir" # not printed: a command substitution would drop the lock with its shell
 }
 
-# ci_main_prune ROOT: empties main's Zig caches (never the pinned toolchain) if the lock on fd 9
-# (main/.lock) is free within CI_PRUNE_WAIT s: every job holds it shared while it runs, so this is
-# called before the caller takes its own shared lock, which it takes after, pruned or not.
+# ci_main_prune ROOT MIN_GIB: empties main's Zig caches (never the pinned toolchain) when the box
+# is low on space (under MIN_GIB free) and the lock on fd 9 (main/.lock) is free: every job holds it
+# shared while it runs, so this is called before the caller takes its own shared lock, which it
+# takes after, pruned or not. One pruner per push is enough, so the wait is short (CI_PRUNE_WAIT,
+# default 5 s) and, once it ends (lock taken or not), space is measured again: if another job has
+# freed it, nothing is pruned and nothing is warned. NRV-W1202 only if space is still low and the
+# lock was not free.
 ci_main_prune() {
-    local root="$1" wait="${CI_PRUNE_WAIT:-600}"
-    if flock -x -w "$wait" 9; then
+    local root="$1" min="$2" wait="${CI_PRUNE_WAIT:-5}" got=no
+    flock -x -w "$wait" 9 && got=yes
+    if [ "$(df --output=avail -B1G "$root/main" | tail -1 | tr -d ' ')" -ge "$min" ]; then
+        echo "main's cache: space is free again, not pruning"
+    elif [ "$got" = yes ]; then
         echo "emptying main's Zig caches (no other job holds them)"
         rm -rf "$root/main/zig" "$root/main/zig-local"
         mkdir -p "$root/main/zig" "$root/main/zig-local"
