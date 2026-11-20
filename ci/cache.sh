@@ -14,8 +14,9 @@
 # The step runs as root and the job as `ci`, so every path a job can write (all of main/ and
 # branches/, and /cache/jepsen) is the job's to redirect: a symlink planted there would make a
 # root chown, chmod, install, mkdir or cp, or a root redirection, act on its target. Root therefore
-# never creates, chowns, chmods or writes anything there (the one exception, `install -d -o ci
-# /cache/jepsen` in the step, is on the mount's own root, which a job cannot swap for a link). What the job needs made there is made by
+# never creates, chowns, chmods or writes anything there (the exceptions, both on a mount's own
+# root, which a job cannot swap for a link: `install -d -o ci /cache/jepsen` in the step, and the
+# `chmod 0755` of ci_cache_job_writable, only when the job's own uid owns it). What the job needs made there is made by
 # the job user itself (ci_as_job, `mkdir`, `mktemp`, `cp`, `mv`, `touch`), which can only touch what
 # the job could touch anyway; root only tests (never acts on the result of a test, so a swap after
 # it changes nothing) and unlinks (rm -rf of a path whose parent is a mount root, which never
@@ -26,8 +27,9 @@
 # A branch's pipeline mounts main/ read-only (.woodpecker/*.yaml) and branches/ writable; main's
 # mounts main/ writable and not branches/. ci_cache_check refuses a mount that is the wrong way
 # round (NRV-E1202: root's access(2) test, which only a read-only mount changes, never the owner or
-# the mode of the mount root), and a mount root the job's user cannot write (NRV-E1229: the job's own
-# test, with the owner and mode in the message; an owner can chmod its mount root). The mounts are
+# the mode of the mount root), and a mount root the job's user cannot write (the job's own test: if
+# the job owns it and only its mode, from a job's chmod, stops it, it is set back to 0755 with
+# NRV-W1203; if another user owns it, NRV-E1229 with the owner and mode in the message). The mounts are
 # what enforce the rule: this script only notices a wrong one.
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
@@ -49,13 +51,27 @@ ci_cache_writable() {
     test -w "$1"
 }
 
-# ci_cache_job_writable DIR: the ownership question, apart from the mount's: NRV-E1229 if the job's
-# user cannot write DIR (the mount root a job makes its directories in), whoever owns it and
-# whatever its mode: Docker makes a missing mount source root 0755, and an owner (a job) can chmod
-# it. The message names the owner and the mode.
+# ci_cache_job_writable DIR: the ownership question, apart from the mount's: whether the job's user
+# can write DIR (the mount root a job makes its directories in), whoever owns it and whatever its
+# mode: Docker makes a missing mount source root 0755, and an owner (a job) can chmod it.
+#  - If the job's own uid owns DIR and only the mode stops it (a job's `chmod 0555`), this sets it
+#    back to 0755 and warns (NRV-W1203): otherwise one job could fail every later pipeline until an
+#    operator acted. Safe, as DIR is a mount's own root, which a job cannot swap for a link or
+#    rename (EBUSY) and whose parent, /cache, is root's; a link at DIR is still refused, never
+#    followed.
+#  - If anyone else owns it, NRV-E1229 names the owner and the mode: root never chowns a host
+#    directory it was not given.
 ci_cache_job_writable() {
-    local d="$1"
+    local d="$1" job_uid was
     ci_as_job test -w "$d" && return 0
+    job_uid=$(id -u "${CI_JOB_USER:-$(id -un)}")
+    if [ ! -L "$d" ] && [ "$(stat -c %u "$d")" = "$job_uid" ]; then
+        was=$(stat -c %a "$d")
+        if chmod 0755 -- "$d" 2>/dev/null && ci_as_job test -w "$d"; then
+            ci_warning "NRV-W1203: $d, owned by the job's user (${CI_JOB_USER:-$(id -un)}), had mode $was and was not writable: set it back to 0755 (a job's chmod); on the host, run bash ci/nerva-woodpecker.sh host again if this keeps happening"
+            return 0
+        fi
+    fi
     ci_error "NRV-E1229: $d is mounted read-write but the job's user (${CI_JOB_USER:-$(id -un)}) cannot write it (owner $(stat -c '%U, uid %u' "$d"), mode $(stat -c %a "$d")): on the host, run bash ci/nerva-woodpecker.sh host again, or chown it to that user and chmod 0755 it"
     return 1
 }

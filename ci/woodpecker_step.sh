@@ -136,6 +136,17 @@ as_ci=(setpriv --reuid "$user" --regid "$user" --init-groups
 # job would inherit them and could `flock -x` one for good. Both commands close them for the child
 # only; the step's own descriptors, and so its locks, stay open until it exits.
 "${as_ci[@]}" ci/install_zig.sh 6>&- 7>&- 8>&- 9<&-
+# The scripts' own tests run as root, here, before the job (review 6000930445): their guards on what
+# root does (the uid spies, the ownership and mount tests) are vacuous, and say so, as anyone else.
+# The checkout is this commit's and nothing untrusted has run in this step yet, as for the scripts
+# above. Without CAP_SYS_ADMIN (this container's) their mount tests print a skip note. The job then
+# skips its own run of them (CI_SCRIPTS_TESTED), and the step fails if either failed.
+tests_status=0
+if [ "$job" = check-scripts ]; then
+    ci_run_timed "$job's ci_test.sh, as root" "$((minutes * 60))" bash ci/ci_test.sh 6>&- 7>&- 8>&- 9<&- || tests_status=$?
+    as_ci+=(CI_SCRIPTS_TESTED=1)
+fi
 status=0
 ci_run_timed "$job" "$((minutes * 60))" "${as_ci[@]}" ci/job.sh "$job" ${arg:+"$arg"} 6>&- 7>&- 8>&- 9<&- || status=$?
+[ "$status" != 0 ] || status=$tests_status
 exit "$status"

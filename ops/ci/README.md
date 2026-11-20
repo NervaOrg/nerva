@@ -347,8 +347,12 @@ set:
    mounted read-write is asked of root (`test -w`, which reports a read-only mount and ignores
    the owner and the mode, so a job that chmods its own mount root changes nothing), not probed by
    creating a file; whether the job's user can write the root it makes its directories in is a
-   second question, asked of the job's user, with its own refusal (NRV-E1229: `nerva-woodpecker.sh
-   host` again, or `chown` and `chmod 0755` it on the host); a root `rm -rf` is only on a path whose parent is a mount root, and anything
+   second question, asked of the job's user. If the job's own uid owns the root and only its mode
+   stops the job (a job's `chmod 0555`), the step sets it back to `0755` and warns (NRV-W1203): one
+   job cannot fail every later pipeline. That `chmod` is the one root does inside these paths
+   besides `install -d -o ci /cache/jepsen`; it is on a mount's own root (no link, no rename), is
+   never done to a link, and never to a directory another user owns, which is NRV-E1229
+   (`nerva-woodpecker.sh host` again, or `chown` and `chmod 0755` it on the host); a root `rm -rf` is only on a path whose parent is a mount root, and anything
    deeper is unlinked by the job's user. The step makes what a job needs there as the job's user (`ci_as_job`), replaces a
    symlink it finds (`rm` unlinks and never follows) and refuses what is not a plain directory the
    job can write (NRV-E1228: `rm -rf` it on the host; it is only a cache).
@@ -414,10 +418,15 @@ CI_PIPELINE_EVENT=manual ci/woodpecker_step.sh check-code
 - Nerva's workflows, after decision O4 (no step privileged; main and branch caches):
   - **Run (in a scratch directory, by `ci/ci_test.sh`, in `check-scripts`):** every refusal of
     the `ci/` scripts but E1203, E1209 and E1210 (E1201 with a stand-in for the kernel's refusal; E1202 for a writable main cache in a branch's role and a
-    missing mount; E1229 and E1230; E1204 to E1208; W1201; W1202), and `ci_redact`; the cache rules (a
+    missing mount; E1229 to E1232; E1204 to E1208; W1201 to W1203), and `ci_redact`; the cache rules (a
     branch's cache is a copy, not a link; main is untouched by a branch; the count bound; a cache
     in use is not pruned; main's prune and its busy case); the toolchain archive checked and
     replaced on main, never replaced by a branch. `ci/changes_test.sh` covers the docs-only skip.
+    `ci/ci_test.sh` runs as root in both CIs (Woodpecker: the step, before the job, which skips its
+    own run; GitHub: a `sudo` step in `checks`), as its guards on what root does need root. The
+    Woodpecker container has no `CAP_SYS_ADMIN`, so its read-only-mount and tmpfs tests print a
+    skip note there; GitHub's runner runs them. Run by hand as anyone else, it prints a note for
+    every block it skipped.
     The seccomp profile's merge into `daemon.json` was run with `jq` on an empty file and on a file
     with other keys (idempotent). All the scripts pass `bash -n`; the `.woodpecker/*.yaml` and
     `ci.yml` parse as YAML.
