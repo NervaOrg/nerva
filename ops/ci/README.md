@@ -344,8 +344,11 @@ set:
    redirection would follow it (to `/cache/locks`, or `/etc/passwd`, which would make the job root
    in the next step's container). The one root operation on them is `install -d -o ci /cache/jepsen`,
    on the mount's own root, which a job cannot swap for a link. Whether `main/` and `branches/` are
-   writable is asked of the job's user (`test -w`, which reports a read-only mount), not probed by
-   creating a file; a root `rm -rf` is only on a path whose parent is a mount root, and anything
+   mounted read-write is asked of root (`test -w`, which reports a read-only mount and ignores
+   the owner and the mode, so a job that chmods its own mount root changes nothing), not probed by
+   creating a file; whether the job's user can write the root it makes its directories in is a
+   second question, asked of the job's user, with its own refusal (NRV-E1229: `nerva-woodpecker.sh
+   host` again, or `chown` and `chmod 0755` it on the host); a root `rm -rf` is only on a path whose parent is a mount root, and anything
    deeper is unlinked by the job's user. The step makes what a job needs there as the job's user (`ci_as_job`), replaces a
    symlink it finds (`rm` unlinks and never follows) and refuses what is not a plain directory the
    job can write (NRV-E1228: `rm -rf` it on the host; it is only a cache).
@@ -411,7 +414,7 @@ CI_PIPELINE_EVENT=manual ci/woodpecker_step.sh check-code
 - Nerva's workflows, after decision O4 (no step privileged; main and branch caches):
   - **Run (in a scratch directory, by `ci/ci_test.sh`, in `check-scripts`):** every refusal of
     the `ci/` scripts but E1203, E1209 and E1210 (E1201 with a stand-in for the kernel's refusal; E1202 for a writable main cache in a branch's role and a
-    missing mount; E1204 to E1208; W1201; W1202), and `ci_redact`; the cache rules (a
+    missing mount; E1229 and E1230; E1204 to E1208; W1201; W1202), and `ci_redact`; the cache rules (a
     branch's cache is a copy, not a link; main is untouched by a branch; the count bound; a cache
     in use is not pruned; main's prune and its busy case); the toolchain archive checked and
     replaced on main, never replaced by a branch. `ci/changes_test.sh` covers the docs-only skip.

@@ -4,12 +4,18 @@
 # touches only a scratch directory. Not covered, as they need a Woodpecker step or a daemon:
 # NRV-E1203 (the Docker socket is not mounted), NRV-E1209 and E1210 (Jepsen), the io_uring check on
 # a real refusing daemon, woodpecker-bootstrap.sh's NRV-E1213 (its preflight wants root on Ubuntu
-# 24.04 first), and "main's cache is not writable in a pipeline for main" when this runs as root
-# (root writes through a read-only mode).
+# 24.04 first). Tests that need two users (root and the job's) or a real read-only bind mount run
+# only as root, and the mount ones only where `mount --bind` works (they say so when they do not).
 set -eu
 root=$(cd "$(dirname "$0")/.." && pwd)
 tmp=${CI_TEST_TMP:-$(mktemp -d)}
-trap 'rm -rf "$tmp"' EXIT
+ro_mounts=() # bind mounts made by the tests below (root only); unmounted before the scratch directory goes
+cleanup() {
+    local m
+    for m in "${ro_mounts[@]}"; do umount "$m" 2>/dev/null || true; done
+    rm -rf "$tmp"
+}
+trap cleanup EXIT
 cd "$root"
 fail=0
 
@@ -95,7 +101,64 @@ is "docker client install: nothing unpacked for a wrong archive" no "$([ -e "$tm
 ok "docker client install: the right archive" env CI_ARCH=x86_64 CI_DOCKER_BIN_DIR="$tmp/dc/bin3" \
     ci/docker_client.sh 9 "$dsha" "$tmp/dc/c3" install
 [ -x "$tmp/dc/bin3/docker" ] || { echo "FAIL docker client install: no binary" >&2; fail=1; }
-is "docker client install unpacks the copy it checked, not the path (static)" 1 "$(grep -c 'tar --no-same-owner -xzf "\$work/docker.tgz"' ci/docker_client.sh || true)"
+is "docker client install unpacks the copy it checked, not the path (static, a supplement to the swap test)" 1 "$(grep -c 'tar --no-same-owner -xzf "\$work/docker.tgz"' ci/docker_client.sh || true)"
+# What is unpacked is what was checked (review 6000627166): a stub for `head` and `cat` (whichever
+# reads the archive) swaps the archive's path for another, valid, archive right after it has copied,
+# which is where a check by path and an unpack by path would see two files. The unpacked binary
+# must be the checked one's.
+mkdir -p "$tmp/dc/evil/docker" "$tmp/dc/swap" "$tmp/dc/c5"
+printf '#!/bin/sh\necho evil\n' >"$tmp/dc/evil/docker/docker"
+chmod +x "$tmp/dc/evil/docker/docker"
+tar -czf "$tmp/dc/evil.tgz" -C "$tmp/dc/evil" docker
+for n in head cat; do
+    printf '#!/bin/bash\n%s "$@"\nrc=$?\nlast="${@: -1}"\nrm -f "$last"\n%s "%s" "$last"\nexit $rc\n' \
+        "$(command -v "$n")" "$(command -v cp)" "$tmp/dc/evil.tgz" >"$tmp/dc/swap/$n"
+    chmod +x "$tmp/dc/swap/$n"
+done
+cp "$tmp/dc/docker-9.tgz" "$tmp/dc/c5/docker-9.tgz"
+ok "docker client install: the archive is swapped after the copy" env PATH="$tmp/dc/swap:$PATH" CI_ARCH=x86_64 CI_DOCKER_BIN_DIR="$tmp/dc/bin5" \
+    ci/docker_client.sh 9 "$dsha" "$tmp/dc/c5" install
+is "docker client install unpacks the checked copy, not the swapped path" "$(cat "$tmp/dc/src/docker/docker")" "$(cat "$tmp/dc/bin5/docker" 2>/dev/null)"
+is "(the stub did swap the path)" "$(sha256sum <"$tmp/dc/evil.tgz")" "$(sha256sum <"$tmp/dc/c5/docker-9.tgz")"
+# NRV-E1230: a directory or a link at the archive's path (a directory made fetch "succeed" by moving
+# the download into it, and install then blamed the pin for ever), in each phase; nothing is
+# unpacked, and nothing is moved into the directory.
+for phase in fetch install all; do
+    d="$tmp/dc/plant-$phase"
+    rm -rf "$d"
+    mkdir -p "$d/docker-9.tgz"
+    refuses NRV-E1230 "docker client $phase: a directory at the archive's path" env CI_ARCH=x86_64 CI_DOCKER_CLIENT_URL="file://$tmp/dc/docker-9.tgz" \
+        CI_DOCKER_BIN_DIR="$tmp/dc/bin-d-$phase" ci/docker_client.sh 9 "$dsha" "$d" "$phase"
+    is "docker client $phase: nothing moved into the directory, nothing unpacked" "" "$(ls -A "$d/docker-9.tgz")$([ -e "$tmp/dc/bin-d-$phase/docker" ] && echo bin)"
+    if [ "$phase" = install ]; then
+        out=$(env CI_ARCH=x86_64 CI_DOCKER_BIN_DIR="$tmp/dc/bin-m" ci/docker_client.sh 9 "$dsha" "$d" install 2>&1 || true)
+        { grep -q "rm -rf" <<<"$out" && ! grep -q "NRV-E1205" <<<"$out"; } || { echo "FAIL E1230 does not tell the host fix, or blames the pin: $out" >&2; fail=1; }
+    fi
+    rm -rf "$d"
+    mkdir -p "$d"
+    ln -s "$tmp/dc/docker-9.tgz" "$d/docker-9.tgz" # a link to an archive that matches the pin
+    refuses NRV-E1230 "docker client $phase: a link at the archive's path" env CI_ARCH=x86_64 CI_DOCKER_CLIENT_URL="file://$tmp/dc/docker-9.tgz" \
+        CI_DOCKER_BIN_DIR="$tmp/dc/bin-l-$phase" ci/docker_client.sh 9 "$dsha" "$d" "$phase"
+    is "docker client $phase: the link is left alone, nothing unpacked" "yes no" "$([ -L "$d/docker-9.tgz" ] && echo yes) $([ -e "$tmp/dc/bin-l-$phase/docker" ] && echo yes || echo no)"
+done
+# The root copy is bounded: a file over the bound is NRV-E1230 (not the pin), and `head` is asked
+# for one byte more than the bound (the spy), so an endless source stops there.
+mkdir -p "$tmp/dc/spyhead" "$tmp/dc/c6"
+printf '#!/bin/bash\necho "$*" >>"%s"\nexec %s "$@"\n' "$tmp/dc/headlog" "$(command -v head)" >"$tmp/dc/spyhead/head"
+chmod +x "$tmp/dc/spyhead/head"
+cp "$tmp/dc/docker-9.tgz" "$tmp/dc/c6/docker-9.tgz"
+refuses NRV-E1230 "docker client install: an archive over the bound" env PATH="$tmp/dc/spyhead:$PATH" CI_DOCKER_MAX_BYTES=10 CI_ARCH=x86_64 \
+    CI_DOCKER_BIN_DIR="$tmp/dc/bin6" ci/docker_client.sh 9 "$dsha" "$tmp/dc/c6" install
+is "docker client install: an archive over the bound is not unpacked" no "$([ -e "$tmp/dc/bin6/docker" ] && echo yes || echo no)"
+grep -q -- "-c 11 " "$tmp/dc/headlog" || { echo "FAIL docker client install: head was not asked for the bound plus one byte: $(cat "$tmp/dc/headlog" 2>&1)" >&2; fail=1; }
+out=$(env CI_DOCKER_MAX_BYTES=10 CI_ARCH=x86_64 CI_DOCKER_BIN_DIR="$tmp/dc/bin6" ci/docker_client.sh 9 "$dsha" "$tmp/dc/c6" install 2>&1 || true)
+! grep -q "NRV-E1205" <<<"$out" || { echo "FAIL an archive over the bound is blamed on the pin: $out" >&2; fail=1; }
+# A read that fails keeps its reason in the message (not "does not match its pin").
+mkdir -p "$tmp/dc/failhead"
+printf '#!/bin/bash\necho "head: cannot open the archive: Input/output error" >&2\nexit 1\n' >"$tmp/dc/failhead/head"
+chmod +x "$tmp/dc/failhead/head"
+out=$(env PATH="$tmp/dc/failhead:$PATH" CI_ARCH=x86_64 CI_DOCKER_BIN_DIR="$tmp/dc/bin7" ci/docker_client.sh 9 "$dsha" "$tmp/dc/c6" install 2>&1 || true)
+grep -q "NRV-E1230: could not read .*(Input/output error)" <<<"$out" || { echo "FAIL a failed read does not keep its reason: $out" >&2; fail=1; }
 
 # --- ci/lib.sh: ci_redact ---
 key=$(printf 'ab%.0s' {1..32})
@@ -665,7 +728,7 @@ if grep -n 'install -d .*\(cache/main\|base\|JEPSEN_OUT\|cache/jepsen/\)\|chown 
     echo "FAIL woodpecker_step.sh makes or chowns something in a cache a job writes as root: use ci_job_dir" >&2
     fail=1
 fi
-if grep -n '^ *chown\|install -d\|mkdir\|chmod' ci/cache.sh | grep -v '^[0-9]*: *#' | grep -v 'chown -h\|chmod 600\|ci_as_job\|mkdir -- "\$p"'; then
+if grep -n '^ *chown\|install -d\|mkdir\|chmod' ci/cache.sh | grep -v '^[0-9]*: *#' | grep -v 'chown -h\|chmod 600\|ci_error\|ci_as_job\|mkdir -- "\$p"'; then
     echo "FAIL ci/cache.sh makes or chowns something as root outside the lock files" >&2
     fail=1
 fi
@@ -811,8 +874,159 @@ echo pkg >"$r/main/zig/p/pkg/f"
 sd2="$r/branches/$branch_key"
 is "seed: the branch directory, zig/p and its package are the job's user's" "$jobuser $jobuser $jobuser $jobuser" "$(stat -c %U "$sd2" "$sd2/zig/p" "$sd2/zig/p/pkg/f" "$sd2/zig-local" | tr '\n' ' ' | sed 's/ $//')"
 is "seed: the copy has main's package" pkg "$(cat "$sd2/zig/p/pkg/f" 2>/dev/null)"
-is "seed: cp, mv, touch, the partial's cleanup and ci_job_dir's unlink run as the job (static)" 5 "$(grep -c -E 'ci_as_job (cp -a|mv -T "\$partial"|touch "\$dir"|rm -rf "\$partial/zig/p"|rm -f -- "\$p")' ci/cache.sh || true)"
-is "ci_cache_writable asks the job's user and creates nothing (static)" 1 "$(grep -c '^    ci_as_job test -w "\$1"$' ci/cache.sh || true)"
+is "seed: cp, mv, touch, the partial's cleanup and ci_job_dir's unlink run as the job (static, a supplement to the spy and swap tests below)" 5 "$(grep -c -E 'ci_as_job (cp -a|mv -T "\$partial"|touch "\$dir"|rm -rf "\$partial/zig/p"|rm -f -- "\$p")' ci/cache.sh || true)"
+is "ci_cache_writable is root's own test -w and creates nothing (static, a supplement to the mount tests below)" 1 "$(grep -c '^    test -w "\$1"$' ci/cache.sh || true)"
+
+# Which user does what below a branch's directory (review 6000627166; behavioural, so a reformatted
+# line cannot hide it): `cp`, `mv`, `touch`, `mkdir`, `mktemp` and `rm` are spies that log the uid
+# that ran them and then run the real one. Root may run none of the first five on anything in
+# branches/, and no `rm` on a path deeper than a direct child of branches/ (a direct child's last
+# component is unlinked and never followed; a deeper path is the job's to swap for a link). The job's
+# own calls are in the log too, so a spy that logged nothing is a failure.
+spy="$tmp/spy"
+mkdir -p "$spy"
+chmod 755 "$spy"
+: >"$tmp/spy.log"
+chmod 666 "$tmp/spy.log"
+for n in cp mv touch mkdir mktemp rm; do
+    printf '#!/bin/bash\necho "$(id -u) %s $*" >>"$SPY_LOG"\nexec %s "$@"\n' "$n" "$(command -v "$n")" >"$spy/$n"
+    chmod 755 "$spy/$n"
+done
+spy_branch() { # spy_branch ROOT: ci_branch_prepare under the spies
+    : >"$tmp/spy.log"
+    (
+        . ci/cache.sh
+        PATH="$spy:$PATH" SPY_LOG="$tmp/spy.log" CI_JOB_USER=$jobuser ci_branch_prepare "$1" feature/atk >/dev/null 2>&1
+    ) || true
+}
+spy_verdict() { # spy_verdict NAME: root's calls in the log, and that the job's were seen
+    local jobuid
+    jobuid=$(id -u "$jobuser")
+    is "$1: root ran no cp, mv, touch, mkdir or mktemp in branches/" 0 "$(grep -c -E '^0 (cp|mv|touch|mkdir|mktemp) .*/branches/' "$tmp/spy.log" || true)"
+    is "$1: root ran no rm below a branch's directory" 0 "$(grep -c -E '^0 rm .*/branches/[^/ ]+/' "$tmp/spy.log" || true)"
+    is "$1: the spies saw the job's calls" yes "$(grep -q -E "^$jobuid (mkdir|mktemp|rm) " "$tmp/spy.log" && echo yes)"
+}
+# A seed that succeeds, then links planted at the branch's zig and zig-local (a job's doing).
+r=$(attack_tree y)
+mkdir -p "$r/main/zig/p/pkg"
+echo pkg >"$r/main/zig/p/pkg/f"
+spy_branch "$r"
+spy_verdict "spy, a fresh seed"
+d="$r/branches/$branch_key"
+ci_as rm -rf "$d/zig" "$d/zig-local"
+ci_as ln -s "$sd" "$d/zig"
+ci_as ln -s "$sf" "$d/zig-local"
+spy_branch "$r"
+spy_verdict "spy, links at zig and zig-local"
+is "spy: the links were replaced by plain directories" "no no" "$([ -L "$d/zig" ] && echo yes || echo no) $([ -L "$d/zig-local" ] && echo yes || echo no)"
+is "spy: the targets of the links are untouched" "$want_state" "$(sentinel_state)"
+reset_sentinels
+# The failed seed's cleanup cannot be turned on a victim: `cp` is a stub that fails after swapping
+# the partial's zig for a link to a root-owned directory (which a job could do between the copy and
+# the cleanup); the cleanup, `rm -rf $partial/zig/p`, must run as the job, which cannot delete there.
+# Root's version would follow the link and remove victim/p. Needs two users, so only as root.
+if [ "$(id -u)" = 0 ]; then
+    r=$(attack_tree v)
+    mkdir -p "$r/main/zig/p/pkg"
+    echo pkg >"$r/main/zig/p/pkg/f"
+    victim="$tmp/victim-root"
+    rm -rf "$victim"
+    mkdir -p "$victim/p"
+    echo precious >"$victim/p/f"
+    mkdir -p "$tmp/stubcp"
+    chmod 755 "$tmp/stubcp"
+    cat >"$tmp/stubcp/cp" <<'STUB'
+#!/bin/bash
+d="${*: -1}"
+d="${d%/}"
+rm -rf "$d"
+ln -s "$VICTIM" "$d"
+echo "cp: simulated failure" >&2
+exit 1
+STUB
+    chmod 755 "$tmp/stubcp/cp"
+    out=$(
+        . ci/cache.sh
+        PATH="$tmp/stubcp:$PATH" VICTIM="$victim" CI_JOB_USER=$jobuser ci_branch_prepare "$r" feature/atk 2>&1
+    ) || true
+    grep -q "seed copy failed" <<<"$out" || { echo "FAIL swapped partial zig: the seed did not fail as the test needs: $out" >&2; fail=1; }
+    is "a failed seed's cleanup does not follow a link swapped in for the partial's zig (the victim's p is kept)" precious "$(cat "$victim/p/f" 2>/dev/null)"
+fi
+
+# The mount question and the ownership question are two (review 6000627166). Both need root and
+# another user as the job's.
+if [ "$(id -u)" = 0 ]; then
+    mk_roots() { # mk_roots DIR: main/ (root's, 0755: what Docker makes of a missing source) with
+        # the job's caches in it, and the job's branches/
+        rm -rf "$1"
+        mkdir -p "$1/main/zig" "$1/main/tools" "$1/branches"
+        mkdir -m 0700 "$1/locks"
+        chown "$jobuser" "$1/main/zig" "$1/main/tools" "$1/branches"
+    }
+    chk() { # chk ROLE ROOT
+        bash -c '. ci/cache.sh; CI_JOB_USER=$3 ci_cache_check "$1" "$2"' _ "$1" "$2" "$jobuser" 2>&1
+    }
+    # A main/ mounted read-write that is root's: a branch pipeline must still be refused (E1202): the
+    # job's own test of it fails, but main's zig and tools are the job's, so it writes main's caches.
+    mk_roots "$tmp/rwroot"
+    out=$(chk branch "$tmp/rwroot" 2>&1 || true)
+    grep -q "NRV-E1202: main's cache is writable in a pipeline for a branch" <<<"$out" || { echo "FAIL a root-owned read-write main/ in a branch's pipeline: $out" >&2; fail=1; }
+    # Main's role: main/ root-owned, or the job's with its mode 0555 (a job's chmod of its mount
+    # root), is mounted read-write: NRV-E1229 with the owner and the mode, never E1202.
+    for variant in root-owned job-chmod; do
+        mk_roots "$tmp/e1229-$variant"
+        if [ "$variant" = job-chmod ]; then
+            chown "$jobuser" "$tmp/e1229-$variant/main"
+            ci_as chmod 0555 "$tmp/e1229-$variant/main"
+        fi
+        out=$(chk main "$tmp/e1229-$variant" || true)
+        grep -q "NRV-E1229: .*main is mounted read-write but the job's user ($jobuser) cannot write it (owner .*, mode [0-9]*).*nerva-woodpecker.sh host.*chmod 0755" <<<"$out" || { echo "FAIL main's role, main/ $variant: $out" >&2; fail=1; }
+        ! grep -q "NRV-E1202" <<<"$out" || { echo "FAIL main's role, main/ $variant is called a mount error: $out" >&2; fail=1; }
+    done
+    out=$(chk main "$tmp/e1229-job-chmod" || true)
+    grep -q "owner $jobuser, uid $(id -u "$jobuser"), mode 555" <<<"$out" || { echo "FAIL E1229 does not name the owner and the mode: $out" >&2; fail=1; }
+    mk_roots "$tmp/e1229-ok"
+    chown "$jobuser" "$tmp/e1229-ok/main"
+    ok "main's role, main/ the job's and rw" chk main "$tmp/e1229-ok"
+    # With a real read-only mount, which is what a branch's pipeline has.
+    ro_bind() { mount --bind "$1" "$1" && ro_mounts+=("$1") && mount -o remount,bind,ro "$1"; }
+    mkdir -p "$tmp/mnt-probe"
+    can_mount=no
+    if ro_bind "$tmp/mnt-probe" 2>/dev/null; then
+        ! test -w "$tmp/mnt-probe" || can_mount=probe-writable
+        [ "$can_mount" != no ] || can_mount=yes
+    fi
+    umount "$tmp/mnt-probe" 2>/dev/null || true
+    if [ "$can_mount" = yes ]; then
+        mk_roots "$tmp/mnt"
+        ro_bind "$tmp/mnt/main"
+        ok "branch's role: main/ a read-only mount, branches/ the job's" chk branch "$tmp/mnt"
+        # A job that chmods its own mount root: not "not mounted" (E1202), but E1229 with the mode.
+        ci_as chmod 0555 "$tmp/mnt/branches"
+        out=$(chk branch "$tmp/mnt" || true)
+        grep -q "NRV-E1229: .*branches is mounted read-write but the job's user ($jobuser) cannot write it (owner .*mode 555)" <<<"$out" || { echo "FAIL branches/ chmod 0555 by the job: $out" >&2; fail=1; }
+        ! grep -q "NRV-E1202" <<<"$out" || { echo "FAIL branches/ chmod 0555 by the job is called a mount error: $out" >&2; fail=1; }
+        ci_as chmod 0755 "$tmp/mnt/branches"
+        umount "$tmp/mnt/main"
+        # Main's role with main/ read-only (root writes through a mode, so only a real mount shows it),
+        # and a branch's with branches/ read-only: E1202, never E1229.
+        mk_roots "$tmp/mnt2"
+        chown "$jobuser" "$tmp/mnt2/main"
+        ro_bind "$tmp/mnt2/main"
+        out=$(chk main "$tmp/mnt2" || true)
+        grep -q "NRV-E1202: main's cache is not writable in a pipeline for main" <<<"$out" || { echo "FAIL main's role with a read-only main/: $out" >&2; fail=1; }
+        umount "$tmp/mnt2/main"
+        mk_roots "$tmp/mnt3"
+        ro_bind "$tmp/mnt3/main"
+        ro_bind "$tmp/mnt3/branches"
+        out=$(chk branch "$tmp/mnt3" || true)
+        grep -q "NRV-E1202: .*branches is not writable" <<<"$out" || { echo "FAIL a read-only branches/: $out" >&2; fail=1; }
+        ! grep -q "NRV-E1229" <<<"$out" || { echo "FAIL a read-only branches/ is called an ownership error: $out" >&2; fail=1; }
+        umount "$tmp/mnt3/branches" "$tmp/mnt3/main"
+    else
+        echo "note: no read-only bind mount here ($can_mount): the mount tests of ci_cache_check were skipped" >&2
+    fi
+fi
 
 # Lock files a prune makes are the step's own, 0600 (they used to be 0644 by root's umask, and a
 # job that could list a 0755 lock directory could take them), and a lock directory with any group

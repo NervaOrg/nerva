@@ -25,7 +25,10 @@
 #
 # A branch's pipeline mounts main/ read-only (.woodpecker/*.yaml) and branches/ writable; main's
 # mounts main/ writable and not branches/. ci_cache_check refuses a mount that is the wrong way
-# round. The mounts are what enforce the rule: this script only notices a wrong one.
+# round (NRV-E1202: root's access(2) test, which only a read-only mount changes, never the owner or
+# the mode of the mount root), and a mount root the job's user cannot write (NRV-E1229: the job's own
+# test, with the owner and mode in the message; an owner can chmod its mount root). The mounts are
+# what enforce the rule: this script only notices a wrong one.
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 # ci_branch_key BRANCH: a directory name for a branch that is safe to use as one and different for
@@ -37,16 +40,31 @@ ci_branch_key() {
     echo "b-$safe-$sum"
 }
 
-# ci_cache_writable DIR: whether DIR is writable, asked of the job's user with access(2) (test -w),
-# which reports a read-only mount (EROFS) as not writable, for root as well. Nothing is created: a
-# probe file made as root in a directory a job writes would follow a link the job planted there,
-# and a directory planted at its name would fail every step.
+# ci_cache_writable DIR: the mount question: whether DIR is mounted read-write, asked of this user
+# (root, in a step) with access(2) (test -w), which answers EROFS for a read-only mount and
+# otherwise ignores the mode, so a job that chmods its own mount root cannot change it. Nothing is
+# created: a probe file made as root in a directory a job writes would follow a link the job planted
+# there, and a directory planted at its name would fail every step.
 ci_cache_writable() {
-    ci_as_job test -w "$1"
+    test -w "$1"
+}
+
+# ci_cache_job_writable DIR: the ownership question, apart from the mount's: NRV-E1229 if the job's
+# user cannot write DIR (the mount root a job makes its directories in), whoever owns it and
+# whatever its mode: Docker makes a missing mount source root 0755, and an owner (a job) can chmod
+# it. The message names the owner and the mode.
+ci_cache_job_writable() {
+    local d="$1"
+    ci_as_job test -w "$d" && return 0
+    ci_error "NRV-E1229: $d is mounted read-write but the job's user (${CI_JOB_USER:-$(id -un)}) cannot write it (owner $(stat -c '%U, uid %u' "$d"), mode $(stat -c %a "$d")): on the host, run bash ci/nerva-woodpecker.sh host again, or chown it to that user and chmod 0755 it"
+    return 1
 }
 
 # ci_cache_check ROLE ROOT: ROLE is main or branch. NRV-E1202 if ROOT is not laid out as above, or
-# main's directory is writable where it must not be (a branch) or not where it must be (main).
+# main's directory is writable where it must not be (a branch) or not where it must be (main), or
+# branches/ is not writable in a branch's pipeline: the mount's, by root's test, whoever owns the
+# directory. Then NRV-E1229 if the directory the job writes (main/ in main's role, branches/ in a
+# branch's) is a mount the job's user cannot write.
 ci_cache_check() {
     local role="$1" root="$2"
     if [ ! -d "$root/main" ] || { [ "$role" = branch ] && [ ! -d "$root/branches" ]; }; then
@@ -66,7 +84,8 @@ ci_cache_check() {
         ci_error "NRV-E1202: $root/branches is not writable: mount /var/cache/nerva-ci/branches"
         return 1
     fi
-    ci_locks_check "$root"
+    ci_locks_check "$root" || return 1
+    if [ "$role" = main ]; then ci_cache_job_writable "$root/main"; else ci_cache_job_writable "$root/branches"; fi
 }
 
 # ci_locks_check ROOT: NRV-E1202 if ROOT/locks is not there (not mounted), NRV-E1226 if it is not a
