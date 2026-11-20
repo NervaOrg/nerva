@@ -450,7 +450,9 @@ fn import_run(
     if (manifest_path) |path| manifest_read(command, path, &manifest);
     // One descriptor for both passes: the path is opened once, so that pass 2 reads the file
     // pass 1 checked, not one renamed over it since (and pass 2 compares the SHA-256s).
-    const input = std.fs.cwd().openFile(args.input, .{}) catch |err|
+    // Opened without blocking and checked first: a FIFO with no writer would block the open
+    // for good, before the refusal that names it (NRV-E0810).
+    const input = input_open(args.input) catch |err|
         import_failed(command, args.input, args.path, err);
     defer input.close();
     // Pass 1, before the data file exists: the whole export is checked.
@@ -694,6 +696,20 @@ fn backup_unreadable(output: []const u8, err: anyerror) noreturn {
 }
 
 /// Exits with the code for an import that failed in `plan` or while restoring.
+/// Opens the export `path` for reading, once for both passes: refuses what is not a regular
+/// file (`import_.input_check`) before any read. `O_NONBLOCK` lets the open of a FIFO return,
+/// and is cleared on the same descriptor afterwards.
+fn input_open(path: []const u8) !std.fs.File {
+    const fd = try std.posix.open(path, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true }, 0);
+    const file: std.fs.File = .{ .handle = fd };
+    errdefer file.close();
+    try import_.input_check(file);
+    const flags = try std.posix.fcntl(fd, std.posix.F.GETFL, 0);
+    const nonblock: usize = @intCast(@as(u32, @bitCast(std.posix.O{ .NONBLOCK = true })));
+    _ = try std.posix.fcntl(fd, std.posix.F.SETFL, flags & ~nonblock);
+    return file;
+}
+
 fn import_failed(
     comptime command: []const u8,
     input: []const u8,
@@ -1067,9 +1083,12 @@ fn trace_unavailable(path: []const u8, err: anyerror) ?TraceCreated {
     return null;
 }
 
+const trace_segments_exhausted =
+    std.fmt.comptimePrint("every segment .1 to .{d} exists", .{trace_segments_max});
+
 fn trace_unavailable_reason(err: anyerror) []const u8 {
     return switch (err) {
-        error.SegmentsExhausted => "every segment .1 to .1024 exists",
+        error.SegmentsExhausted => trace_segments_exhausted,
         error.NameTooLong => "the path is too long for a segment's name",
         error.FileNotFound, error.NotDir => "its directory is gone",
         error.AccessDenied, error.PermissionDenied, error.ReadOnlyFileSystem => "not permitted",
@@ -1518,6 +1537,26 @@ test "trace_create: a first start never opens an existing file; a re-executed on
     try testing.expectEqualStrings(
         "operator",
         try tmp.dir.readFile("trace.json.2", &read_buffer),
+    );
+}
+
+test "trace_create: at the bound, the last segment is created; past it, none" {
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for (1..trace_segments_max) |segment| {
+        var name_buffer: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buffer, "trace.json.{d}", .{segment});
+        (try tmp.dir.createFile(name, .{ .exclusive = true })).close();
+    }
+    // 1023 segments exist: the start creates the 1024th.
+    const created = try trace_create(tmp.dir, "trace.json", true, trace_segments_max, &buffer);
+    created.file.close();
+    try std.testing.expectEqual(@as(u32, trace_segments_max), created.segment);
+    try std.testing.expectEqualStrings("trace.json.1024", created.path);
+    try std.testing.expectError(
+        error.SegmentsExhausted,
+        trace_create(tmp.dir, "trace.json", true, trace_segments_max, &buffer),
     );
 }
 

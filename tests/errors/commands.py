@@ -493,6 +493,14 @@ def main():
         check("import not a regular file", imp + ["--input=/dev/null", os.path.join(tmp, "d.nerva")],
               "NRV-E0810", 1, "not a regular file")
         assert not os.path.exists(os.path.join(tmp, "d.nerva"))
+        # A FIFO with no writer: the open must not block (the timeout turns a hang into a failure).
+        fifo = os.path.join(tmp, "fifo")
+        os.mkfifo(fifo)
+        check("import a FIFO", imp + ["--input=" + fifo, os.path.join(tmp, "d.nerva")],
+              "NRV-E0810", 1, "not a regular file", timeout=20)
+        check("import a directory", imp + ["--input=" + tmp, os.path.join(tmp, "d.nerva")],
+              "NRV-E0810", 1, "is a directory", timeout=20)
+        assert not os.path.exists(os.path.join(tmp, "d.nerva"))
         check("import junk", imp + ["--input=" + junk, os.path.join(tmp, "d.nerva")],
               "NRV-E0804", 1, "junk")
         assert not os.path.exists(os.path.join(tmp, "d.nerva"))

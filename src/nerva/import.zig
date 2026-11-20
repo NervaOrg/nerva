@@ -110,13 +110,23 @@ pub const Plan = struct {
 
 pub const CatalogRows = std.AutoHashMapUnmanaged(u64, [nerva.value_size]u8);
 
+/// Refuses an input that is not a regular file: `error.IsDir` for a directory, else
+/// `error.NotRegularFile` (a pipe, a device).
+pub fn input_check(file: std.fs.File) !void {
+    switch ((try file.stat()).kind) {
+        .file => {},
+        .directory => return error.IsDir,
+        else => return error.NotRegularFile,
+    }
+}
+
 /// Pass 1: reads and checks the whole export in `file`, from its start, and rebuilds the views'
 /// definitions. Refuses a file that is not a regular file (`error.NotRegularFile`): both passes read
 /// it. Allocates the plan's table checks from `arena`. The caller keeps `file` open for
 /// pass 2 (`Input.file`), which reads it again: a path opened twice could name another file.
 pub fn plan(arena: std.mem.Allocator, file: std.fs.File) !Plan {
     // Pass 2 seeks back to the start: a pipe or a device cannot.
-    if ((try file.stat()).kind != .file) return error.NotRegularFile;
+    try input_check(file);
     try file.seekTo(0);
     var buffered = std.io.bufferedReader(file.reader());
     var reader = try export_file.ReaderType(@TypeOf(buffered).Reader).init(buffered.reader());
@@ -643,13 +653,13 @@ pub fn ImporterType(comptime Storage: type) type {
                                 );
                             }
                             if (view) |declared| {
-                                try restore.view_restore(op, declared);
+                                restore.view_restore(op, declared) catch |err| return restore.refused_or_changed(reader, err);
                                 view_index += 1;
                             } else if (ledger) |declared| {
-                                try restore.ledger_restore(op, &declared.definition);
+                                restore.ledger_restore(op, &declared.definition) catch |err| return restore.refused_or_changed(reader, err);
                                 ledger_index += 1;
                             } else {
-                                try restore.index_restore(op, index.?);
+                                restore.index_restore(op, index.?) catch |err| return restore.refused_or_changed(reader, err);
                                 index_index += 1;
                             }
                             ops_restored += 1;
@@ -684,9 +694,9 @@ pub fn ImporterType(comptime Storage: type) type {
                                 changes_done = pending == null;
                             }
                             if (records) {
-                                try restore.changes_restore_wide(op, restore.changes_wide[0..count]);
+                                restore.changes_restore_wide(op, restore.changes_wide[0..count]) catch |err| return restore.refused_or_changed(reader, err);
                             } else {
-                                try restore.changes_restore(op, restore.changes[0..count]);
+                                restore.changes_restore(op, restore.changes[0..count]) catch |err| return restore.refused_or_changed(reader, err);
                             }
                             ops_restored += 1;
                         }
@@ -850,6 +860,19 @@ pub fn ImporterType(comptime Storage: type) type {
                 return export_file.corrupt(reason);
             }
 
+            /// The state machine refused an op in pass 2 (`err`, `error.Refused`; any other error
+            /// is its own). The export is bad only if it is pass 1's, byte for byte: a different
+            /// SHA-256 means the file changed since pass 1 (`ExportChanged`, P476b). Reads the
+            /// rest to tell.
+            fn refused_or_changed(restore: *const Restore, reader: anytype, err: anyerror) anyerror {
+                if (err != error.Refused) return err;
+                if (reader.state == .records) while (try restore.reader_next(reader)) |_| {};
+                if (!std.mem.eql(u8, &reader.digest, &restore.plan.origin)) {
+                    return restore.changed_log("another SHA-256 than pass 1's");
+                }
+                return error.Refused;
+            }
+
             fn change_from_record(record: *const export_file.Change) nerva.Change {
                 return .{
                     .id = record.id,
@@ -878,7 +901,9 @@ pub fn ImporterType(comptime Storage: type) type {
                 );
                 Wait.run(restore.storage);
                 state_machine.restore_changes(op, changes, &restore.timestamp_next) catch |err| {
-                    log.err("op {}: {} changes: {s}", .{ op, changes.len, @errorName(err) });
+                    if (!builtin.is_test) {
+                        log.err("op {}: {} changes: {s}", .{ op, changes.len, @errorName(err) });
+                    }
                     return error.Refused;
                 };
             }
@@ -899,7 +924,9 @@ pub fn ImporterType(comptime Storage: type) type {
                 );
                 Wait.run(restore.storage);
                 state_machine.restore_changes_wide(op, changes, &restore.timestamp_next) catch |err| {
-                    log.err("op {}: {} changes: {s}", .{ op, changes.len, @errorName(err) });
+                    if (!builtin.is_test) {
+                        log.err("op {}: {} changes: {s}", .{ op, changes.len, @errorName(err) });
+                    }
                     return error.Refused;
                 };
             }
@@ -1494,6 +1521,18 @@ fn export_test_history(buffer: []u8, id: u64) []const u8 {
 /// An export of `ops` ops on row `id` of `table`: op 1 puts it, op 2 deletes it, op 3 puts it
 /// again, and so on.
 fn export_test_ops(buffer: []u8, id: u64, table: u32, ops: u64) []const u8 {
+    return export_test_ops_from(buffer, id, table, ops, true);
+}
+
+/// `export_test_ops`, whose op 1 puts the row if `put_first`, else deletes a row that is not
+/// there: the same counts and timestamps, a history the state machine refuses.
+fn export_test_ops_from(
+    buffer: []u8,
+    id: u64,
+    table: u32,
+    ops: u64,
+    put_first: bool,
+) []const u8 {
     var stream = std.io.fixedBufferStream(buffer);
     var writer = export_file.WriterType(@TypeOf(stream).Writer)
         .init(stream.writer(), 2, 0) catch unreachable;
@@ -1501,7 +1540,7 @@ fn export_test_ops(buffer: []u8, id: u64, table: u32, ops: u64) []const u8 {
     var value: [nerva.value_size]u8 = @splat(0);
     value[0] = 0x5a;
     for (1..ops + 1) |op| {
-        const put = op % 2 == 1;
+        const put = (op % 2 == 1) == put_first;
         writer.write(&.{ .change = .{
             .table = table,
             .id = id,
@@ -1646,6 +1685,47 @@ test "import: pass 2 refuses rows pass 1 would refuse, and more ops than pass 1 
             import_test_run(&plan_file, .{ .file = file }),
         );
     }
+}
+
+test "import: the state machine's pass-2 refusal is the export's own, or a changed file's (NRV-E0807, NRV-E0813)" {
+    var buffer_a: [1024]u8 = undefined;
+    var buffer_b: [1024]u8 = undefined;
+    // Op 1 puts row 1 and op 2 deletes it; and the reverse, which the state machine refuses
+    // (a delete of a row that is not there) with the same counts and timestamps.
+    const a = export_test_ops_from(&buffer_a, 1, 1, 2, true);
+    const b = export_test_ops_from(&buffer_b, 1, 1, 2, false);
+    try std.testing.expect(!std.mem.eql(u8, a, b));
+
+    var arena_instance = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+    const plan_a = try plan_bytes(arena, a);
+    const plan_b = try plan_bytes(arena, b);
+
+    // An export that is pass 1's, refused by the state machine: the export's own fault.
+    try std.testing.expectError(error.Refused, import_test_run(&plan_b, .{ .bytes = b }));
+    // The same refusal from another export than pass 1's: the file changed.
+    try std.testing.expectError(error.ExportChanged, import_test_run(&plan_a, .{ .bytes = b }));
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "rewritten", .data = a });
+    const file = try tmp.dir.openFile("rewritten", .{});
+    defer file.close();
+    const plan_file = try plan(arena, file);
+    try tmp.dir.writeFile(.{ .sub_path = "rewritten", .data = b });
+    try std.testing.expectError(error.ExportChanged, import_test_run(&plan_file, .{ .file = file }));
+}
+
+test "import: a directory as the input is refused as a directory (NRV-E0810)" {
+    var arena_instance = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_instance.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var directory = try tmp.dir.openDir(".", .{});
+    defer directory.close();
+    const file: std.fs.File = .{ .handle = directory.fd };
+    try std.testing.expectError(error.IsDir, plan(arena_instance.allocator(), file));
 }
 
 test "import: an input that is not a regular file is refused before pass 1 (NRV-E0810)" {
