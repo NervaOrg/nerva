@@ -1,6 +1,6 @@
 # Woodpecker and Forgejo on your own boxes
 
-**Nerva's shape (2026-11):** GitHub (`NervaLog/nerva`) stays the forge. Woodpecker runs from
+**Nerva's shape (2026-11):** GitHub (`NervaOrg/nerva`) stays the forge. Woodpecker runs from
 GitHub's webhooks (`forge = github`) on one bare-metal Hetzner auction server, which has
 `/dev/kvm`, so section 1 is Robot, not `hcloud`. A separate Forgejo pull-mirrors the repository
 every 5 minutes (`mirror_interval` in `ops/forgejo/forgejo-bootstrap.sh`), as a copy that does

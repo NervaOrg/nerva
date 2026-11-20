@@ -112,7 +112,7 @@ You need Linux (io_uring) or macOS, on x86_64 with AES or on aarch64. The reposi
 own Zig compiler:
 
 ```bash
-git clone https://github.com/NervaLog/nerva.git
+git clone https://github.com/NervaOrg/nerva.git
 cd nerva
 ./zig/download.sh      # installs Zig 0.14.1 into ./zig
 ./zig/zig build        # builds zig-out/bin/nerva (a few minutes the first time)
@@ -141,7 +141,7 @@ decides which replicas, data files and clients work together (see "One release p
 below).
 
 Or skip the build: release binaries for Linux and macOS (x86_64, aarch64) are on the
-[releases page](https://github.com/NervaLog/nerva/releases), each with a bill of
+[releases page](https://github.com/NervaOrg/nerva/releases), each with a bill of
 materials (`nerva-<tag>.cdx.json`) listing exactly what went into it. This tutorial matches
 v0.7.0, and its outputs were recorded on an earlier release (see the top of this page);
 [CHANGELOG.md](../CHANGELOG.md) lists what each release changed, and the README's

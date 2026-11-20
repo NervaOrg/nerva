@@ -43,8 +43,8 @@ set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 self=$here/$(basename "$0")
 where=release-finish.yml
-tap_url=${TAP_URL:-https://github.com/NervaLog/homebrew-tap.git}
-site_repo=${SITE_REPO:-NervaLog/nervalog.github.io}
+tap_url=${TAP_URL:-https://github.com/NervaOrg/homebrew-tap.git}
+site_repo=${SITE_REPO:-NervaOrg/nerva-site}
 site_owner=${site_repo%%/*}
 site_url=${SITE_URL:-https://github.com/$site_repo.git}
 wait_seconds=${SITE_WAIT_SECONDS:-1200}
@@ -128,7 +128,7 @@ tap_run() {
   trap 'rm -rf "$work"' EXIT
   if ! git_auth clone --quiet --depth 1 "$tap_url" "$work/tap" 2> "$work/err"; then
     refuse NRV-E1135 "cannot clone the tap" "$(scrub "$work/err")" \
-      "check that the App is installed on NervaLog/homebrew-tap, and run the failed job again"
+      "check that the App is installed on NervaOrg/homebrew-tap, and run the failed job again"
   fi
   cd "$work/tap"
   # A release never takes the tap back to an older version.
@@ -280,7 +280,7 @@ case "${1:-}" in
     tag=${2:?usage: release_finish.sh formula <tag> <formula> <sha-file>}
     formula=${3:?usage: release_finish.sh formula <tag> <formula> <sha-file>}
     shafile=${4:?usage: release_finish.sh formula <tag> <formula> <sha-file>}
-    want_url="https://github.com/NervaLog/nerva/releases/download/$tag/nerva-$tag-universal-macos.zip"
+    want_url="https://github.com/NervaOrg/nerva/releases/download/$tag/nerva-$tag-universal-macos.zip"
     want_sha=$(head -n1 "$shafile" | awk '{ print $1 }')
     if ! [[ "$want_sha" =~ ^[0-9a-f]{64}$ ]]; then
       refuse NRV-E1134 "the zip's checksum file does not start with a SHA-256" \
@@ -318,7 +318,7 @@ case "${1:-}" in
     shafile=${3:?usage: release_finish.sh make-formula <tag> <sha-file> <out>}
     out=${4:?usage: release_finish.sh make-formula <tag> <sha-file> <out>}
     sha=$(head -n1 "$shafile" | awk '{ print $1 }')
-    url="https://github.com/NervaLog/nerva/releases/download/$tag/nerva-$tag-universal-macos.zip"
+    url="https://github.com/NervaOrg/nerva/releases/download/$tag/nerva-$tag-universal-macos.zip"
     sed -e "s#@URL@#$url#" -e "s#@VERSION@#${tag#v}#" -e "s#@SHA256@#$sha#" \
       "$here/../../packaging/homebrew/nerva.rb" > "$out"
     ;;
@@ -484,7 +484,7 @@ case "${1:-}" in
         echo "$merged"
         exit 0
       fi
-      body="Nerva $tag is released: https://github.com/NervaLog/nerva/releases/tag/$tag. This changes only the RELEASES entry and SITE.version, SITE.released and SITE.updated (docs/releases/automation.md)."
+      body="Nerva $tag is released: https://github.com/NervaOrg/nerva/releases/tag/$tag. This changes only the RELEASES entry and SITE.version, SITE.released and SITE.updated (docs/releases/automation.md)."
       if ! url=$(gh pr create --repo "$site_repo" --base main --head "$branch" --title "Release $tag" --body "$body" 2> "$work/err"); then
         refuse NRV-E1136 "cannot open the site's pull request for $tag" "$(scrub "$work/err")" \
           "open a pull request from $branch by hand (the release is already published)"

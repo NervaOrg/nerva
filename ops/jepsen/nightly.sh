@@ -20,8 +20,8 @@ set -euo pipefail
 
 : "${JEPSEN_HOME:=/var/lib/jepsen}"
 : "${JEPSEN_REPO_DIR:=$JEPSEN_HOME/nerva}"
-: "${JEPSEN_REMOTE:=https://github.com/NervaLog/nerva.git}"
-: "${JEPSEN_GH_REPO:=NervaLog/nerva}"
+: "${JEPSEN_REMOTE:=https://github.com/NervaOrg/nerva.git}"
+: "${JEPSEN_GH_REPO:=NervaOrg/nerva}"
 : "${JEPSEN_BRANCH:=main}"
 : "${JEPSEN_TRACKER:=}"
 : "${JEPSEN_TOKEN_FILE:=${CREDENTIALS_DIRECTORY:-/nonexistent}/token}"

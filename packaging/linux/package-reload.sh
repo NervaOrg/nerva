@@ -1,5 +1,5 @@
 #!/bin/sh
-# Part of Nerva (https://github.com/NervaLog/nerva): the .deb's postinst and postrm, one script
+# Part of Nerva (https://github.com/NervaOrg/nerva): the .deb's postinst and postrm, one script
 # (v0.7.1, P295). After the units are unpacked or removed it runs `systemctl daemon-reload` when
 # systemd is running, as install.sh does, so that `systemctl restart nerva@0` runs the new unit and
 # not the one systemd loaded earlier. It starts, stops and restarts nothing. (The .rpm needs no

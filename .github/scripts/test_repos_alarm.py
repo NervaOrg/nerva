@@ -13,7 +13,7 @@ import unittest
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parent / "repos_alarm.sh"
-REPO = "NervaLog/nerva"
+REPO = "NervaOrg/nerva"
 TOKEN = "ghp_FAKE_TOKEN_0123456789"
 RUN = "https://github.com/NervaLog/nerva/actions/runs/42"
 NOW = 1_800_000_000
@@ -223,7 +223,7 @@ class Alarm(unittest.TestCase):
             self.assertNotIn("graphql", json.dumps(call))
 
     def test_a_github_failure_is_w1103_and_never_a_failed_step(self):
-        for what in ("GET repos/NervaLog/nerva/issues?", "POST repos/NervaLog/nerva/issues"):
+        for what in ("GET repos/NervaOrg/nerva/issues?", "POST repos/NervaOrg/nerva/issues"):
             self.state({"issues": [], "comments": []})
             self.fail(what)
             p = self.alarm()
@@ -243,7 +243,7 @@ class Alarm(unittest.TestCase):
         self.assertEqual(self.state()["comments"], [])
 
     def test_a_missing_label_is_w1103(self):
-        self.fail("POST repos/NervaLog/nerva/issues")
+        self.fail("POST repos/NervaOrg/nerva/issues")
         p = self.alarm()
         self.assertEqual(p.returncode, 0)
         self.assertIn("the label package-repos exists", p.stderr)

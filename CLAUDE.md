@@ -130,6 +130,9 @@ own, named by its number.
   write a new one with `amends` or `supersedes`. The earlier text stays as it was.
 - Nothing builds an index yet. To learn what has been decided, read every file
   in `docs/decisions/`.
+- **Pull requests on `NervaOrg/nerva` use the prefix `O`** (O2): `docs/decisions/O<number>-<slug>.md`,
+  cited as `O<number>`, and `worklog/O<number>.md`. Its pull request numbers restart at 1, and the
+  `P` and bare numbers already in the tree are the old `NervaLog/nerva` tracker's.
 
 ### Change notes
 
@@ -211,7 +214,7 @@ Check them against `git diff --name-only origin/main...` before you write them.
 ### Pre-existing bugs
 
 Whenever you find a bug that existed before your change (in Nerva's code or a vendored file),
-file a GitHub issue on `NervaLog/nerva`, even if you fix it in the same pull request: what
+file a GitHub issue on `NervaOrg/nerva`, even if you fix it in the same pull request: what
 fails, how to reproduce it, since when (the commit or release, if known), its impact, and the
 fix or the pull request that carries it. Fixing it in the PR does not replace the issue; link
 them (`Fixes #N`), and close the issue as completed if the fix has already merged.
@@ -225,7 +228,7 @@ You are not done until:
 2. `./zig/zig build test:fmt` passes.
 3. Cleanup pass: no dead code, no stray `TODO` without a reason, assertions on new invariants.
 4. README.md / UPSTREAM.md updated if behaviour, design or vendored code changed, and README's
-   Production table and the site's data (`index.html` in `NervaLog/nervalog.github.io`: `SITE`,
+   Production table and the site's data (`index.html` in `NervaOrg/nerva-site`: `SITE`,
    `GOALS`, `PRODUCTION`) if a status changed.
 5. `worklog/<number>.md` exists for the change, and any decision you took is in `docs/decisions/`.
 6. The pull request description carries the three statements above.
@@ -317,7 +320,7 @@ work done.
 
 ## README and site status (adopted from Zigbox, P147)
 
-- The site is its own repository, `NervaLog/nervalog.github.io` (P148): `index.html`, built and
+- The site is its own repository, `NervaOrg/nerva-site` (P148): `index.html`, built and
   deployed as a Cloudflare Worker (static assets, Workers Builds) from that repository's `main`
   at <https://nerva.pro/> (P365, P410). README's
   Production table and the site (the `SITE`, `GOALS`, `PRODUCTION`, `NEXT` and `RELEASES` data
@@ -340,5 +343,7 @@ work done.
 - There is no Docker, so Jepsen does not run here; it runs on the R1 host.
 - The session proxy cannot reach Cloudflare (the dashboard, the API, `nerva.pro`'s settings); the
   owner does those steps (docs/releases/packages.md, "Setup").
-- The repository moved from `Botpike/nerva-ledger` to `NervaLog/nerva`; GitHub redirects the old
-  name for reads only. File issues on `NervaLog/nerva`.
+- The repository lives at `NervaOrg/nerva` (O2). It was `Botpike/nerva-ledger`, then
+  `NervaLog/nerva`, whose owning account is suspended: its issues, pull requests, Actions runs,
+  releases and secrets are unreachable. A `NervaLog/nerva#N` or `#N` in a file written before the
+  move names that old tracker, not this one. File issues on `NervaOrg/nerva`.

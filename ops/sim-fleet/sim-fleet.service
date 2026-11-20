@@ -1,6 +1,6 @@
 [Unit]
 Description=Nerva simulation fleet (the VOPR and the fuzzers on fresh seeds at the tip of main)
-Documentation=https://github.com/NervaLog/nerva/blob/main/ops/sim-fleet/README.md
+Documentation=https://github.com/NervaOrg/nerva/blob/main/ops/sim-fleet/README.md
 After=network-online.target
 Wants=network-online.target
 

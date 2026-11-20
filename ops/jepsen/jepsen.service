@@ -1,6 +1,6 @@
 [Unit]
 Description=Nerva Jepsen nightly (retry and bank under kill, partition and gateway faults)
-Documentation=https://github.com/NervaLog/nerva/blob/main/ops/jepsen/README.md
+Documentation=https://github.com/NervaOrg/nerva/blob/main/ops/jepsen/README.md
 After=network-online.target docker.service
 Wants=network-online.target
 Requires=docker.service

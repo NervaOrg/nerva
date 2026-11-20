@@ -9,6 +9,10 @@ work is [WORKLOG.md](./WORKLOG.md).
 
 ### Upgrading from v0.7.1
 
+- **Nerva moved to `NervaOrg/nerva` (O2).** On a Mac, move to the new tap once:
+  `brew untap nervalog/tap && brew tap nervaorg/tap && brew trust nervaorg/tap`, then
+  `brew upgrade nerva`. The apt and dnf repositories at `packages.nerva.pro` and their signing key
+  are unchanged; nothing to do there. Links to `NervaLog/nerva` issues and releases no longer resolve.
 - **Gateway keys need 32 bytes (#335).** `nerva api` and `nerva view` refuse a `NERVA_KEY` or
   `NERVA_KEY_NEXT` shorter than 32 bytes, or one with leading or trailing space or tab or a control
   byte (`NRV-E0008`). Before upgrading, rotate a gateway key shorter than 32 bytes through
