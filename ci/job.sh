@@ -2,7 +2,11 @@
 # One CI job, the same under GitHub Actions (.github/workflows/ci.yml), Woodpecker (.woodpecker/)
 # or a shell. Run from the repository root, after ci/install_zig.sh.
 #
-#   ci/job.sh check                 typecheck, format, the scripts' own tests, declared views
+#   ci/job.sh check                 typecheck, format, the scripts' own tests, declared views: the
+#                                   two below in turn (GitHub runs it whole; Woodpecker, the halves
+#                                   side by side, as the scripts' tests alone take 20 minutes)
+#   ci/job.sh check-code            typecheck, format, the quickstart loop, declared views
+#   ci/job.sh check-scripts         the release, packaging, perf, fleet and Jepsen scripts' tests
 #   ci/job.sh integration           three real replicas (~3.5 GiB of disk)
 #   ci/job.sh api                   the JSON API against a model
 #   ci/job.sh releases              mixed releases
@@ -26,12 +30,15 @@ arg="${2:-}"
 targets=(x86_64-linux aarch64-linux x86_64-macos aarch64-macos)
 demos_expected="canvas_chaos.py seats_chaos.py "
 
-case "$job" in
-check)
+check_code() {
     ./zig/zig build check
     ./zig/zig build test:fmt
     .github/scripts/docs_only_test.sh
     scripts/quickstart_loop_test.sh # its refusals, NRV-E0741 and NRV-E0742
+    ./zig/zig build test:views
+}
+
+check_scripts() {
     # The release scripts: the bill of materials (N63) and the refusals (NRV-E1112 to E1117,
     # E1130 to E1138, E1152, E1164). Needs ci/install_repo_tools.sh first.
     python3 .github/scripts/test_sbom.py
@@ -48,8 +55,15 @@ check)
     python3 perf/nightly/test_file_issue.py
     python3 ops/sim-fleet/test_sim_fleet.py
     python3 -I ops/jepsen/test_jepsen_report.py
-    ./zig/zig build test:views
+}
+
+case "$job" in
+check)
+    check_code
+    check_scripts
     ;;
+check-code) check_code ;;
+check-scripts) check_scripts ;;
 integration) ./zig/zig build test:integration ;;
 api) ./zig/zig build test:api ;;
 releases) ./zig/zig build test:release ;;

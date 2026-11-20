@@ -319,7 +319,7 @@ To run a job by hand on any Linux box with the toolchain's needs (as root, in a 
 the tree, with `/cache` present):
 
 ```bash
-CI_PIPELINE_EVENT=manual ci/woodpecker_step.sh check
+CI_PIPELINE_EVENT=manual ci/woodpecker_step.sh check-code
 ```
 
 ## What was and was not tested
