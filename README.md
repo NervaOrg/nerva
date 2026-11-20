@@ -402,7 +402,9 @@ ledger's check with the manifest, and refuses with `NRV-E0809` naming the first 
 (`NRV-E0808` when the manifest is missing, malformed or of another version; `NRV-E0804` when the
 backup itself is damaged). The manifest is a record kept apart so that a damaged or swapped
 backup is caught by something it did not carry; it holds no checksum of its own. Then it restores
-as `import` does: the data file is named only once its state equals the checks.
+as `import` does: the data file is named only once its state equals the checks. Both passes
+read the file opened once, and the second must end in the first's SHA-256, or the restore (or
+import) is refused with `NRV-E0813`: let nothing write the backup while it runs (P476).
 
 - **Restore every replica from the same backup, with the cluster closed**, then start them. A
   replica of a running cluster is never restored alone (P90): use `recover`.
@@ -437,7 +439,15 @@ statsd format with DogStatsD tags (`|#cluster:…,replica:N`). `--trace=<path>` 
 trace for [Perfetto](https://ui.perfetto.dev) or `chrome://tracing` to a new file (it refuses
 an existing one); tracing slows the replica, so use it to diagnose, not to time. The trace is
 written 64 KiB at a time and stops at `--trace-size-max` (default 1 GiB), or if writing it fails,
-with a warning in the log; the replica runs on (N71). A `--statsd` address this host cannot send to
+with a warning in the log; the replica runs on (N71). A bundled binary that switches release
+(down to the data file's at open, or up at an upgrade) re-executes itself: the process after
+each switch traces to the next new segment, `<path>.1`, `<path>.2` and so on (up to 1024), each
+its own trace with its own size limit, so the total is bounded at 1025 times `--trace-size-max`
+(`<path>` and 1024 segments), not at one (P480). A start that switches down at open has written no spans yet: it removes
+`<path>`, and its trace is `<path>.1`, so `<path>` itself exists only on a start that did not
+switch (P480b). The process before an upgrade writes its spans out first. If a segment cannot
+be created (the directory is gone, every segment exists), the replica logs `NRV-W0012` and runs
+untraced; only a first start is refused (P480b). A `--statsd` address this host cannot send to
 (no route, or a broadcast address) does not stop `start`: it warns, `NRV-W0733`, drops the
 metrics and runs on (P427). An address family the host has no socket for refuses the start with
 `error[NRV-E0010]`, before the replica's vendored open. The metrics most useful for performance work:
