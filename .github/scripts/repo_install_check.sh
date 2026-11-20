@@ -23,7 +23,7 @@ usage() { echo "usage: repo_install_check.sh <apt|dnf> <channel> <base-url> <fin
 
 [ $# -eq 5 ] || usage
 mgr=$1 CHANNEL=$2 BASE=${3%/} fpr=$4 version=$5
-KEY_URL=${INSTALL_KEY_URL:-https://raw.githubusercontent.com/NervaLog/nerva/main/packaging/keys/nerva-release.asc}
+KEY_URL=${INSTALL_KEY_URL:-https://raw.githubusercontent.com/NervaOrg/nerva/main/packaging/keys/nerva-release.asc}
 case $mgr in apt | dnf) ;; *) usage ;; esac
 case $CHANNEL in stable | rc) ;; *) usage ;; esac
 [[ $fpr =~ ^[0-9A-F]{40}$ ]] || usage

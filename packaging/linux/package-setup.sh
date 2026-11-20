@@ -1,5 +1,5 @@
 #!/bin/sh
-# Part of Nerva (https://github.com/NervaLog/nerva): the .deb's preinst and the .rpm's pre scriptlet, one
+# Part of Nerva (https://github.com/NervaOrg/nerva): the .deb's preinst and the .rpm's pre scriptlet, one
 # script (v0.7.1, P284b; docs/briefs/v0.7.1.md, slice 5). It creates the system user `nerva`,
 # /var/lib/nerva (0750, nerva:nerva) and /etc/nerva (0750, root:nerva), and does nothing else:
 # it never formats, enables, starts or removes anything, and no removal script touches the data.

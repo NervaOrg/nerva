@@ -324,7 +324,7 @@ class SpecCommands(unittest.TestCase):
                 self.assertLess(len(filled), 512)  # the dashboard's limit
 
     def test_pins(self):
-        self.assertIn("raw.githubusercontent.com/NervaLog/nerva/<commit>/.github/scripts/site_build.sh",
+        self.assertIn("raw.githubusercontent.com/NervaOrg/nerva/<commit>/.github/scripts/site_build.sh",
                       self.build)
         self.assertIn('echo "<sha256>  $f" | sha256sum -c --status', self.build)
         self.assertTrue(self.build.endswith("; sh $f"))
@@ -344,7 +344,7 @@ class SpecCommands(unittest.TestCase):
         fake = bin_dir / "curl"
         fake.write_text("#!/bin/sh\n"
                         "while [ $# -gt 0 ]; do case $1 in -*o) out=$2; shift 2;; -*) shift;; *) url=$1; shift;; esac; done\n"
-                        f"[ \"$url\" = 'https://raw.githubusercontent.com/NervaLog/nerva/{COMMIT}/.github/scripts/site_build.sh' ] || exit 22\n"
+                        f"[ \"$url\" = 'https://raw.githubusercontent.com/NervaOrg/nerva/{COMMIT}/.github/scripts/site_build.sh' ] || exit 22\n"
                         f"cp '{SCRIPT}' \"$out\"\n")
         fake.chmod(0o755)
         tree = tmp / "site"

@@ -15,7 +15,7 @@ SCRIPT = ROOT / ".github/scripts/site_release.py"
 PAGE = """<html><script>
 const SITE = {
   updated: "2026-11-10",
-  repo: "https://github.com/NervaLog/nerva",
+  repo: "https://github.com/NervaOrg/nerva",
   version: "0.7.0",
   released: "2026-11-10",
   stage: "Research",
@@ -141,10 +141,10 @@ class SiteRelease(unittest.TestCase):
         self.assertEqual(self.run_script("0.7.1", "2026-11-13", "x" * 300).returncode, 0)
 
     def test_the_output_passes_the_sites_own_checker_when_it_is_reachable(self):
-        """Runs NervaLog/nervalog.github.io's site_check.mjs (branch claude/site-check, or main once
+        """Runs NervaOrg/nerva-site's site_check.mjs (branch claude/site-check, or main once
         merged) on the output, against the page before. Skipped, and the skip says so, when the
         checkout or node is not there (SITE_REPO names the checkout)."""
-        repo = Path(os.environ.get("SITE_REPO", "/home/user/nervalog.github.io"))
+        repo = Path(os.environ.get("SITE_REPO", "/home/user/nerva-site"))
         node = shutil.which("node")
         shown = subprocess.run(["git", "-C", str(repo), "show", "origin/claude/site-check:.github/scripts/site_check.mjs"],
                                capture_output=True, text=True) if repo.is_dir() else None

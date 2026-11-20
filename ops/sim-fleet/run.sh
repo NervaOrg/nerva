@@ -27,8 +27,8 @@ main() {
         : "${SIM_FLEET_REPO_DIR:=$SIM_FLEET_HOME/nerva}"
         : "${SIM_FLEET_STATE_DIR:=$SIM_FLEET_HOME/state}"
     fi
-    : "${SIM_FLEET_REMOTE:=https://github.com/NervaLog/nerva.git}"
-    : "${SIM_FLEET_GH_REPO:=NervaLog/nerva}"
+    : "${SIM_FLEET_REMOTE:=https://github.com/NervaOrg/nerva.git}"
+    : "${SIM_FLEET_GH_REPO:=NervaOrg/nerva}"
     : "${SIM_FLEET_BRANCH:=main}"
     : "${SIM_FLEET_TRACKER:=}"
     # Workers: one core each, and about SIM_FLEET_SEED_MEMORY_MB of RAM each (P179). By default

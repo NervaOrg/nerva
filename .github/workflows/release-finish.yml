@@ -26,7 +26,7 @@
 # repositories on 16 cells; `site-verify` checks that nerva.pro shows the release and its WKD key.
 # `repos-ready` and `repos` are the only jobs here that write the bucket, in the one concurrency
 # group `nerva-packages-bucket` (with the refresh of package-repos-refresh.yml); `alarm` files an
-# issue when one of them fails. The App's token (NervaLog/homebrew-tap and NervaLog/nervalog.github.io only, contents and
+# issue when one of them fails. The App's token (NervaOrg/homebrew-tap and NervaOrg/nerva-site only, contents and
 # pull requests) is given only to the steps that write there; writes to this repository use
 # GITHUB_TOKEN. Secrets are never on a command line.
 name: Release finish
@@ -292,8 +292,8 @@ jobs:
         with:
           app-id: ${{ vars.RELEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
-          owner: NervaLog
-          repositories: homebrew-tap,nervalog.github.io
+          owner: NervaOrg
+          repositories: homebrew-tap,nerva-site
           permission-contents: write
           permission-pull-requests: write
 

@@ -559,7 +559,7 @@ the middle of a regression does not absorb it. To try the issue step, run the wo
 
 ```bash
 python3 perf/nightly/file_issue.py --verdict verdict.json --summary summary.md \
-    --run-id 1 --run-url <url> --repo NervaLog/nerva --dry-run
+    --run-id 1 --run-url <url> --repo NervaOrg/nerva --dry-run
 python3 perf/nightly/test_file_issue.py   # its tests, offline (CI runs them)
 ```
 

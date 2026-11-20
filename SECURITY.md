@@ -7,7 +7,7 @@ is bumped at release); the release slice re-records them on the release commit.
 
 ## Reporting a vulnerability
 
-Use GitHub's private vulnerability reporting on `NervaLog/nerva`: the repository's Security tab,
+Use GitHub's private vulnerability reporting on `NervaOrg/nerva`: the repository's Security tab,
 "Report a vulnerability". Say what you found, the release or commit, and how to reproduce it.
 Put nothing about the vulnerability in a public issue.
 There is no SLA: this is an alpha with one maintainer.

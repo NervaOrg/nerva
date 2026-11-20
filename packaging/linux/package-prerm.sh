@@ -1,5 +1,5 @@
 #!/bin/sh
-# Part of Nerva (https://github.com/NervaLog/nerva): the .deb's prerm and the .rpm's preun scriptlet,
+# Part of Nerva (https://github.com/NervaOrg/nerva): the .deb's prerm and the .rpm's preun scriptlet,
 # one script (v0.7.1, P295). On removal only, it disables the instances the operator enabled
 # (nerva@0, nerva-api@0), as `install.sh --uninstall` does (P286b): left behind the links dangle,
 # and a later install would make them live again. It never stops anything, so a running replica
