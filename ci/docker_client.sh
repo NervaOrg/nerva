@@ -9,8 +9,8 @@
 # test); CI_ARCH replaces `uname -m`.
 #
 # An optional fourth word splits the work for a step that runs as root over a cache a job writes:
-# `fetch` only downloads and verifies the archive (run it as the job's user), `install` only checks
-# the archive again and unpacks the binary (root). Without it, both.
+# `fetch` only downloads and verifies the archive (run it as the job's user), `install` only copies the
+# archive privately, checks the copy and unpacks it (root). Without it, both.
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
 
@@ -39,9 +39,15 @@ if [ "$phase" != install ] && { [ ! -f "$archive" ] || ! echo "$sha  $archive" |
     mv "$partial" "$archive"
 fi
 [ "$phase" != fetch ] || exit 0
-if ! echo "$sha  $archive" | sha256sum -c - >/dev/null 2>&1; then
+# What is unpacked is what was checked: the archive sits where a job can write, so a check by path
+# and an unpack by path could see two files. One copy, in a directory only this user can use, is
+# checked and unpacked.
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+cat -- "$archive" >"$work/docker.tgz" 2>/dev/null || true
+if ! echo "$sha  $work/docker.tgz" | sha256sum -c - >/dev/null 2>&1; then
     ci_error "NRV-E1205: docker-$version.tgz does not match its pinned sha256 $sha"
     exit 1
 fi
 mkdir -p "$bin"
-tar --no-same-owner -xzf "$archive" -C "$bin" --strip-components=1 docker/docker
+tar --no-same-owner -xzf "$work/docker.tgz" -C "$bin" --strip-components=1 docker/docker

@@ -87,6 +87,15 @@ echo junk >"$tmp/dc/c3/docker-9.tgz"
 ok "docker client replaces a bad cached archive" env CI_ARCH=x86_64 CI_DOCKER_CLIENT_URL="file://$tmp/dc/docker-9.tgz" \
     CI_DOCKER_BIN_DIR="$tmp/dc/bin2" ci/docker_client.sh 9 "$dsha" "$tmp/dc/c3"
 is "docker client cache repaired" "$dsha" "$(sha256sum "$tmp/dc/c3/docker-9.tgz" | cut -d ' ' -f 1)"
+# The install phase (root's, over a cache a job writes) checks what it unpacks: a pin that matches
+# nothing is NRV-E1205 and unpacks nothing; the right pin unpacks, and leaves no temporary behind.
+refuses NRV-E1205 "docker client install: archive that is not the pin" env CI_ARCH=x86_64 CI_DOCKER_BIN_DIR="$tmp/dc/bin3" \
+    ci/docker_client.sh 9 "$(printf '%064d' 0)" "$tmp/dc/c3" install
+is "docker client install: nothing unpacked for a wrong archive" no "$([ -e "$tmp/dc/bin3/docker" ] && echo yes || echo no)"
+ok "docker client install: the right archive" env CI_ARCH=x86_64 CI_DOCKER_BIN_DIR="$tmp/dc/bin3" \
+    ci/docker_client.sh 9 "$dsha" "$tmp/dc/c3" install
+[ -x "$tmp/dc/bin3/docker" ] || { echo "FAIL docker client install: no binary" >&2; fail=1; }
+is "docker client install unpacks the copy it checked, not the path (static)" 1 "$(grep -c 'tar --no-same-owner -xzf "\$work/docker.tgz"' ci/docker_client.sh || true)"
 
 # --- ci/lib.sh: ci_redact ---
 key=$(printf 'ab%.0s' {1..32})
@@ -132,6 +141,27 @@ if [ "$(id -u)" != 0 ]; then
     ok "branch with main read-only" ci_cache_check branch "$c"
     chmod u+w "$c/main"
 fi
+# The writability check creates nothing (review 6000451946): a link, or a directory, planted at the
+# old probe's name (`.probe.<pid>`, the pid being the checking shell's own) is neither followed nor
+# a failure. The plant and the check share one shell, so the name is the one a probe would use.
+pr="$tmp/probe"
+mkdir -p "$pr/main" "$pr/branches"
+mkdir -m 0700 "$pr/locks"
+echo precious >"$pr/victim"
+bash -c '
+    . ci/cache.sh
+    ln -s "$1/victim" "$1/main/.probe.$$"
+    ln -s "$1/missing" "$1/branches/.probe.$$"
+    ci_cache_check main "$1" && ci_cache_writable "$1/branches"
+' _ "$pr" 2>"$pr/err" || { echo "FAIL a link planted at .probe.<pid>: the check failed: $(cat "$pr/err")" >&2; fail=1; }
+is "a link planted at .probe.<pid> is not followed (victim kept, missing target not made)" "precious no" "$(cat "$pr/victim") $([ -e "$pr/missing" ] && echo yes || echo no)"
+rm -f "$pr"/main/.probe.* "$pr"/branches/.probe.*
+bash -c '
+    . ci/cache.sh
+    mkdir "$1/main/.probe.$$" "$1/branches/.probe.$$"
+    ci_cache_check main "$1" && ci_cache_writable "$1/branches"
+' _ "$pr" 2>"$pr/err" || { echo "FAIL a directory planted at .probe.<pid>: the check failed: $(cat "$pr/err")" >&2; fail=1; }
+is "the check made nothing of its own (no stray stderr)" "" "$(cat "$pr/err")"
 
 # A branch's zig/p is a plain copy of main's (not a link, and writing it leaves main's alone);
 # main's zig-local and the rest of its zig/, which a build may be writing, are not copied.
@@ -766,6 +796,23 @@ ci_as ln -s "$sd" "$r/branches/b-link-00000003.partial.1"
     CI_JOB_USER=$jobuser ci_branch_prepare "$r" feature/atk >/dev/null 2>&1
 ) || true
 is "a link named like a cache, or like a partial one, is unlinked and the target is left alone" "$want_state no no" "$(sentinel_state) $([ -e "$r/branches/b-link-00000003" ] && echo yes || echo no) $([ -L "$r/branches/b-link-00000003.partial.1" ] && echo yes || echo no)"
+
+# A seed made as the job's user (review 6000451946): main's zig/p has a root-owned package, and the
+# branch's copy, its directory and its zig/p belong to the job's user, which a root `cp -a`
+# (keeps the owner), `mv` or `touch` would not leave. The last three are also pinned statically,
+# as an owner cannot tell them apart.
+r=$(attack_tree s)
+mkdir -p "$r/main/zig/p/pkg"
+echo pkg >"$r/main/zig/p/pkg/f"
+(
+    . ci/cache.sh
+    CI_JOB_USER=$jobuser ci_branch_prepare "$r" feature/atk >/dev/null 2>&1
+) || true
+sd2="$r/branches/$branch_key"
+is "seed: the branch directory, zig/p and its package are the job's user's" "$jobuser $jobuser $jobuser $jobuser" "$(stat -c %U "$sd2" "$sd2/zig/p" "$sd2/zig/p/pkg/f" "$sd2/zig-local" | tr '\n' ' ' | sed 's/ $//')"
+is "seed: the copy has main's package" pkg "$(cat "$sd2/zig/p/pkg/f" 2>/dev/null)"
+is "seed: cp, mv, touch, the partial's cleanup and ci_job_dir's unlink run as the job (static)" 5 "$(grep -c -E 'ci_as_job (cp -a|mv -T "\$partial"|touch "\$dir"|rm -rf "\$partial/zig/p"|rm -f -- "\$p")' ci/cache.sh || true)"
+is "ci_cache_writable asks the job's user and creates nothing (static)" 1 "$(grep -c '^    ci_as_job test -w "\$1"$' ci/cache.sh || true)"
 
 # Lock files a prune makes are the step's own, 0600 (they used to be 0644 by root's umask, and a
 # job that could list a 0755 lock directory could take them), and a lock directory with any group

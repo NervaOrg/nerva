@@ -339,10 +339,14 @@ set:
    old `.lock` there is unused and can be deleted.) The step refuses a `locks/` that is a link or
    that another user can write or list (NRV-E1226), and never follows a link at a lock path.
 
-   Root never creates, chowns, chmods or writes anything in `main/`, `branches/` or `jepsen/`: a
-   job can plant a symlink anywhere in them, and a root `chown`, `install -d` or `mkdir` would follow
-   it (to `/cache/locks`, or `/etc/passwd`, which would make the job root in the next step's
-   container). The step makes what a job needs there as the job's user (`ci_as_job`), replaces a
+   Root never creates, chowns, chmods or writes anything inside `main/`, `branches/` or `jepsen/`: a
+   job can plant a symlink anywhere in them, and a root `chown`, `install -d`, `mkdir` or
+   redirection would follow it (to `/cache/locks`, or `/etc/passwd`, which would make the job root
+   in the next step's container). The one root operation on them is `install -d -o ci /cache/jepsen`,
+   on the mount's own root, which a job cannot swap for a link. Whether `main/` and `branches/` are
+   writable is asked of the job's user (`test -w`, which reports a read-only mount), not probed by
+   creating a file; a root `rm -rf` is only on a path whose parent is a mount root, and anything
+   deeper is unlinked by the job's user. The step makes what a job needs there as the job's user (`ci_as_job`), replaces a
    symlink it finds (`rm` unlinks and never follows) and refuses what is not a plain directory the
    job can write (NRV-E1228: `rm -rf` it on the host; it is only a cache).
    A lock that stays busy is never waited on for good: the branch caches' lock and a prune warn

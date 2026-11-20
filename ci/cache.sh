@@ -14,10 +14,13 @@
 # The step runs as root and the job as `ci`, so every path a job can write (all of main/ and
 # branches/, and /cache/jepsen) is the job's to redirect: a symlink planted there would make a
 # root chown, chmod, install, mkdir or cp, or a root redirection, act on its target. Root therefore
-# never creates, chowns, chmods or writes anything there. What the job needs made there is made by
+# never creates, chowns, chmods or writes anything there (the one exception, `install -d -o ci
+# /cache/jepsen` in the step, is on the mount's own root, which a job cannot swap for a link). What the job needs made there is made by
 # the job user itself (ci_as_job, `mkdir`, `mktemp`, `cp`, `mv`, `touch`), which can only touch what
 # the job could touch anyway; root only tests (never acts on the result of a test, so a swap after
-# it changes nothing) and unlinks (rm -rf, which never follows a link, and rm -f of a symlink).
+# it changes nothing) and unlinks (rm -rf of a path whose parent is a mount root, which never
+# follows a link in its last component). A path with any other job-writable component (a
+# partial directory's zig/p, a branch's zig link) is unlinked by the job user.
 # What is then not a plain directory the job can write is refused: NRV-E1228.
 #
 # A branch's pipeline mounts main/ read-only (.woodpecker/*.yaml) and branches/ writable; main's
@@ -34,11 +37,12 @@ ci_branch_key() {
     echo "b-$safe-$sum"
 }
 
-# ci_cache_writable DIR: whether this process can create a file in DIR.
+# ci_cache_writable DIR: whether DIR is writable, asked of the job's user with access(2) (test -w),
+# which reports a read-only mount (EROFS) as not writable, for root as well. Nothing is created: a
+# probe file made as root in a directory a job writes would follow a link the job planted there,
+# and a directory planted at its name would fail every step.
 ci_cache_writable() {
-    local probe="$1/.probe.$$"
-    if : > "$probe" 2>/dev/null; then rm -f "$probe"; return 0; fi
-    return 1
+    ci_as_job test -w "$1"
 }
 
 # ci_cache_check ROLE ROOT: ROLE is main or branch. NRV-E1202 if ROOT is not laid out as above, or
@@ -161,7 +165,7 @@ ci_as_job() {
 ci_job_dir() {
     local p
     for p in "$@"; do
-        if [ -L "$p" ]; then rm -f -- "$p" 2>/dev/null || true; fi
+        if [ -L "$p" ]; then ci_as_job rm -f -- "$p" 2>/dev/null || true; fi
         if [ ! -e "$p" ] && [ ! -L "$p" ]; then ci_as_job mkdir -- "$p" 2>/dev/null || true; fi
         if [ -L "$p" ] || [ ! -d "$p" ] || ! ci_as_job test -w "$p"; then
             ci_error "NRV-E1228: $p is not a plain directory that the job's user (${CI_JOB_USER:-$(id -un)}) can write (a link, a file, or another user's directory): on the host, rm -rf it (it is only a cache) and start the pipeline again"
@@ -284,7 +288,7 @@ ci_branch_prepare() {
                 if ! err=$(ci_as_job cp -a "$root/main/zig/p" "$partial/zig/" 2>&1 >/dev/null); then
                     last=${err##*$'\n'}
                     echo "seed copy failed: branch $key starts empty (${last:-no message})" >&2
-                    rm -rf "$partial/zig/p"
+                    ci_as_job rm -rf "$partial/zig/p" # as the job: $partial/zig is its to swap for a link
                 fi
             else
                 echo "main's package cache is over $seedgib GiB: branch $key starts empty" >&2
