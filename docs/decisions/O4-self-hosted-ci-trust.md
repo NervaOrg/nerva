@@ -37,7 +37,8 @@ container on that daemon without a profile of its own; the box runs CI and nothi
   which a build of main may be writing, so a branch starts it empty) made when the branch's cache is
   first needed (not made if main's is over 6 GiB; the branch then starts empty), bounded in count
   (8), age (7 days) and size (12 GiB each), pruned under a lock that skips a cache another job is
-  using. Nothing a branch writes is read by main. A branch's cache is not shielded from other branches (see "What remains trusted").
+  using. Nothing a branch writes is read by main. A branch's cache is not shielded from other
+  branches (see "What remains trusted").
 - The toolchain is never trusted by name. Every use copies the archive from `main/tools/<sha256>.tar.xz`
   into the job's own `zig/cache` and runs `zig/download.sh`, which checks it against the sha256
   pinned in the repository and downloads it again on a mismatch (NRV-W1201). Each job unpacks into
@@ -88,8 +89,9 @@ repository, and that is the trust boundary of this box.
 
 ## What it costs
 
-- A cold branch's first run copies main's cache (up to 6 GiB) or starts empty; the second run of a
-  branch is as warm as before.
+- A cold branch's first run copies main's global Zig cache `zig/` (up to 6 GiB) and starts with an
+  empty `zig-local/`, where most build artifacts go: its first run is close to cold, and its second
+  is as warm as the branch's own first.
 - Disk: at most 8 branch caches of 12 GiB beside main's. `ci/woodpecker_step.sh` empties the unused
   ones when the free space is low; the manual recovery is in `ops/ci/README.md`.
 - Docker restarts once when the profile is installed (running pipelines fail; the owner runs the

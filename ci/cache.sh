@@ -3,7 +3,7 @@
 # the one rule about them (decision O4): only a pipeline for a push to main writes main's caches.
 #
 #   <root>/main/            main's: tools/ (the pinned Zig's archive, by sha256), zig/, zig-local/
-#   <root>/branches/<key>/  one branch's own zig/ and zig-local/, seeded by a copy of main's
+#   <root>/branches/<key>/  one branch's own zig/ and zig-local/; zig/ is seeded by a copy of main's
 #
 # A branch's pipeline mounts main/ read-only (.woodpecker/*.yaml) and branches/ writable; main's
 # mounts main/ writable and not branches/. ci_cache_check refuses a mount that is the wrong way
@@ -73,13 +73,15 @@ ci_branch_prune() {
         [ "$drop" = yes ] || continue
         (
             exec 5>>"$b/$name.lock"
-            flock -x -n 5 && rm -rf "$d" && rm -f "$b/$name.lock"
+            # The lock file stays: unlinking it would let a job that opened it first keep a lock
+            # on an inode no later prune opens. They are empty, one per branch key.
+            flock -x -n 5 && rm -rf "$d"
         ) 2>/dev/null || true
     done < <(ls -1dt "$b"/b-*/ 2>/dev/null)
 }
 
-# ci_branch_prepare ROOT BRANCH: creates this branch's cache (a copy of main's, if main's is no
-# larger than CI_BRANCH_SEED_MAX_GIB), prunes the others, and holds a shared lock on its own on
+# ci_branch_prepare ROOT BRANCH: creates this branch's cache (zig/ a copy of main's, if that is no
+# larger than CI_BRANCH_SEED_MAX_GIB; zig-local/ empty), prunes the others, and holds a shared lock on its own on
 # fd 6 for the rest of the process, so a prune by another job leaves it alone. Sets CI_BRANCH_DIR.
 # The count, age and size of branch caches are bounded: CI_BRANCH_CACHES (8), CI_BRANCH_CACHE_DAYS
 # (7), CI_BRANCH_CACHE_MAX_GIB (12). With CI_BRANCH_PRUNE_ALL=1 (the disk is low) every cache
@@ -126,7 +128,8 @@ ci_branch_prepare() {
                 echo "main's cache is over $seedgib GiB: branch $key starts empty" >&2
             fi
             mkdir -p "$partial/zig" "$partial/zig-local"
-            mv "$partial" "$dir"
+            # -T: if a job without the lock made $dir meanwhile, replace nothing and move nothing in.
+            mv -T "$partial" "$dir" 2>/dev/null || rm -rf "$partial"
         else
             # No lock on the branches' directory: no shared partial directory a prune could remove.
             mkdir -p "$dir/zig" "$dir/zig-local"
@@ -134,6 +137,7 @@ ci_branch_prepare() {
     fi
     [ "$locked" != yes ] || flock -u 7
     touch "$dir"
+    # shellcheck disable=SC2034 # read by ci/woodpecker_step.sh
     CI_BRANCH_DIR="$dir" # not printed: a command substitution would drop the lock with its shell
 }
 

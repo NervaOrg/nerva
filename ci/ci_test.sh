@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Table test for the CI scripts' own refusals and cache rules (NRV-E1201 to E1210, NRV-W1201 and
+# Table test for the CI scripts' own refusals and cache rules (NRV-E1201 to E1211, NRV-W1201 and
 # W1202, docs/ERRORS.md; decision O4). Needs flock. Takes a few seconds; touches only a scratch
 # directory. Not covered, as they need a Woodpecker step or a daemon: NRV-E1203 (the Docker socket
 # is not mounted), the io_uring check on a real refusing daemon, and "main's cache is not writable
@@ -146,6 +146,68 @@ sleep 0.3
 is "old branch caches pruned, the one in use kept" "yes" "$([ -d "$c/branches/b-old6-00000006" ] && [ ! -d "$c/branches/b-old5-00000005" ] && [ ! -d "$c/branches/b-old1-00000001" ] && echo yes)"
 kill "$holder" 2>/dev/null || true
 wait "$holder" 2>/dev/null || true
+
+# A prune never unlinks a branch's lock file: a job that opened it first would then hold a lock on
+# an inode that no later prune opens.
+mkdir "$c/branches/b-gone-00000099"
+touch -d "40 days ago" "$c/branches/b-gone-00000099"
+: >"$c/branches/b-gone-00000099.lock"
+(
+    . ci/cache.sh
+    ci_branch_prepare "$c" feature/four
+)
+is "old branch cache removed" no "$([ -d "$c/branches/b-gone-00000099" ] && echo yes || echo no)"
+is "its lock file stays" yes "$([ -f "$c/branches/b-gone-00000099.lock" ] && echo yes || echo no)"
+# NRV-W1202: the branches' lock stays busy, so the branch's cache is made without seeding.
+flock -x "$c/branches/.lock" sleep 20 &
+holder=$!
+sleep 0.3
+out=$(
+    . ci/cache.sh
+    CI_LOCK_WAIT=1 ci_branch_prepare "$c" feature/five 2>&1
+    echo "dir=$CI_BRANCH_DIR"
+)
+kill "$holder" 2>/dev/null || true
+wait "$holder" 2>/dev/null || true
+grep -q NRV-W1202 <<<"$out" || { echo "FAIL branch lock busy: no NRV-W1202 in: $out" >&2; fail=1; }
+key5=$(. ci/cache.sh && ci_branch_key feature/five)
+is "unlocked branch cache is made" yes "$([ -d "$c/branches/$key5/zig-local" ] && echo yes)"
+# A seed whose directory a job without the lock made meanwhile replaces nothing and nests nothing.
+(
+    . ci/cache.sh
+    key=$(ci_branch_key feature/six)
+    cp() { mkdir -p "$c/branches/$key/zig"; command cp "$@"; } # the other job, mid-seed
+    ci_branch_prepare "$c" feature/six
+    echo "$CI_BRANCH_DIR" >"$tmp/dir6"
+)
+d6=$(cat "$tmp/dir6")
+is "a seed does not nest in an existing cache" "" "$(find "$d6" -name '*.partial.*')"
+is "no seed directory is left behind" "" "$(find "$c/branches" -maxdepth 1 -name '*.partial.*')"
+
+# --- ops/ci/io_uring_probe.sh: the probe's perl never dies (exit 255); NRV-E1201 and E1211 ---
+if command -v perl >/dev/null; then
+    rc=0
+    bash ops/ci/io_uring_probe.sh local >/dev/null 2>&1 || rc=$?
+    is "io_uring probe runs on the host (exit 0 or 1, not 255)" yes "$([ "$rc" -le 1 ] && echo yes || echo "no, $rc")"
+else
+    echo "ci_test: no perl: the io_uring probe is not run on the host" >&2
+fi
+# With no Docker here, a stub stands in for it: pull and run succeed, fail or die as set.
+mkdir "$tmp/fakedocker"
+cat >"$tmp/fakedocker/docker" <<'EOS'
+#!/bin/sh
+case "$1" in
+    pull) [ "$FAKE_PULL" = ok ] || { echo "toomanyrequests: pull rate limit" >&2; exit 1; } ;;
+    run) echo "${FAKE_REASON:-}" >&2; exit "$FAKE_RUN" ;;
+esac
+EOS
+chmod +x "$tmp/fakedocker/docker"
+probe() { env PATH="$tmp/fakedocker:$PATH" "$@" bash ops/ci/io_uring_probe.sh; }
+refuses NRV-E1211 "probe: image not pulled" probe FAKE_PULL=no FAKE_RUN=0
+refuses "Operation not permitted" "probe: reason shown" probe FAKE_PULL=ok FAKE_RUN=1 FAKE_REASON="Operation not permitted"
+refuses "kernel.io_uring_disabled" "probe: other cause named" probe FAKE_PULL=ok FAKE_RUN=1
+refuses "probe itself failed" "probe: perl died" probe FAKE_PULL=ok FAKE_RUN=255 FAKE_REASON="perl: not found"
+ok "probe: io_uring allowed" probe FAKE_PULL=ok FAKE_RUN=0
 
 # ci_main_prune: empties main's Zig caches when nobody holds them; NRV-W1202 when others do.
 echo x >"$c/main/zig-local/entry"

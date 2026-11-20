@@ -296,7 +296,8 @@ set:
    (keeping every other key) and restarts Docker, only if either changed. **The restart stops the
    containers running on the box: do it with no pipeline running**; the agent and the server come
    back (`restart: unless-stopped`). `nerva-woodpecker.sh host` refuses to go on if the daemon
-   has no such profile, and every job checks io_uring first and fails with NRV-E1201 if it is
+   has no such profile (`io_uring_probe.sh`: it pulls the pinned ubuntu image, NRV-E1211 if it cannot, and
+   runs `io_uring_setup` in a throwaway container), and every job checks io_uring first and fails with NRV-E1201 if it is
    refused. Without the profile there is no other way to run Nerva's IO in a step: do not make
    the steps privileged instead.
 

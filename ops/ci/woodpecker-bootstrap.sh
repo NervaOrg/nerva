@@ -18,10 +18,6 @@ opt=/opt/woodpecker
 mode="${1:-server}"
 
 fail() { echo "woodpecker-bootstrap: FAIL $*"; exit 1; }
-io_uring_probe() { # a throwaway container on the pinned image: io_uring_setup (425) under the daemon's own profile
-    docker run --rm docker.io/library/ubuntu:24.04@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8 \
-        perl -e 'exit(syscall(425, 1, "\0" x 120) < 0 ? 1 : 0)' >/dev/null 2>&1
-}
 step() { echo "woodpecker-bootstrap: $*"; }
 tmpfiles=()
 trap 'rm -f "${tmpfiles[@]}"' EXIT
@@ -242,8 +238,8 @@ if [ -f "$seccomp_src" ]; then
         step "Docker $(docker version --format '{{.Server.Version}}'): installing the io_uring seccomp profile, restarting Docker"
         systemctl restart docker
     fi
-    io_uring_probe ||
-        fail "NRV-E1201: a throwaway container cannot create an io_uring after the restart: the daemon is not running $seccomp_dst (docker info: $(docker info --format '{{json .SecurityOptions}}'))"
+    msg=$(bash "$(dirname "$(readlink -f "$0")")/io_uring_probe.sh" 2>&1) ||
+        fail "$msg (docker info: $(docker info --format '{{json .SecurityOptions}}'))"
 else
     step "no $seccomp_src: Docker keeps its default seccomp profile, which refuses io_uring (Nerva's CI steps will fail NRV-E1201)"
 fi
