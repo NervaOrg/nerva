@@ -160,14 +160,14 @@ is "oversize main is not copied" "" "$(ls -A "$(cat "$tmp/dir2")/zig")"
 # A failed copy leaves no partial zig/p (a stub cp early in PATH that half-copies and fails, so
 # the case runs as root too).
 mkdir -p "$tmp/badcp"
-printf '#!/bin/sh\nfor a; do last=$a; done\nmkdir -p "${last}p"\nexit 1\n' >"$tmp/badcp/cp"
+printf '#!/bin/sh\nfor a; do last=$a; done\nmkdir -p "${last}p"\necho "cp: stub: no space left on device" >&2\nexit 1\n' >"$tmp/badcp/cp"
 chmod +x "$tmp/badcp/cp"
 out=$(
     . ci/cache.sh
     PATH="$tmp/badcp:$PATH" ci_branch_prepare "$c" feature/badseed 2>&1
     echo "$CI_BRANCH_DIR" >"$tmp/dirbs"
 )
-grep -q "seed copy failed: branch" <<<"$out" || { echo "FAIL failed seed: no message in: $out" >&2; fail=1; }
+grep -q "seed copy failed: branch .*no space left on device" <<<"$out" || { echo "FAIL failed seed: no message in: $out" >&2; fail=1; }
 is "a failed seed copy leaves no zig/p" "" "$(ls -A "$(cat "$tmp/dirbs")/zig")"
 # Bounded: only the newest CI_BRANCH_CACHES others stay, and one a job holds is never removed.
 for i in 1 2 3 4 5 6; do
@@ -185,7 +185,7 @@ sleep 0.3
 # the two places; old6 is the oldest but a job holds it, so it stays as well.
 is "old branch caches pruned, the one in use kept" "yes" "$([ -d "$c/branches/b-old6-00000006" ] && [ ! -d "$c/branches/b-old5-00000005" ] && [ ! -d "$c/branches/b-old1-00000001" ] && echo yes)"
 is "the bound is at most CI_BRANCH_CACHES, the job's own included, and what is in use" 3 "$(find "$c/branches" -maxdepth 1 -type d -name 'b-*' | wc -l)"
-kill "$holder" 2>/dev/null || true
+pkill -P "$holder" 2>/dev/null || true; kill "$holder" 2>/dev/null || true
 wait "$holder" 2>/dev/null || true
 
 # A prune never unlinks a branch's lock file: a job that opened it first would then hold a lock on
@@ -208,7 +208,7 @@ out=$(
     CI_LOCK_WAIT=1 ci_branch_prepare "$c" feature/five 2>&1
     echo "dir=$CI_BRANCH_DIR"
 )
-kill "$holder" 2>/dev/null || true
+pkill -P "$holder" 2>/dev/null || true; kill "$holder" 2>/dev/null || true
 wait "$holder" 2>/dev/null || true
 grep -q NRV-W1202 <<<"$out" || { echo "FAIL branch lock busy: no NRV-W1202 in: $out" >&2; fail=1; }
 key5=$(. ci/cache.sh && ci_branch_key feature/five)
@@ -251,7 +251,7 @@ branch_file_unlocked() {
     CI_LOCK_WAIT=1 ci_branch_prepare "$c" feature/eight
 }
 refuses NRV-E1214 "branch cache path is a file, branches' lock busy" branch_file_unlocked
-kill "$holder" 2>/dev/null || true
+pkill -P "$holder" 2>/dev/null || true; kill "$holder" 2>/dev/null || true
 wait "$holder" 2>/dev/null || true
 rm -f "$c/branches/$eight"
 
@@ -410,7 +410,7 @@ out=$(
     exec 9<"$c/main/.lock"
     CI_PRUNE_WAIT=1 ci_main_prune "$c" 99999999 2>&1
 )
-kill "$holder" 2>/dev/null || true
+pkill -P "$holder" 2>/dev/null || true; kill "$holder" 2>/dev/null || true
 wait "$holder" 2>/dev/null || true
 grep -q NRV-W1202 <<<"$out" || { echo "FAIL prune busy: no NRV-W1202 in: $out" >&2; fail=1; }
 is "main kept when busy" entry "$(ls "$c/main/zig-local")"
@@ -423,7 +423,7 @@ out=$(
     exec 9<"$c/main/.lock"
     CI_PRUNE_WAIT=1 ci_main_prune "$c" 0 2>&1
 )
-kill "$holder" 2>/dev/null || true
+pkill -P "$holder" 2>/dev/null || true; kill "$holder" 2>/dev/null || true
 wait "$holder" 2>/dev/null || true
 if grep -q NRV-W1202 <<<"$out"; then echo "FAIL prune busy but space free: NRV-W1202 in: $out" >&2; fail=1; fi
 is "main kept when space is free again" entry "$(ls "$c/main/zig-local")"
@@ -433,6 +433,21 @@ is "main kept when space is free again" entry "$(ls "$c/main/zig-local")"
     CI_PRUNE_WAIT=1 ci_main_prune "$c" 0 >/dev/null
 )
 is "main kept when idle and space is free" entry "$(ls "$c/main/zig-local")"
+
+# The step's own sequence (ci_main_prepare: lock, prune, then ownership): after a prune main's
+# directories belong to the job's user. As root the user is `nobody`; as another user the check is
+# trivially true (the prune recreates the directories as that user), so only root proves the order.
+if [ "$(id -u)" = 0 ]; then ou=nobody; else ou=$(id -un); fi
+og=$(id -gn "$ou")
+echo x >"$c/main/zig-local/entry"
+(
+    . ci/cache.sh
+    CI_PRUNE_WAIT=1 ci_main_prepare "$c" "$ou" "$og" yes 99999999 >/dev/null
+)
+is "prepare: main pruned" "" "$(ls -A "$c/main/zig-local")"
+is "prepare: zig owned by the job's user after a prune" "$ou" "$(stat -c %U "$c/main/zig")"
+is "prepare: zig-local owned by the job's user after a prune" "$ou" "$(stat -c %U "$c/main/zig-local")"
+is "prepare: tools owned by the job's user" "$ou" "$(stat -c %U "$c/main/tools")"
 
 # --- ci/install_zig.sh: the toolchain archive is checked on every use; only main writes it ---
 z="$tmp/zrepo"

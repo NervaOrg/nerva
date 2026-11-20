@@ -136,13 +136,14 @@ ci_branch_prepare() {
                 echo "main has no package cache yet: branch $key starts empty" >&2
             elif [ "$(ci_dir_gib "$root/main/zig/p")" -le "$seedgib" ]; then
                 # A failed copy must not leave a partial zig/p (a half-written package would be trusted).
-                cp -a "$root/main/zig/p" "$partial/zig/" 2>/dev/null || {
-                    echo "seed copy failed: branch $key starts empty" >&2
+                cp -a "$root/main/zig/p" "$partial/zig/" 2>"$partial/cp.err" || {
+                    echo "seed copy failed: branch $key starts empty ($(tail -n 1 "$partial/cp.err" 2>/dev/null))" >&2
                     rm -rf "$partial/zig/p"
                 }
             else
                 echo "main's package cache is over $seedgib GiB: branch $key starts empty" >&2
             fi
+            rm -f "$partial/cp.err"
             mkdir -p "$partial/zig" "$partial/zig-local"
             # -T: if a job without the lock filled $dir meanwhile, keep its directory and drop the seed.
             mv -T "$partial" "$dir" 2>/dev/null || rm -rf "$partial"
@@ -179,4 +180,18 @@ ci_main_prune() {
     else
         ci_warning "NRV-W1202: other jobs held main's cache for $wait s: not pruned. To recover by hand, with the agent idle: rm -rf /var/cache/nerva-ci/main/zig-local /var/cache/nerva-ci/main/zig"
     fi
+}
+
+# ci_main_prepare ROOT USER GROUP LOW MIN_GIB: the main role's cache set-up, run as root, in this
+# order: the lock file and its fd 9, the prune (when LOW is yes), and only then the ownership of
+# main's directories. The prune recreates main/zig and main/zig-local as the caller (root), so the
+# ownership is set after it: the job runs as USER and must be able to write them. The caller takes
+# its shared lock (flock -s 9) after this returns.
+ci_main_prepare() {
+    local root="$1" user="$2" group="$3" low="$4" min="$5"
+    touch "$root/main/.lock"
+    chown "$user:$group" "$root/main/.lock"
+    exec 9<"$root/main/.lock"
+    [ "$low" = no ] || { echo "Below $min GiB free"; ci_main_prune "$root" "$min"; }
+    install -d -o "$user" -g "$group" "$root/main/zig" "$root/main/zig-local" "$root/main/tools"
 }
