@@ -216,27 +216,47 @@ fn run() !void {
 
             // `start --trace` writes spans to a file; `start --statsd` sends metrics over UDP.
             // Never an existing file: a path given by mistake (the data file's, say) would be
-            // truncated (#29).
-            const trace_file: ?std.fs.File = if (tag == .start and args.trace != null)
-                std.fs.cwd().createFile(args.trace.?, .{ .exclusive = true }) catch |err|
-                    switch (err) {
-                        error.PathAlreadyExists => diagnostic.fail(
-                            "NRV-E0004",
-                            "start: --trace {s} exists",
-                            .{args.trace.?},
-                            "give a new path: nerva never overwrites a file",
-                            .{},
-                        ),
-                        else => diagnostic.fail_file(args.trace.?, err),
-                    }
+            // truncated (#29). A `start` that a release transition re-executed, with the same
+            // arguments, writes the next segment beside it instead (`<path>.1`, P480).
+            var trace_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+            const reexecuted = tag == .start and start_reexecuted();
+            const trace: ?TraceCreated = if (tag == .start and args.trace != null)
+                trace_create(
+                    std.fs.cwd(),
+                    args.trace.?,
+                    reexecuted,
+                    trace_segments_max,
+                    &trace_path_buffer,
+                ) catch |err| if (reexecuted)
+                    // Tracing never stops the replica (N71), least of all in the middle of an
+                    // upgrade: warn and run untraced (P480b).
+                    trace_unavailable(args.trace.?, err)
+                else switch (err) {
+                    error.PathAlreadyExists => diagnostic.fail(
+                        "NRV-E0004",
+                        "start: --trace {s} exists",
+                        .{args.trace.?},
+                        "give a new path: nerva never overwrites a file",
+                        .{},
+                    ),
+                    else => diagnostic.fail_file(args.trace.?, err),
+                }
             else
                 null;
+            const trace_file: ?std.fs.File = if (trace) |created| created.file else null;
             defer if (trace_file) |file| file.close();
             // Every coded exit from here on (through `diagnostic`) removes the file, or the next
             // start is refused with NRV-E0004 on it (#197). So does a panic (`panic` above) and
             // SIGINT or SIGTERM (P208). Not removed: vendored `vsr.fatal` exits (NRV-E0707, say;
             // #206). `command_start` clears this once `replica.open` has returned.
-            if (trace_file) |file| diagnostic.cleanup_register(args.trace.?, file);
+            if (trace) |created| diagnostic.cleanup_register(created.path, created.file);
+            // After the registration: an interrupt that follows this line removes the segment.
+            if (trace) |created| if (created.segment > 0) {
+                log.info("tracing to {s}: segment {d}, after a release transition", .{
+                    created.path,
+                    created.segment,
+                });
+            };
             var trace_file_writer: ?std.fs.File.Writer =
                 if (trace_file) |file| file.writer() else null;
             // Buffered, bounded, and never failing: a trace write error must not panic the
@@ -246,6 +266,14 @@ fn run() !void {
             else
                 null;
             defer if (trace_writer) |*writer| writer.flush();
+            // A release transition re-executes the binary, which drops what is buffered: the
+            // replica's `release_execute` writes it out first, or removes the file when the
+            // transition comes while the start is still opening (P480, P480b).
+            var multiversion_traced: ?MultiversionTraced = if (multiversion_bundled and
+                trace_writer != null)
+                .{ .inner = multiversion, .trace = &trace_writer.? }
+            else
+                null;
 
             var tracer = Tracer.init(gpa, time, .unknown, if (tag == .start) .{
                 .writer = if (trace_writer) |*writer| writer.writer() else null,
@@ -302,7 +330,7 @@ fn run() !void {
                     &tracer,
                     &storage,
                     args,
-                    multiversion,
+                    if (multiversion_traced) |*traced| traced.multiversion() else multiversion,
                     if (multiversion_bundled) &multiversion_os else null,
                 ),
                 .version, .view, .api, .@"export", .backup, .import, .restore, .recover => comptime unreachable,
@@ -420,10 +448,17 @@ fn import_run(
     // The manifest first: a backup is compared with a record it did not carry.
     var manifest: backup.Manifest = undefined;
     if (manifest_path) |path| manifest_read(command, path, &manifest);
+    // One descriptor for both passes: the path is opened once, so that pass 2 reads the file
+    // pass 1 checked, not one renamed over it since (and pass 2 compares the SHA-256s).
+    // Opened without blocking and checked first: a FIFO with no writer would block the open
+    // for good, before the refusal that names it (NRV-E0810).
+    const input = input_open(args.input) catch |err|
+        import_failed(command, args.input, args.path, err);
+    defer input.close();
     // Pass 1, before the data file exists: the whole export is checked.
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    const plan = import_.plan(arena.allocator(), args.input) catch |err|
+    const plan = import_.plan(arena.allocator(), input) catch |err|
         import_failed(command, args.input, args.path, err);
     if (commit_keys_deduplicate and plan.flags & export_file.flag_keys_off != 0) {
         diagnostic.fail(
@@ -435,11 +470,11 @@ fn import_run(
             .{},
         );
     }
-    if (manifest_path) |path| manifest_compare(command, args, path, &manifest, &plan);
+    if (manifest_path) |path| manifest_compare(command, args, input, path, &manifest, &plan);
     // Pass 2. A failure removes the data file only if this invocation created it: the
     // exclusive create can lose to another import of the same path, whose file it is (P489).
     var created = false;
-    command_import(gpa, args, &created, path_importing, &plan) catch |err| {
+    command_import(gpa, args, input, &created, path_importing, &plan) catch |err| {
         staging_remove(created, path_importing);
         // `Storage.init` can fail after its create (the allocation: no space), and then
         // `created` is still false: the file may be this one's and is left (P489).
@@ -522,11 +557,13 @@ fn manifest_read(comptime command: []const u8, path: []const u8, manifest: *back
 fn manifest_compare(
     comptime command: []const u8,
     args: *const cli.Command.Import,
+    input: std.fs.File,
     manifest_path: []const u8,
     manifest: *const backup.Manifest,
     plan: *const import_.Plan,
 ) void {
-    const stat = std.fs.cwd().statFile(args.input) catch |err|
+    // The file pass 1 read, not the path's.
+    const stat = input.stat() catch |err|
         diagnostic.fail_file(args.input, err);
     const actual = backup.from_plan(plan, manifest.release_slice(), manifest.cluster, stat.size);
     var difference_buffer: [512]u8 = undefined;
@@ -562,11 +599,17 @@ fn command_backup(gpa: std.mem.Allocator, args: *const cli.Command.Backup) void 
     // A backup that `restore` would refuse is refused now.
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
-    const plan = import_.plan(arena.allocator(), args.output) catch |err| {
+    const output = std.fs.cwd().openFile(args.output, .{}) catch |err| {
+        std.fs.cwd().deleteFile(args.output) catch {};
+        diagnostic.fail_file(args.output, err);
+    };
+    defer output.close();
+    const plan = import_.plan(arena.allocator(), output) catch |err| {
         std.fs.cwd().deleteFile(args.output) catch {};
         backup_unreadable(args.output, err);
     };
-    const size = (std.fs.cwd().statFile(args.output) catch |err| {
+    // From the descriptor the SHA-256 was read through, not the path again.
+    const size = (output.stat() catch |err| {
         std.fs.cwd().deleteFile(args.output) catch {};
         diagnostic.fail_file(args.output, err);
     }).size;
@@ -653,6 +696,20 @@ fn backup_unreadable(output: []const u8, err: anyerror) noreturn {
 }
 
 /// Exits with the code for an import that failed in `plan` or while restoring.
+/// Opens the export `path` for reading, once for both passes: refuses what is not a regular
+/// file (`import_.input_check`) before any read. `O_NONBLOCK` lets the open of a FIFO return,
+/// and is cleared on the same descriptor afterwards.
+fn input_open(path: []const u8) !std.fs.File {
+    const fd = try std.posix.open(path, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true }, 0);
+    const file: std.fs.File = .{ .handle = fd };
+    errdefer file.close();
+    try import_.input_check(file);
+    const flags = try std.posix.fcntl(fd, std.posix.F.GETFL, 0);
+    const nonblock: usize = @intCast(@as(u32, @bitCast(std.posix.O{ .NONBLOCK = true })));
+    _ = try std.posix.fcntl(fd, std.posix.F.SETFL, flags & ~nonblock);
+    return file;
+}
+
 fn import_failed(
     comptime command: []const u8,
     input: []const u8,
@@ -681,6 +738,15 @@ fn import_failed(
             "read the log lines above; nothing was named {s}",
             .{output},
         ),
+        error.ExportChanged => diagnostic.fail(
+            "NRV-E0813",
+            command ++ ": {s} changed while it was read: the second pass read another export " ++
+                "than the first",
+            .{input},
+            "let nothing write or replace {s} during the {s}, then {s} again; nothing was " ++
+                "named {s}",
+            .{ input, command, command, output },
+        ),
         // Another import or restore of the same path created `output` first. It is that
         // process's file: this one touched nothing (P489).
         error.PathAlreadyExists => diagnostic.fail(
@@ -695,6 +761,7 @@ fn import_failed(
         error.AccessDenied,
         error.PermissionDenied,
         error.IsDir,
+        error.NotRegularFile,
         => diagnostic.fail_file(input, err),
         else => diagnostic.fail_file(output, err),
     }
@@ -719,6 +786,7 @@ fn staging_remove(created: bool, path: []const u8) void {
 fn command_import(
     gpa: std.mem.Allocator,
     args: *const cli.Command.Import,
+    input: std.fs.File,
     created: *bool,
     path: []const u8,
     plan: *const import_.Plan,
@@ -755,7 +823,7 @@ fn command_import(
     try import_.ImporterType(Storage).run(gpa, time, &tracer, &storage, .{
         .cluster = args.cluster,
         .release = config.process.release,
-        .input = args.input,
+        .input = .{ .file = input },
     }, plan);
     // Import cannot see the cluster, so it says what it needs (P90): a replica imported alone
     // into a cluster that ran on has forgotten the prepares the replica it replaces acknowledged.
@@ -950,6 +1018,121 @@ fn command_start(
         try io.run_for_ns(constants.tick_ms * std.time.ns_per_ms);
     }
 }
+
+/// How many segments a re-executed `start --trace` looks through for a new one: one per release
+/// transition, and a replica makes few (P480).
+const trace_segments_max = 1024;
+
+const TraceCreated = struct {
+    file: std.fs.File,
+    /// In the caller's buffer.
+    path: []const u8,
+    /// 0 for the path the operator gave; n for `<path>.n`.
+    segment: u32,
+};
+
+/// Creates `start --trace`'s file, never over an existing one (#29). A `start` that a release
+/// transition re-executed is given the same `path` as the process before it, which created it:
+/// it creates the first `<path>.n` (n from 1 to `segments_max`) that does not exist (P480).
+fn trace_create(
+    dir: std.fs.Dir,
+    path: []const u8,
+    reexecuted: bool,
+    segments_max: u32,
+    path_buffer: *[std.fs.max_path_bytes]u8,
+) !TraceCreated {
+    std.debug.assert(segments_max > 0);
+    if (!reexecuted) {
+        const file = try dir.createFile(path, .{ .exclusive = true });
+        return .{ .file = file, .path = path, .segment = 0 };
+    }
+    for (1..segments_max + 1) |segment| {
+        const segment_path = std.fmt.bufPrint(path_buffer, "{s}.{d}", .{ path, segment }) catch
+            return error.NameTooLong;
+        const file = dir.createFile(segment_path, .{ .exclusive = true }) catch |err| switch (err) {
+            error.PathAlreadyExists => continue,
+            else => return err,
+        };
+        return .{ .file = file, .path = segment_path, .segment = @intCast(segment) };
+    }
+    return error.SegmentsExhausted;
+}
+
+/// What `MultiversionOS` names the binary it re-executes from: the bundle's memfd on Linux
+/// (`/memfd:<name> (deleted)`), a temporary file on macOS. It is the prefix of the vendored
+/// `multiversion_uuid`, which is private to `multiversion.zig`; `self_exe_path` tests for the same
+/// uuid, so a process is re-executed here exactly when it is there.
+const reexecuted_marker = "tigerbeetle-multiversion-";
+
+/// Whether this process is a `start` that `MultiversionOS` re-executed at a release transition:
+/// the kernel's path for it carries the marker (P480).
+fn start_reexecuted() bool {
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const native = std.fs.selfExePath(&buffer) catch return false;
+    return path_reexecuted(native);
+}
+
+fn path_reexecuted(native: []const u8) bool {
+    return std.mem.indexOf(u8, native, reexecuted_marker) != null;
+}
+
+/// A re-executed `start` that cannot create its trace segment: one warning, and no trace (P480b).
+fn trace_unavailable(path: []const u8, err: anyerror) ?TraceCreated {
+    log.warn("NRV-W0012 start: tracing stopped after a release transition: cannot create " ++
+        "{s}.n: {s}; the replica runs on untraced", .{ path, trace_unavailable_reason(err) });
+    return null;
+}
+
+const trace_segments_exhausted =
+    std.fmt.comptimePrint("every segment .1 to .{d} exists", .{trace_segments_max});
+
+fn trace_unavailable_reason(err: anyerror) []const u8 {
+    return switch (err) {
+        error.SegmentsExhausted => trace_segments_exhausted,
+        error.NameTooLong => "the path is too long for a segment's name",
+        error.FileNotFound, error.NotDir => "its directory is gone",
+        error.AccessDenied, error.PermissionDenied, error.ReadOnlyFileSystem => "not permitted",
+        error.NoSpaceLeft, error.DiskQuota => "the disk is full",
+        else => "the system refused",
+    };
+}
+
+/// The replica's `Multiversion` for `start --trace` on a bundled binary: `release_execute` writes
+/// out the buffered spans before the binary is re-executed, which would drop them (P480).
+const MultiversionTraced = struct {
+    inner: Multiversion,
+    trace: *TraceFile,
+
+    fn multiversion(traced: *MultiversionTraced) Multiversion {
+        return .{ .context = traced, .vtable = &.{
+            .releases_bundled = releases_bundled,
+            .release_execute = release_execute,
+            .tick = tick,
+        } };
+    }
+
+    fn from(context: *anyopaque) *MultiversionTraced {
+        return @ptrCast(@alignCast(context));
+    }
+
+    fn releases_bundled(context: *anyopaque) mv.ReleaseList {
+        return from(context).inner.releases_bundled();
+    }
+
+    fn release_execute(context: *anyopaque, release: vsr.Release) void {
+        const traced = from(context);
+        // A transition while the start is still opening (down to the data file's release): the
+        // process after it carries on the start, so this one's file, which holds no spans worth
+        // keeping, goes now, as it would if the start failed (#197, P208). Otherwise the spans are
+        // written out (P480, P480b).
+        if (!diagnostic.cleanup_now()) traced.trace.flush();
+        traced.inner.release_execute(release);
+    }
+
+    fn tick(context: *anyopaque) void {
+        from(context).inner.tick();
+    }
+};
 
 /// The highest release `multiversion` offers: the gauge `replica_releases_offered`, which says
 /// when every replica carries the next release (not how many releases it bundles).
@@ -1309,6 +1492,194 @@ test "bundle_present: unreadable, too large, out of memory, unbundled" {
     try testing.expect(!(try bundle_present(testing.allocator, "/proc/self/exe")));
 }
 
+test "trace_create: a first start never opens an existing file; a re-executed one takes the next segment" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+
+    // A first start creates the path, and refuses it once it exists (#29).
+    const first = try trace_create(tmp.dir, "trace.json", false, 4, &buffer);
+    try first.file.writeAll("[\nfirst");
+    first.file.close();
+    try testing.expectEqual(@as(u32, 0), first.segment);
+    try testing.expectEqualStrings("trace.json", first.path);
+    try testing.expectError(
+        error.PathAlreadyExists,
+        trace_create(tmp.dir, "trace.json", false, 4, &buffer),
+    );
+
+    // An operator's file at `.2` is passed over, never opened.
+    try tmp.dir.writeFile(.{ .sub_path = "trace.json.2", .data = "operator" });
+    var segments: [2]u32 = undefined;
+    for (&segments) |*segment| {
+        const created = try trace_create(tmp.dir, "trace.json", true, 4, &buffer);
+        created.file.close();
+        segment.* = created.segment;
+    }
+    try testing.expectEqualSlices(u32, &.{ 1, 3 }, &segments);
+    const created = try trace_create(tmp.dir, "trace.json", true, 4, &buffer);
+    created.file.close();
+    try testing.expectEqualStrings("trace.json.4", created.path);
+
+    // At the bound, every segment exists: refused.
+    try testing.expectError(
+        error.SegmentsExhausted,
+        trace_create(tmp.dir, "trace.json", true, 4, &buffer),
+    );
+
+    // Nothing was truncated.
+    var read_buffer: [16]u8 = undefined;
+    try testing.expectEqualStrings(
+        "[\nfirst",
+        try tmp.dir.readFile("trace.json", &read_buffer),
+    );
+    try testing.expectEqualStrings(
+        "operator",
+        try tmp.dir.readFile("trace.json.2", &read_buffer),
+    );
+}
+
+test "trace_create: at the bound, the last segment is created; past it, none" {
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for (1..trace_segments_max) |segment| {
+        var name_buffer: [32]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buffer, "trace.json.{d}", .{segment});
+        (try tmp.dir.createFile(name, .{ .exclusive = true })).close();
+    }
+    // 1023 segments exist: the start creates the 1024th.
+    const created = try trace_create(tmp.dir, "trace.json", true, trace_segments_max, &buffer);
+    created.file.close();
+    try std.testing.expectEqual(@as(u32, trace_segments_max), created.segment);
+    try std.testing.expectEqualStrings("trace.json.1024", created.path);
+    try std.testing.expectError(
+        error.SegmentsExhausted,
+        trace_create(tmp.dir, "trace.json", true, trace_segments_max, &buffer),
+    );
+}
+
+test "path_reexecuted: only the bundle's own re-execution path is re-executed" {
+    try std.testing.expect(path_reexecuted("/memfd:" ++ reexecuted_marker ++
+        "1768a738-ef69-4605-8b5c-c6e63580e345 (deleted)"));
+    try std.testing.expect(path_reexecuted("/tmp/" ++ reexecuted_marker ++ "1768a738/nerva"));
+    try std.testing.expect(!path_reexecuted("/usr/bin/nerva"));
+    // A binary replaced on disk since the start began is still a first start.
+    try std.testing.expect(!path_reexecuted("/usr/bin/nerva (deleted)"));
+    try std.testing.expect(!start_reexecuted());
+}
+
+test "trace_unavailable: a re-executed start that cannot create a segment warns and has no trace" {
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    try std.testing.expectEqual(@as(?TraceCreated, null), trace_unavailable("trace.json", error.SegmentsExhausted));
+    try std.testing.expectEqualStrings(
+        "every segment .1 to .1024 exists",
+        trace_unavailable_reason(error.SegmentsExhausted),
+    );
+    try std.testing.expectEqualStrings("its directory is gone", trace_unavailable_reason(error.FileNotFound));
+    try std.testing.expectEqualStrings("the system refused", trace_unavailable_reason(error.Unexpected));
+    // The failures that lead here are the ones `trace_create` gives.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try std.testing.expectError(
+        error.FileNotFound,
+        trace_create(tmp.dir, "gone/trace.json", true, 4, &buffer),
+    );
+    var long: [std.fs.max_path_bytes]u8 = undefined;
+    @memset(&long, 'a');
+    try std.testing.expectError(error.NameTooLong, trace_create(tmp.dir, long[0 .. long.len - 1], true, 4, &buffer));
+}
+
+test "MultiversionTraced: release_execute writes the buffered spans out first" {
+    const testing = std.testing;
+    const Release = vsr.Release;
+    var sink = std.ArrayList(u8).init(testing.allocator);
+    defer sink.deinit();
+    var trace = TraceFile.init(sink.writer().any(), trace_file_size_max_test);
+    trace.writer().writeAll("[\nspan") catch unreachable;
+    try testing.expectEqual(@as(usize, 0), sink.items.len);
+
+    const Inner = struct {
+        sink: *std.ArrayList(u8),
+        executed: ?Release = null,
+        written_before: usize = 0,
+
+        fn releases_bundled(_: *anyopaque) mv.ReleaseList {
+            var list: mv.ReleaseList = .empty;
+            list.push(Release.from(.{ .major = 0, .minor = 7, .patch = 1 }));
+            return list;
+        }
+        fn release_execute(context: *anyopaque, release: Release) void {
+            const inner: *@This() = @ptrCast(@alignCast(context));
+            inner.executed = release;
+            inner.written_before = inner.sink.items.len;
+        }
+        fn tick(_: *anyopaque) void {}
+    };
+    var inner: Inner = .{ .sink = &sink };
+    const vtable: Multiversion.VTable = .{
+        .releases_bundled = Inner.releases_bundled,
+        .release_execute = Inner.release_execute,
+        .tick = Inner.tick,
+    };
+    var traced: MultiversionTraced = .{
+        .inner = .{ .context = &inner, .vtable = &vtable },
+        .trace = &trace,
+    };
+    const multiversion = traced.multiversion();
+    try testing.expectEqual(@as(u16, 1), multiversion.releases_bundled().count);
+    const release = Release.from(.{ .major = 0, .minor = 7, .patch = 0 });
+    multiversion.release_execute(release);
+    try testing.expectEqual(release.value, inner.executed.?.value);
+    try testing.expectEqualStrings("[\nspan", sink.items[0..inner.written_before]);
+}
+
+test "MultiversionTraced: a transition during the open removes the registered file instead" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try tmp.dir.realpath(".", &buffer);
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buffer, "{s}/trace.json", .{dir});
+    const file = try std.fs.cwd().createFile(path, .{ .exclusive = true });
+    defer file.close();
+    diagnostic.cleanup_register(path, file);
+    defer diagnostic.cleanup_clear();
+
+    var writer = file.writer();
+    var trace = TraceFile.init(writer.any(), trace_file_size_max_test);
+    trace.writer().writeAll("[\n") catch unreachable;
+    const Inner = struct {
+        directory: std.fs.Dir,
+        existed: bool = true,
+        fn releases_bundled(_: *anyopaque) mv.ReleaseList {
+            return .empty;
+        }
+        fn release_execute(context: *anyopaque, _: vsr.Release) void {
+            const inner: *@This() = @ptrCast(@alignCast(context));
+            inner.existed = if (inner.directory.access("trace.json", .{})) true else |_| false;
+        }
+        fn tick(_: *anyopaque) void {}
+    };
+    var inner: Inner = .{ .directory = tmp.dir };
+    const vtable: Multiversion.VTable = .{
+        .releases_bundled = Inner.releases_bundled,
+        .release_execute = Inner.release_execute,
+        .tick = Inner.tick,
+    };
+    var traced: MultiversionTraced = .{
+        .inner = .{ .context = &inner, .vtable = &vtable },
+        .trace = &trace,
+    };
+    traced.multiversion().release_execute(vsr.Release.from(.{ .major = 0, .minor = 7, .patch = 0 }));
+    // Gone before the binary was re-executed; nothing written to it.
+    try testing.expect(!inner.existed);
+}
+
+const trace_file_size_max_test = 1024 * 1024;
+
 test "import: an exclusive create that loses touches nothing (P489)" {
     if (builtin.target.os.tag != .linux) return error.SkipZigTest;
     const testing = std.testing;
@@ -1331,12 +1702,14 @@ test "import: an exclusive create that loses touches nothing (P489)" {
         .log_debug = false,
         .path = "d.nerva",
     };
-    // The create fails before the plan is read.
+    // The create fails before the plan or the input is read.
     const plan = std.mem.zeroes(import_.Plan);
+    const input = try tmp.dir.createFile("unused", .{});
+    defer input.close();
     var created = false;
     try testing.expectError(
         error.PathAlreadyExists,
-        command_import(testing.allocator, &args, &created, path, &plan),
+        command_import(testing.allocator, &args, input, &created, path, &plan),
     );
     try testing.expect(!created);
 
