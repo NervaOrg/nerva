@@ -24,8 +24,8 @@ COMMIT = "0123456789abcdef0123456789abcdef01234567"
 
 FORMULA = """class Nerva < Formula
   desc "Research database"
-  homepage "https://github.com/NervaLog/nerva"
-  url "https://github.com/NervaLog/nerva/releases/download/v0.7.1/nerva-v0.7.1-universal-macos.zip"
+  homepage "https://github.com/NervaOrg/nerva"
+  url "https://github.com/NervaOrg/nerva/releases/download/v0.7.1/nerva-v0.7.1-universal-macos.zip"
   version "0.7.1"
   sha256 "%s"
   license "Apache-2.0"

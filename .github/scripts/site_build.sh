@@ -2,8 +2,8 @@
 # The site's build gate (docs/releases/packages.md, "The site on a Cloudflare Worker"; P410).
 #
 # Workers Builds' build command, set in the Cloudflare dashboard, downloads this file from
-# raw.githubusercontent.com at a pinned commit of NervaLog/nerva, checks its SHA-256 and runs it
-# from the root of a checkout of NervaLog/nervalog.github.io. It refuses a tree that could change
+# raw.githubusercontent.com at a pinned commit of NervaOrg/nerva, checks its SHA-256 and runs it
+# from the root of a checkout of NervaOrg/nerva-site. It refuses a tree that could change
 # what Cloudflare runs, installs or binds (NRV-E1152), copies the named files into
 # .nerva-site/dist/, and writes .nerva-site/wrangler.json, the only Wrangler configuration the
 # deploy and preview commands read (they run inside .nerva-site/ and name it with --config): an

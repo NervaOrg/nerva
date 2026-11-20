@@ -671,7 +671,7 @@ class Soak(unittest.TestCase):
 
     def live_main(self, path, rnd, token_file, commit=SHA_A, round_id=None):
         return self.run_main("ingest", "--round", rnd.path, "--round-id", round_id or new_id(),
-                             "--commit", commit, "--state", path, "--repo", "NervaLog/nerva",
+                             "--commit", commit, "--state", path, "--repo", "NervaOrg/nerva",
                              "--token-file", token_file)
 
     def failing_round(self):
@@ -1086,7 +1086,7 @@ class GitHubRequest(unittest.TestCase):
             def open(self, request, timeout):
                 return opened()
 
-        github = fleet.GitHub("NervaLog/nerva", "t0ken", lambda message: None)
+        github = fleet.GitHub("NervaOrg/nerva", "t0ken", lambda message: None)
         github.opener = Opener()
         return github
 
@@ -2002,7 +2002,7 @@ class Alarm(unittest.TestCase):
     """`sim_fleet.py alarm` files one issue and comments on it after that."""
 
     ARGS = ["alarm", "--rounds", "3", "--round-id", ID_A, "--commit", SHA_A,
-            "--repo", "NervaLog/nerva", "--token-file", "/x"]
+            "--repo", "NervaOrg/nerva", "--token-file", "/x"]
 
     def run_alarm(self, github, argv=None):
         err = io.StringIO()

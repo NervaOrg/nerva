@@ -1,4 +1,4 @@
-# Part of Nerva (https://github.com/NervaLog/nerva): sourced by build-deb.sh and build-rpm.sh
+# Part of Nerva (https://github.com/NervaOrg/nerva): sourced by build-deb.sh and build-rpm.sh
 # (v0.7.1, P295). check_elf <script> <file> <machine>: refuses, with NRV-E1110, a file that is not
 # an ELF executable for <machine> (x86_64 or aarch64), reading the header as install.sh's
 # elf_machine does (so an emulator that would run a foreign binary cannot hide the mismatch).

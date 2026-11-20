@@ -1,4 +1,4 @@
-# Part of Nerva (https://github.com/NervaLog/nerva): shipped by the tarball's install.sh and by
+# Part of Nerva (https://github.com/NervaOrg/nerva): shipped by the tarball's install.sh and by
 # the nerva packages, byte for byte. Change it with a drop-in (systemctl edit nerva@0), not here.
 #
 # One replica per instance: nerva@0 reads /etc/nerva/replica-0.env (see replica.env.example).
@@ -6,7 +6,7 @@
 # enables or starts a replica for you.
 [Unit]
 Description=Nerva replica %i
-Documentation=https://github.com/NervaLog/nerva
+Documentation=https://github.com/NervaOrg/nerva
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=300

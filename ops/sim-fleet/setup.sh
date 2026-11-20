@@ -75,7 +75,7 @@ if [ ! -f /etc/sim-fleet/fleet.env ]; then
 fi
 # The remote fleet.env names (a private repository is fetched over SSH with the deploy key).
 REMOTE=$(sed -n 's/^SIM_FLEET_REMOTE=//p' /etc/sim-fleet/fleet.env | tail -n1)
-REMOTE=${REMOTE:-https://github.com/NervaLog/nerva.git}
+REMOTE=${REMOTE:-https://github.com/NervaOrg/nerva.git}
 
 # MemoryMax from this host (P179): the shipped unit's 56G suits a 64 GB host, and on a smaller one
 # the kernel's global OOM killer acts before the cgroup limit does. The drop-in caps the service

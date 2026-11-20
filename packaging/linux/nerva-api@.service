@@ -1,11 +1,11 @@
-# Part of Nerva (https://github.com/NervaLog/nerva): shipped by the tarball's install.sh and by
+# Part of Nerva (https://github.com/NervaOrg/nerva): shipped by the tarball's install.sh and by
 # the nerva packages, byte for byte. Change it with a drop-in (systemctl edit nerva-api@0), not here.
 #
 # One gateway per instance: nerva-api@0 reads /etc/nerva/api-0.env (see api.env.example). It
 # listens on loopback unless the env file says otherwise (and adds --listen-remote to NERVA_FLAGS).
 [Unit]
 Description=Nerva gateway %i
-Documentation=https://github.com/NervaLog/nerva
+Documentation=https://github.com/NervaOrg/nerva
 After=network-online.target
 StartLimitIntervalSec=10
 StartLimitBurst=5

@@ -106,14 +106,14 @@ OS, creates the token and the tracker issue, runs `setup.sh` as root).
 | Users | `jepsen`, in the `docker` group (root-equivalent: the host is single-purpose, and the fleet's `simfleet` user and token stay apart) |
 | Disk | 100 GB free for `store/` archives (90 days) and images |
 | Network out | github.com and api.github.com, clojars.org and Maven Central (first `lein deps`), ziglang.org, Docker Hub and deb.debian.org (the node image, by digest) |
-| GitHub token | A fine-grained PAT on `NervaLog/nerva` only: **Issues read/write, Commit statuses read/write**, metadata read; nothing else (the repository is public, so it clones without one). Delivered by systemd `LoadCredential`; its expiry noted on the tracker issue |
+| GitHub token | A fine-grained PAT on `NervaOrg/nerva` only: **Issues read/write, Commit statuses read/write**, metadata read; nothing else (the repository is public, so it clones without one). Delivered by systemd `LoadCredential`; its expiry noted on the tracker issue |
 
 ## Deploy
 
 On the host, as root:
 
 ```sh
-git clone https://github.com/NervaLog/nerva.git /tmp/nerva && cd /tmp/nerva
+git clone https://github.com/NervaOrg/nerva.git /tmp/nerva && cd /tmp/nerva
 sh ops/jepsen/setup.sh --token-file /root/jepsen-token      # then delete the file
 $EDITOR /etc/jepsen/jepsen.env                              # JEPSEN_TRACKER=<issue number>
 systemctl start jepsen.service                              # a night now; journalctl -u jepsen -f
@@ -155,7 +155,7 @@ no script, so only the environment file is edited.
 **A night by hand**, inside the soak rather than waiting for 01:17: `systemctl start
 jepsen.service` (it stops the fleet for the window and starts it again after, as every night
 does; `journalctl -u jepsen -f`). Read the result as the status `jepsen/nightly` on the candidate
-on GitHub (`gh api repos/NervaLog/nerva/commits/<SHA>/status`), and quote it in the release PR.
+on GitHub (`gh api repos/NervaOrg/nerva/commits/<SHA>/status`), and quote it in the release PR.
 
 A merged fix moves the candidate: change `JEPSEN_BRANCH` (and the fleet's `SIM_FLEET_BRANCH`) to
 the new SHA, and both clauses start again, unless the fix changed only Markdown. When the soak

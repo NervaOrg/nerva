@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Adds a release to the site's data (docs/releases/automation.md, "release.yml"), in the checkout of
-NervaLog/nervalog.github.io that the publish job edits:
+NervaOrg/nerva-site that the publish job edits:
 
     python3 -I .github/scripts/site_release.py <index.html> <version> <date> <site line>
 

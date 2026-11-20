@@ -91,7 +91,7 @@ Pre-Depends: passwd
 Recommends: systemd
 Section: database
 Priority: optional
-Homepage: https://github.com/NervaLog/nerva
+Homepage: https://github.com/NervaOrg/nerva
 Description: Nerva, a research database with derived state maintained from one replicated log
  One static binary: a replica (nerva start), the JSON gateway (nerva api) and the tools
  around them. The package installs the binary, the systemd units nerva@.service and
