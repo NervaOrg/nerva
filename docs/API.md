@@ -512,8 +512,9 @@ A page may be empty while `more` is true: follow `cursor`. As for `changes`, the
 last page is where to resume, not `null`. A cursor that is not one Nerva gave is `400` NRV-E0408.
 A page ends at an op boundary and holds its first op whole, then only the whole ops that fit in
 `limit - 1` more changes. An op with more changes than `limit` is read to its end in the largest
-requests the cluster allows, so a small `limit` does not make a large op slower to read; the
-page is still that op alone, and `more` is true when ops follow it.
+requests the cluster allows, so a small `limit` does not make a large op slower to read; this
+changes how many requests the server makes, not the page: its content, `cursor` and `more` are
+as if the feed had been read in windows of `limit`.
 
 ```
 GET /v1/documents/changes?namespace=7&limit=10

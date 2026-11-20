@@ -26,8 +26,9 @@
 //!   (`put` or `delete`), and `value_hex` for a put. Paging is as in `/v1/changes`: `limit`
 //!   bounds the underlying changes scanned, so a page may hold fewer documents, or none, while
 //!   `more` is true. A page always ends at an op boundary: an op with more changes than `limit`
-//!   is read to its end (in larger requests, so its cost does not grow as `limit` shrinks), and
-//!   is then the whole page.
+//!   is read to its end, and the page is what reading in windows of `limit` gives. The server
+//!   reads an op that large in larger requests, so its cost does not grow as `limit` shrinks;
+//!   that changes the number of requests, not the page (O5).
 //! - A delete writes a tombstone (`documents.zig`). A put that shrinks a document, and a delete,
 //!   leave its old trailing chunks in place, unread: an accepted cost (N41).
 
@@ -80,9 +81,9 @@ const changes_per_op_max = 1 << 16;
 const changes_request_max =
     nerva.Operation.get_changes.result_max(constants.message_body_size_max) - 1;
 /// `changes` reads: one request of the caller's `limit`, then requests of `changes_request_max`
-/// while a single op continues, until the op's last change (at most `changes_per_op_max`), and
-/// one more when that request ends in the next op.
-const changes_requests_max = 2 + (changes_per_op_max + changes_request_max - 1) /
+/// while a single op continues, until the op's last change (at most `changes_per_op_max`), one
+/// more when that request ends in the next op, and one to fill the last window.
+const changes_requests_max = 3 + (changes_per_op_max + changes_request_max - 1) /
     changes_request_max;
 
 const Document = struct {
@@ -366,13 +367,17 @@ pub fn changes(arena: std.mem.Allocator, client: anytype, query: []const u8) !Re
     const limit = try api.limit_parse(parameters.get("limit"));
     var cursor = if (parameters.get("cursor")) |text| try api.u64_parse(text, "cursor") else 0;
 
-    // Whole ops only: read on while the page holds a single op that continues past it, and
-    // leave a trailing op that continues for the next page. The caller's `limit` sizes the first
-    // request only: once an op is known to continue, the rest of it is read in the largest
-    // requests, so that an op costs a few cluster requests however small `limit` is (#1).
+    // The page is what reading in windows of `window` changes gives (the caller's `limit`, as
+    // far as one request goes): read on while the page holds a single op that continues past it,
+    // and leave a trailing op that continues for the next page. Only the cost differs from that
+    // plain loop. Once the first op's length `n` is known, the page ends at the last window's
+    // end, `window * (n / window + 1)` changes from its start, so an op larger than `window` is
+    // read in the largest requests, then the rest of that last window in one more (#1, #5).
     var accumulated: std.ArrayListUnmanaged(Change) = .{};
+    const window: u32 = @min(limit, changes_request_max);
     var page = try arena.alloc(Change, limit + 1);
     var request_limit: u32 = limit;
+    var window_end: ?usize = null;
     var more: bool = undefined;
     var op_through: u64 = 0;
     for (0..changes_requests_max) |iteration| {
@@ -389,38 +394,43 @@ pub fn changes(arena: std.mem.Allocator, client: anytype, query: []const u8) !Re
         try accumulated.appendSlice(arena, page[0 .. count - 1]);
         cursor = end.timestamp;
         more = end.flags.more;
-        if (iteration > 0) {
-            // The first request held one op that continues, so the page is that op, whole. What
-            // the larger requests read past it is left for the next page: `limit` still bounds
-            // a page to its first op and at most `limit - 1` changes more.
-            const items = accumulated.items;
-            const op_first = items[0].op;
-            const cut = for (items, 0..) |change, index| {
-                if (change.op != op_first) break index;
-            } else null;
-            if (cut) |index| {
-                cursor = items[index].timestamp;
-                more = true; // The page stops before the feed's end, even if the request did not.
-                accumulated.shrinkRetainingCapacity(index);
+        if (!more) op_through = end.op;
+        const items = accumulated.items;
+        if (iteration == 0) {
+            if (!more) break;
+            if (items.len > 0 and items[0].op != items[items.len - 1].op) {
+                var first = items.len - 1;
+                while (items[first - 1].op == items[items.len - 1].op) first -= 1;
+                cursor = items[first].timestamp;
+                accumulated.shrinkRetainingCapacity(first);
                 break;
             }
-        }
-        if (!more) {
-            op_through = end.op;
-            break;
-        }
-        const items = accumulated.items;
-        if (items.len > 0 and items[0].op != items[items.len - 1].op) {
-            var first = items.len - 1;
-            while (items[first - 1].op == items[items.len - 1].op) first -= 1;
-            cursor = items[first].timestamp;
-            accumulated.shrinkRetainingCapacity(first);
-            break;
-        }
-        if (request_limit < changes_request_max) {
             request_limit = changes_request_max;
-            page = try arena.alloc(Change, request_limit + 1);
+        } else if (window_end == null) {
+            // The first op's length, once a change of another op, or the feed's end, is read.
+            const length = for (items, 0..) |change, index| {
+                if (change.op != items[0].op) break index;
+            } else if (more) null else items.len;
+            if (length) |n| window_end = window * (n / window + 1);
         }
+        if (window_end) |window_end_known| {
+            if (items.len >= window_end_known) {
+                // The last window is full: more, and its trailing op is left for the next page.
+                const op_last = items[window_end_known - 1].op;
+                assert(op_last != items[0].op);
+                var first = window_end_known - 1;
+                while (items[first - 1].op == op_last) first -= 1;
+                cursor = items[first].timestamp;
+                more = true;
+                accumulated.shrinkRetainingCapacity(first);
+                break;
+            }
+            if (!more) break;
+            // Short of the last window's end: read exactly up to it (fewer than `window`).
+            request_limit = @intCast(window_end_known - items.len);
+            assert(request_limit < window);
+        }
+        if (request_limit + 1 > page.len) page = try arena.alloc(Change, request_limit + 1);
     } else return error.Corrupt; // An op larger than any request.
 
     var out = Writer.init(arena);
@@ -518,6 +528,7 @@ fn string(out: *Writer, text: []const u8) !void {
 }
 
 const testing = std.testing;
+const stdx = @import("stdx");
 
 test "documents feed: an op's changes decode to its documents, each as the op left it" {
     var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
@@ -629,7 +640,7 @@ fn feed_put(
 
 /// Reads `feed` from the start in pages of `limit`, checking each page against what `limit`
 /// promises: it ends at an op boundary, and holds its first op and no more than `limit - 1`
-/// changes beyond it. A page costs at most `2 + ceil(changes in its first op / request max)`
+/// changes beyond it. A page costs at most `3 + ceil(changes in its first op / request max)`
 /// requests, a bound that does not depend on how many pages there are. Returns the documents.
 fn feed_pages_check(arena: std.mem.Allocator, feed: []const Change, limit: u32) !usize {
     var client = FeedClient.init(feed);
@@ -667,7 +678,7 @@ fn feed_pages_check(arena: std.mem.Allocator, feed: []const Change, limit: u32) 
             const op = try std.fmt.parseInt(u64, parsed.object.get("op").?.string, 10);
             try testing.expectEqual(client.query_op, op);
         }
-        const request_bound = 2 + (first_op_changes + changes_request_max - 1) /
+        const request_bound = 3 + (first_op_changes + changes_request_max - 1) /
             changes_request_max;
         try testing.expect(client.requests - requests_before <= request_bound);
         if (!more) return documents_total;
@@ -753,4 +764,221 @@ test "documents feed: an op of changes_per_op_max changes is read at the limits 
             try feed_pages_check(arena, feed.items, @min(limit, api.page_limit_max)),
         );
     }
+}
+
+/// `changes` as `main` had it before #1: the reference model of the differential test. It reads
+/// in windows of `limit` and keeps every whole op of its last window but the trailing one, so
+/// the pages it gives are the contract; `changes` may only take fewer requests for them.
+fn changes_model(arena: std.mem.Allocator, client: anytype, query: []const u8) !Reply {
+    const parameters = try api.query_parse(arena, query, &.{ "namespace", "cursor", "limit" });
+    const namespace = try api.u64_parse(
+        parameters.get("namespace") orelse return bad_as(.E0107, "namespace is required"),
+        "namespace",
+    );
+    const limit = try api.limit_parse(parameters.get("limit"));
+    var cursor = if (parameters.get("cursor")) |text| try api.u64_parse(text, "cursor") else 0;
+
+    var accumulated: std.ArrayListUnmanaged(Change) = .{};
+    const page = try arena.alloc(Change, limit + 1);
+    var more: bool = undefined;
+    var op_through: u64 = 0;
+    for (0..changes_per_op_max / limit + 2) |iteration| {
+        const count = try client.get_changes(.{ .timestamp_min = cursor, .limit = limit }, page);
+        if (count == 0) {
+            if (iteration == 0) return bad_as(.E0408, "invalid cursor");
+            return error.Corrupt; // The feed's own cursor.
+        }
+        const end = page[count - 1];
+        assert(end.kind == .end);
+        try accumulated.appendSlice(arena, page[0 .. count - 1]);
+        cursor = end.timestamp;
+        more = end.flags.more;
+        if (!more) {
+            op_through = end.op;
+            break;
+        }
+        const items = accumulated.items;
+        if (items.len > 0 and items[0].op != items[items.len - 1].op) {
+            var first = items.len - 1;
+            while (items[first - 1].op == items[items.len - 1].op) first -= 1;
+            cursor = items[first].timestamp;
+            accumulated.shrinkRetainingCapacity(first);
+            break;
+        }
+    } else return error.Corrupt; // An op larger than any request.
+
+    var out = Writer.init(arena);
+    try out.raw("{\"documents\":[");
+    var written: u32 = 0;
+    var start: usize = 0;
+    const items = accumulated.items;
+    while (start < items.len) {
+        var end = start + 1;
+        while (end < items.len and items[end].op == items[start].op) end += 1;
+        const decoded = try op_documents(arena, namespace, items[start..end]);
+        for (decoded) |document| {
+            if (written > 0) try out.raw(",");
+            written += 1;
+            try out.raw("{\"key\":");
+            try string(&out, document.key);
+            try out.raw(",\"op\":");
+            try out.number(items[start].op);
+            if (document.value) |value| {
+                try out.raw(",\"kind\":\"put\",\"value_hex\":");
+                try out.hex(value);
+            } else {
+                try out.raw(",\"kind\":\"delete\"");
+            }
+            try out.raw("}");
+        }
+        start = end;
+    }
+    try out.print("],\"more\":{},\"cursor\":", .{more});
+    try out.number(cursor);
+    try out.raw(",\"op\":");
+    if (more) try out.raw("null") else try out.number(op_through);
+    try out.raw("}");
+    return .{ .status = 200, .body = out.items() };
+}
+
+/// Appends ops of the given sizes to `feed`, one document per change, .
+fn feed_ops(
+    arena: std.mem.Allocator,
+    feed: *std.ArrayListUnmanaged(Change),
+    ops: []const struct { op: u64, size: usize },
+) !void {
+    for (ops) |op| {
+        for (0..op.size) |index| {
+            const key = try std.fmt.allocPrint(arena, "k{}-{}", .{ op.op, index });
+            try feed_put(arena, feed, op.op, key, 5);
+        }
+    }
+}
+
+/// Asserts that `changes` answers (`cursor`, `limit`) exactly as the model does, within
+/// `3 + ceil(first op's changes / changes_request_max)` requests, and returns what the test
+/// needs of the reply.
+fn changes_same_as_model(
+    arena: std.mem.Allocator,
+    feed: []const Change,
+    cursor: u64,
+    limit: u32,
+) !struct { cursor: u64, more: bool, requests: u32, requests_model: u32 } {
+    const query = try std.fmt.allocPrint(
+        arena,
+        "namespace=7&cursor={}&limit={}",
+        .{ cursor, limit },
+    );
+    var client = FeedClient.init(feed);
+    var client_model = FeedClient.init(feed);
+    const reply = try changes(arena, &client, query);
+    const reply_model = try changes_model(arena, &client_model, query);
+    try testing.expectEqual(reply_model.status, reply.status);
+    try testing.expectEqualStrings(reply_model.body, reply.body);
+
+    const start: usize = @min(@max(cursor, 1) - 1, feed.len);
+    var first_op_changes: usize = 0;
+    while (start + first_op_changes < feed.len and
+        feed[start + first_op_changes].op == feed[start].op) first_op_changes += 1;
+    const request_bound = 3 + (first_op_changes + changes_request_max - 1) / changes_request_max;
+    try testing.expect(client.requests <= request_bound);
+
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, reply.body, .{});
+    return .{
+        .cursor = try std.fmt.parseInt(u64, parsed.object.get("cursor").?.string, 10),
+        .more = parsed.object.get("more").?.bool,
+        .requests = client.requests,
+        .requests_model = client_model.requests,
+    };
+}
+
+test "documents feed: a page is the one main gave, after an op larger than limit (#5)" {
+    var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+
+    // Op 9 has 88 changes (timestamps 12..99), then small ops: their whole ops that fit in the
+    // last window of `limit` stay on the page.
+    var feed: std.ArrayListUnmanaged(Change) = .{};
+    try feed_ops(arena, &feed, &.{.{ .op = 1, .size = 11 }});
+    try feed_ops(arena, &feed, &.{
+        .{ .op = 9, .size = 88 },
+        .{ .op = 10, .size = 2 },
+        .{ .op = 11, .size = 1 },
+        .{ .op = 13, .size = 3 },
+    });
+    try testing.expectEqual(@as(u64, 12), feed.items[11].timestamp);
+    const cases = [_]struct { limit: u32, cursor: u64 }{
+        .{ .limit = 7, .cursor = 102 },
+        .{ .limit = 28, .cursor = 106 },
+        .{ .limit = 29, .cursor = 106 },
+    };
+    for (cases) |case| {
+        const same = try changes_same_as_model(arena, feed.items, 12, case.limit);
+        try testing.expectEqual(case.cursor, same.cursor);
+        try testing.expectEqual(case.limit == 7, same.more); // 28 and 29 reach the feed's end.
+    }
+
+    // At the feed's end: op F of 5 changes, then op G of 1, at limit 4. The last window holds
+    // both and reaches the end: one page, `more` false, with `op`.
+    var end_feed: std.ArrayListUnmanaged(Change) = .{};
+    try feed_ops(arena, &end_feed, &.{ .{ .op = 5, .size = 5 }, .{ .op = 6, .size = 1 } });
+    const same = try changes_same_as_model(arena, end_feed.items, 0, 4);
+    try testing.expect(!same.more);
+    try testing.expectEqual(@as(u64, 7), same.cursor);
+}
+
+test "documents feed: differential against main's pages" {
+    var prng = stdx.PRNG.from_seed(0x5eed);
+    var requests: u64 = 0;
+    var requests_model: u64 = 0;
+    var pages: u64 = 0;
+    for (0..40) |_| {
+        var arena_instance = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_instance.deinit();
+        const arena = arena_instance.allocator();
+
+        // Ops of 1..3 changes, up to R + 1, near multiples of R, and up to 4R.
+        var feed: std.ArrayListUnmanaged(Change) = .{};
+        var op: u64 = 1;
+        for (0..prng.range_inclusive(usize, 1, 12)) |_| {
+            op += prng.range_inclusive(u64, 1, 3);
+            const size: usize = switch (prng.int_inclusive(u8, 9)) {
+                0...5 => prng.range_inclusive(usize, 1, 3),
+                6, 7 => prng.range_inclusive(usize, 1, changes_request_max + 1),
+                8 => changes_request_max * prng.range_inclusive(usize, 1, 3) +
+                    prng.range_inclusive(usize, 0, 2) - 1,
+                else => prng.range_inclusive(usize, 1, 4 * changes_request_max),
+            };
+            try feed_ops(arena, &feed, &.{.{ .op = op, .size = size }});
+        }
+        const limits = [_]u32{
+            1,                   2,                                                3,
+            5,                   7,                                                changes_request_max - 1,
+            changes_request_max, changes_request_max + 1,                          100,
+            api.page_limit_max,  prng.range_inclusive(u32, 1, api.page_limit_max),
+        };
+        for (limits) |limit| {
+            // Main's own walk from 0, page by page.
+            var cursor: u64 = 0;
+            while (true) {
+                const same = try changes_same_as_model(arena, feed.items, cursor, limit);
+                requests += same.requests;
+                requests_model += same.requests_model;
+                pages += 1;
+                if (!same.more) break;
+                cursor = same.cursor;
+            }
+            // Random cursors: mid-op, and one past the end.
+            for (0..3) |_| {
+                const random_cursor = prng.range_inclusive(u64, 1, feed.items.len + 1);
+                const same = try changes_same_as_model(arena, feed.items, random_cursor, limit);
+                requests += same.requests;
+                requests_model += same.requests_model;
+                pages += 1;
+            }
+        }
+    }
+    try testing.expect(pages > 1000);
+    try testing.expect(requests < requests_model);
 }
