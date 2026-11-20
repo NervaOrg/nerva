@@ -170,8 +170,13 @@ is (P147i). Its tests need no network: `python3 ops/sim-fleet/test_sim_fleet.py`
    `setup.sh` refuses, before it stops the service). It is worked out when `setup.sh` runs:
    **after resizing the VM, run `setup.sh` again**, so the cgroup limit is reached before the kernel's global OOM killer starts on
    sshd or the journal; a seed it kills (137) is still counted as the host's. Disk: the build caches are emptied past
-   `SIM_FLEET_CACHE_MB` (16 GB); 100 GB is plenty. The Jepsen suite (N82, #106) could share the
-   host later; it would take cores from the workers.
+   `SIM_FLEET_CACHE_MB` (16 GB); 100 GB is plenty. Other work can share the host: the unit's
+   `CPUWeight=idle` and `IOWeight=10` give the fleet only the CPU and disk time nothing else
+   wants, so a Woodpecker agent's pipelines (ops/ci/README.md) or a Jepsen run take the cores
+   back at once (`Nice=10` alone does not: it orders processes only inside the fleet's own
+   cgroup). Memory is not shared that way: the fleet keeps its `MemoryMax`, so on a shared host
+   set fewer `SIM_FLEET_WORKERS` (in `/etc/sim-fleet/fleet.env`) or stop the fleet for a Jepsen
+   window (P215).
 2. **A token**, a fine-grained personal access token (Settings, Developer settings, Fine-grained
    tokens):
    - Resource owner: the repository's owner. Repository access: **only** `nerva`.
