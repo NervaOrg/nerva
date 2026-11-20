@@ -83,9 +83,9 @@ is "docker client cache repaired" "$dsha" "$(sha256sum "$tmp/dc/c3/docker-9.tgz"
 
 # --- ci/lib.sh: ci_redact ---
 key=$(printf 'ab%.0s' {1..32})
-out=$(bash -c ". ci/lib.sh; ci_mask $key; echo \"key $key and ${key:0:16}x\" | ci_redact")
+out=$(env -u GITHUB_ACTIONS bash -c ". ci/lib.sh; ci_mask $key; echo \"key $key and ${key:0:16}x\" | ci_redact")
 is "ci_redact" "key *** and ***x" "$out"
-is "ci_redact without a mask" "plain" "$(bash -c '. ci/lib.sh; echo plain | ci_redact')"
+is "ci_redact without a mask" "plain" "$(env -u GITHUB_ACTIONS bash -c '. ci/lib.sh; echo plain | ci_redact')"
 
 # --- ci/cache.sh ---
 . ci/cache.sh
