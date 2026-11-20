@@ -51,6 +51,25 @@ ci_cache_check() {
     return 0
 }
 
+# ci_lock_file FILE: creates a lock file that only this user (root, in a step) can open. flock
+# works on a file opened read-only, so a job running as another user could otherwise take an
+# exclusive lock on a 0644 file and hold every later step up with it. A job inherits the open
+# descriptor and never opens the file itself.
+ci_lock_file() {
+    : >>"$1" 2>/dev/null || true
+    chown "$(id -u):$(id -g)" "$1" 2>/dev/null || true
+    chmod 600 "$1" 2>/dev/null || true
+}
+
+# ci_shared_lock: a shared lock on fd 9 (main/.lock), waiting at most CI_LOCK_WAIT seconds
+# (default 1800): a holder that never lets go must not hold a step up for good. NRV-E1224.
+ci_shared_lock() {
+    flock -s -w "${CI_LOCK_WAIT:-1800}" 9 || {
+        ci_error "NRV-E1224: main's cache lock was held for ${CI_LOCK_WAIT:-1800} s: a job that never ends holds it; find it on the box (docker ps, or lslocks) and stop it, then start this pipeline again"
+        return 1
+    }
+}
+
 # ci_dir_gib DIR...: the size of the directories together, in GiB rounded up.
 ci_dir_gib() {
     du -s -B1G "$@" 2>/dev/null | awk '{n += $1} END {print n + 0}'
@@ -93,7 +112,7 @@ ci_branch_prune() {
 # nobody is using goes. The lock on fd 7 (branches/.lock) serialises seeding and pruning; fd 6 is
 # taken before it is released, so no prune falls between.
 ci_branch_prepare() {
-    local root="$1" key b dir maxn maxdays maxgib seedgib partial locked=no
+    local root="$1" key b dir maxn maxdays maxgib seedgib partial err locked=no
     key=$(ci_branch_key "$2")
     b="$root/branches"
     dir="$b/$key"
@@ -102,6 +121,7 @@ ci_branch_prepare() {
     maxgib="${CI_BRANCH_CACHE_MAX_GIB:-12}"
     seedgib="${CI_BRANCH_SEED_MAX_GIB:-6}"
     [ "${CI_BRANCH_PRUNE_ALL:-}" != 1 ] || maxn=0
+    ci_lock_file "$b/.lock"
     exec 7>>"$b/.lock"
     if flock -x -w "${CI_LOCK_WAIT:-300}" 7; then
         locked=yes
@@ -119,6 +139,7 @@ ci_branch_prepare() {
     # Our own shared lock first, then the test: a prune by a job that holds fd 7 skips a cache whose
     # lock is held, so it cannot delete $dir between the test and the use (NRV-W1202 path too).
     # (One empty b-<key>.lock stays per branch name the box has seen; a prune never unlinks them.)
+    ci_lock_file "$b/$key.lock"
     exec 6>>"$b/$key.lock"
     flock -s 6
     if [ ! -d "$dir" ]; then
@@ -136,14 +157,14 @@ ci_branch_prepare() {
                 echo "main has no package cache yet: branch $key starts empty" >&2
             elif [ "$(ci_dir_gib "$root/main/zig/p")" -le "$seedgib" ]; then
                 # A failed copy must not leave a partial zig/p (a half-written package would be trusted).
-                cp -a "$root/main/zig/p" "$partial/zig/" 2>"$partial/cp.err" || {
-                    echo "seed copy failed: branch $key starts empty ($(tail -n 1 "$partial/cp.err" 2>/dev/null))" >&2
+                # cp's reason is kept in memory: on a full disk a file in $partial could not hold it.
+                if ! err=$(cp -a "$root/main/zig/p" "$partial/zig/" 2>&1 >/dev/null); then
+                    echo "seed copy failed: branch $key starts empty (${err##*$'\n'})" >&2
                     rm -rf "$partial/zig/p"
-                }
+                fi
             else
                 echo "main's package cache is over $seedgib GiB: branch $key starts empty" >&2
             fi
-            rm -f "$partial/cp.err"
             mkdir -p "$partial/zig" "$partial/zig-local"
             # -T: if a job without the lock filled $dir meanwhile, keep its directory and drop the seed.
             mv -T "$partial" "$dir" 2>/dev/null || rm -rf "$partial"
@@ -183,14 +204,13 @@ ci_main_prune() {
 }
 
 # ci_main_prepare ROOT USER GROUP LOW MIN_GIB: the main role's cache set-up, run as root, in this
-# order: the lock file and its fd 9, the prune (when LOW is yes), and only then the ownership of
+# order: the lock file (ours, 0600) and its fd 9, the prune (when LOW is yes), and only then the ownership of
 # main's directories. The prune recreates main/zig and main/zig-local as the caller (root), so the
 # ownership is set after it: the job runs as USER and must be able to write them. The caller takes
 # its shared lock (flock -s 9) after this returns.
 ci_main_prepare() {
     local root="$1" user="$2" group="$3" low="$4" min="$5"
-    touch "$root/main/.lock"
-    chown "$user:$group" "$root/main/.lock"
+    ci_lock_file "$root/main/.lock" # not USER's: a job could hold it exclusively for good
     exec 9<"$root/main/.lock"
     [ "$low" = no ] || { echo "Below $min GiB free"; ci_main_prune "$root" "$min"; }
     install -d -o "$user" -g "$group" "$root/main/zig" "$root/main/zig-local" "$root/main/tools"

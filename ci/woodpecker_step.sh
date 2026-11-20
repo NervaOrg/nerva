@@ -76,7 +76,7 @@ if [ "$job" = jepsen ]; then
     sock=/var/run/docker.sock
     [ -S "$sock" ] || { ci_error "NRV-E1203: $sock is not mounted (see .woodpecker/jepsen.yaml)"; exit 1; }
     install -d -o "$user" -g "$user" "$cache/jepsen"
-    touch "$cache/jepsen/.lock"
+    ci_lock_file "$cache/jepsen/.lock"
     exec 8<"$cache/jepsen/.lock"
     echo "jepsen: waiting for any other Jepsen run on this machine"
     flock -x -w "${CI_JEPSEN_WAIT:-5400}" 8 || {
@@ -104,12 +104,12 @@ low=no
 [ "$(df --output=avail -B1G "$cache_fs" | tail -1 | tr -d ' ')" -ge "$free_min_gib" ] || low=yes
 if [ "$role" = main ]; then
     ci_main_prepare "$cache" "$user" "$user" "$low" "$free_min_gib"
-    flock -s 9
+    ci_shared_lock || exit 1
     base="$cache/main"
     toolchain_write=1
 else
     # main's cache is read-only here; this branch's own is a copy of it, made under main's lock.
-    if [ -e "$cache/main/.lock" ]; then exec 9<"$cache/main/.lock"; flock -s 9; fi
+    if [ -e "$cache/main/.lock" ]; then exec 9<"$cache/main/.lock"; ci_shared_lock || exit 1; fi
     [ "$low" = no ] || { echo "Below $free_min_gib GiB free: emptying the branch caches nobody uses"; export CI_BRANCH_PRUNE_ALL=1; }
     ci_branch_prepare "$cache" "$branch"
     flock -u 9 2>/dev/null || true

@@ -325,8 +325,11 @@ set:
    seeded with a copy of main's fetched packages (`zig/p` only; the rest of `zig/` and `zig-local/` start empty), at most 8 of them (the job's own included), 12 GiB and 7 days each. Jobs hold a shared `flock`
    on what they use. Below 60 GiB free (`CI_FREE_MIN_GIB`), a job for `main` waits up to
    `CI_PRUNE_WAIT` (5 s), measures free space again, and if it is still low holds `main/` alone and empties its Zig caches (never the
-   toolchain), and a branch job empties every branch cache no job is using. A lock that stays busy
-   is never waited on for good: the job warns (NRV-W1202) and runs.
+   toolchain), and a branch job empties every branch cache no job is using. The lock files are
+   owned by the step (root, mode 0600), so a job running as `ci` cannot open one to hold it. A lock that stays busy
+   is never waited on for good: the branch caches' lock and a prune warn (NRV-W1202) and the job runs;
+   main's shared lock, which every step takes, waits at most `CI_LOCK_WAIT` (1800 s) and then fails
+   NRV-E1224.
 
    **When the disk fills** (a job fails with "No space left", or NRV-W1202 keeps appearing), with
    no pipeline running: `rm -rf /var/cache/nerva-ci/branches/*` empties every branch cache, and
