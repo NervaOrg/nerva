@@ -11,6 +11,15 @@
 #                         replaced by a job (a symlink in its place would make a root step chown
 #                         and chmod the target); here a job cannot create, unlink or open anything.
 #
+# The step runs as root and the job as `ci`, so every path a job can write (all of main/ and
+# branches/, and /cache/jepsen) is the job's to redirect: a symlink planted there would make a
+# root chown, chmod, install, mkdir or cp, or a root redirection, act on its target. Root therefore
+# never creates, chowns, chmods or writes anything there. What the job needs made there is made by
+# the job user itself (ci_as_job, `mkdir`, `mktemp`, `cp`, `mv`, `touch`), which can only touch what
+# the job could touch anyway; root only tests (never acts on the result of a test, so a swap after
+# it changes nothing) and unlinks (rm -rf, which never follows a link, and rm -f of a symlink).
+# What is then not a plain directory the job can write is refused: NRV-E1228.
+#
 # A branch's pipeline mounts main/ read-only (.woodpecker/*.yaml) and branches/ writable; main's
 # mounts main/ writable and not branches/. ci_cache_check refuses a mount that is the wrong way
 # round. The mounts are what enforce the rule: this script only notices a wrong one.
@@ -57,9 +66,10 @@ ci_cache_check() {
 }
 
 # ci_locks_check ROOT: NRV-E1202 if ROOT/locks is not there (not mounted), NRV-E1226 if it is not a
-# real directory (no symlink) owned by this user (root, in a step) that nobody else can write. A
-# lock directory a job could write would let it replace a lock file and make a root step follow
-# its symlink.
+# real directory (no symlink) owned by this user (root, in a step) that nobody else can write or
+# list (no group or other bits at all: a job that can list the directory can open a 0644 lock read
+# only, and flock -x works on that). A lock directory a job could write would let it replace a lock
+# file and make a root step follow its symlink.
 ci_locks_check() {
     local d="$1/locks"
     if [ ! -e "$d" ] && [ ! -L "$d" ]; then
@@ -67,8 +77,8 @@ ci_locks_check() {
         return 1
     fi
     if [ -L "$d" ] || [ ! -d "$d" ] || [ "$(stat -c %u "$d")" != "$(id -u)" ] ||
-        [ -n "$(find "$d" -maxdepth 0 -perm /022)" ]; then
-        ci_error "NRV-E1226: $d is not a plain directory owned by uid $(id -u) that only it can write: on the host, chown root:root and chmod 0700 /var/cache/nerva-ci/locks"
+        [ -n "$(find "$d" -maxdepth 0 -perm /077)" ]; then
+        ci_error "NRV-E1226: $d is not a plain directory owned by uid $(id -u) that only it can use (mode 0700): on the host, run bash ci/nerva-woodpecker.sh host again (it makes it root:root 0700; Docker makes a missing mount source 0755)"
         return 1
     fi
     return 0
@@ -99,11 +109,16 @@ ci_lock_file() {
     chmod 600 "$f" 2>/dev/null || true
 }
 
-# ci_lock_open_failed FILE: NRV-E1227, with the reason the open gave (the step's own `exec N>>FILE`
-# just failed). Not a wait: nothing has been waited for.
+# ci_lock_open_failed FILE MODE: NRV-E1227, with the reason the open gave (the step's own `exec N>>FILE`
+# or `exec N<FILE` just failed; MODE is `>>` or `<`, and the probe opens the same way, so it gives
+# the reason the real open had). Not a wait: nothing has been waited for.
 ci_lock_open_failed() {
     local why
-    why=$( { : >>"$1"; } 2>&1 || true)
+    case "$2" in
+        '<') why=$( { : <"$1"; } 2>&1 || true) ;;
+        '>>') why=$( { : >>"$1"; } 2>&1 || true) ;;
+        *) ci_error "NRV-B1201: ci_lock_open_failed: mode '$2' is neither < nor >> (a bug in the script that called it)"; return 1 ;;
+    esac
     why=${why##*: }
     ci_error "NRV-E1227: could not open the lock file $1 (${why:-no reason given}): check the lock directory on the host"
 }
@@ -125,7 +140,34 @@ ci_shared_lock() {
 ci_main_lock_open() {
     local f="$1/locks/main.lock"
     ci_lock_file "$f" || return 1
-    { exec 9<"$f"; } 2>/dev/null || { ci_lock_open_failed "$f"; return 1; }
+    { exec 9<"$f"; } 2>/dev/null || { ci_lock_open_failed "$f" '<'; return 1; }
+}
+
+# ci_as_job CMD...: runs CMD as the job's user, $CI_JOB_USER (default: this user). Root becomes it
+# with setpriv; anyone else is already the only user it could be, so CMD runs as is.
+ci_as_job() {
+    local u="${CI_JOB_USER:-$(id -un)}"
+    if [ "$(id -u)" = 0 ] && [ "$u" != root ]; then
+        setpriv --reuid "$(id -u "$u")" --regid "$(id -g "$u")" --init-groups "$@"
+    else
+        "$@"
+    fi
+}
+
+# ci_job_dir PATH...: makes each PATH (parents first) a plain directory the job user can write, as
+# the job user, never as root (see the top). A symlink there is unlinked and replaced (it is the
+# job's own doing); anything else that is not a directory the job can write (a file, a directory
+# of another user, a link planted again after the unlink) is refused: NRV-E1228.
+ci_job_dir() {
+    local p
+    for p in "$@"; do
+        if [ -L "$p" ]; then rm -f -- "$p" 2>/dev/null || true; fi
+        if [ ! -e "$p" ] && [ ! -L "$p" ]; then ci_as_job mkdir -- "$p" 2>/dev/null || true; fi
+        if [ -L "$p" ] || [ ! -d "$p" ] || ! ci_as_job test -w "$p"; then
+            ci_error "NRV-E1228: $p is not a plain directory that the job's user (${CI_JOB_USER:-$(id -un)}) can write (a link, a file, or another user's directory): on the host, rm -rf it (it is only a cache) and start the pipeline again"
+            return 1
+        fi
+    done
 }
 
 # ci_dir_gib DIR...: the size of the directories together, in GiB rounded up.
@@ -138,15 +180,23 @@ ci_dir_gib() {
 # than MAXGIB GiB. KEEP, the caller's own, is never removed and counts
 # against MAXN. Call with the branches lock held.
 ci_branch_prune() {
-    local b="$1" locks="$2" keep="$3" maxn="$4" maxdays="$5" maxgib="$6" d name n=0 drop
+    local b="$1" locks="$2" keep="$3" maxn="$4" maxdays="$5" maxgib="$6" rec d name n=0 drop
     # KEEP takes one of the MAXN places (it is made right after, if it is not there yet), so MAXN
     # is the most there are, KEEP included.
     n=1
     rm -rf "$b"/*.partial.* 2>/dev/null || true # a killed seed's; seeds run under the lock
-    while IFS= read -r d; do
-        d=${d%/}
-        name=${d##*/}
+    # Names come NUL-separated from find, never from parsing ls: a job can name a directory with a
+    # newline in it, and a line of that name would be taken for a path. A name that is not one
+    # ci_branch_key makes, or is not a real directory, is the job's own doing and is removed (a
+    # link is unlinked, not followed), with no lock: no job's cache is called that.
+    while IFS= read -r -d '' rec; do
+        name=${rec#* }
         [ "$name" != "$keep" ] || continue
+        if ! [[ "$name" =~ ^b-[A-Za-z0-9._-]+$ ]] || [ -L "$b/$name" ] || [ ! -d "$b/$name" ]; then
+            rm -rf -- "${b:?}/$name" 2>/dev/null || true
+            continue
+        fi
+        d="$b/$name"
         n=$((n + 1))
         drop=no
         [ "$n" -le "$maxn" ] || drop=yes
@@ -154,12 +204,14 @@ ci_branch_prune() {
         [ "$(ci_dir_gib "$d")" -le "$maxgib" ] || drop=yes
         [ "$drop" = yes ] || continue
         (
+            # Made by ci_lock_file: 0600, never followed, in the step's own lock directory.
+            ci_lock_file "$locks/$name.lock" || exit 1
             exec 5>>"$locks/$name.lock"
             # The lock file stays: unlinking it would let a job that opened it first keep a lock
             # on an inode no later prune opens. They are empty, one per branch key.
             flock -x -n 5 && rm -rf "$d"
         ) 2>/dev/null || true
-    done < <(ls -1dt "$b"/b-*/ 2>/dev/null)
+    done < <(find "$b" -mindepth 1 -maxdepth 1 -name 'b-*' -printf '%T@ %f\0' 2>/dev/null | sort -z -rn)
 }
 
 # ci_branch_prepare ROOT BRANCH: creates this branch's cache (zig/p, the fetched packages, a copy of main's, if that is no
@@ -181,13 +233,14 @@ ci_branch_prepare() {
     seedgib="${CI_BRANCH_SEED_MAX_GIB:-6}"
     [ "${CI_BRANCH_PRUNE_ALL:-}" != 1 ] || maxn=0
     ci_lock_file "$locks/branches.lock" || return 1
-    { exec 7>>"$locks/branches.lock"; } 2>/dev/null || { ci_lock_open_failed "$locks/branches.lock"; return 1; }
+    { exec 7>>"$locks/branches.lock"; } 2>/dev/null || { ci_lock_open_failed "$locks/branches.lock" '>>'; return 1; }
     if flock -x -w "${CI_LOCK_WAIT:-300}" 7; then
         locked=yes
         ci_branch_prune "$b" "$locks" "$key" "$maxn" "$maxdays" "$maxgib"
         # Its own cache over the size limit starts again, if no job of this branch is using it.
         if [ -d "$dir" ] && [ "$(ci_dir_gib "$dir")" -gt "$maxgib" ]; then
             (
+                ci_lock_file "$locks/$key.lock" || exit 1
                 exec 5>>"$locks/$key.lock"
                 flock -x -n 5 && echo "branch cache $key is over $maxgib GiB: starting again" >&2 && rm -rf "$dir"
             ) 2>/dev/null || true
@@ -200,7 +253,7 @@ ci_branch_prepare() {
     # (One empty b-<key>.lock stays per branch name the box has seen; a prune never unlinks them.)
     ci_lock_file "$locks/$key.lock" || { [ "$locked" != yes ] || flock -u 7; return 1; }
     if ! { exec 6>>"$locks/$key.lock"; } 2>/dev/null; then
-        ci_lock_open_failed "$locks/$key.lock"
+        ci_lock_open_failed "$locks/$key.lock" '>>'
         [ "$locked" != yes ] || flock -u 7
         return 1
     fi
@@ -209,23 +262,26 @@ ci_branch_prepare() {
         [ "$locked" != yes ] || flock -u 7
         return 1
     }
-    if [ ! -d "$dir" ]; then
-        if [ "$locked" = yes ]; then
-            partial="$dir.partial.$$"
-            mkdir -p "$partial"
+    # A link at $dir is the job's own doing: unlinked (never followed), then made again below.
+    if [ -L "$dir" ]; then rm -f -- "$dir" 2>/dev/null || true; fi
+    if [ ! -e "$dir" ]; then
+        # Everything under $b is made by the job's user (ci_as_job), never by root: nothing root
+        # does can then follow a link there. The partial directory has a name of mktemp's, made
+        # with O_EXCL, so a link planted at a guessed name is not used.
+        if [ "$locked" = yes ] && partial=$(ci_as_job mktemp -d "$b/$key.partial.XXXXXX" 2>/dev/null); then
             # Only zig/p, the fetched packages, is copied: they are content-addressed and written
             # once. Main's other global-cache files and its zig-local are rewritten by main's jobs,
             # which hold main's lock shared, as this job does (the shared flock in the step script):
             # nothing keeps them out while this copies, so a copy could keep a torn file for days.
             # They start empty and fill themselves. A plain copy: a hard link would let a branch
             # write main's inode.
-            mkdir -p "$partial/zig"
+            ci_as_job mkdir "$partial/zig"
             if [ ! -d "$root/main/zig/p" ]; then
                 echo "main has no package cache yet: branch $key starts empty" >&2
             elif [ "$(ci_dir_gib "$root/main/zig/p")" -le "$seedgib" ]; then
                 # A failed copy must not leave a partial zig/p (a half-written package would be trusted).
                 # cp's reason is kept in memory: on a full disk a file in $partial could not hold it.
-                if ! err=$(cp -a "$root/main/zig/p" "$partial/zig/" 2>&1 >/dev/null); then
+                if ! err=$(ci_as_job cp -a "$root/main/zig/p" "$partial/zig/" 2>&1 >/dev/null); then
                     last=${err##*$'\n'}
                     echo "seed copy failed: branch $key starts empty (${last:-no message})" >&2
                     rm -rf "$partial/zig/p"
@@ -233,19 +289,24 @@ ci_branch_prepare() {
             else
                 echo "main's package cache is over $seedgib GiB: branch $key starts empty" >&2
             fi
-            mkdir -p "$partial/zig" "$partial/zig-local"
+            ci_as_job mkdir -p "$partial/zig" "$partial/zig-local"
             # -T: if a job without the lock filled $dir meanwhile, keep its directory and drop the seed.
-            mv -T "$partial" "$dir" 2>/dev/null || rm -rf "$partial"
+            ci_as_job mv -T "$partial" "$dir" 2>/dev/null || rm -rf "$partial"
         else
-            # No lock on the branches' directory: no shared partial directory a prune could remove.
-            mkdir -p "$dir/zig" "$dir/zig-local" 2>/dev/null || true
+            # No lock on the branches' directory (or no partial directory could be made): no
+            # shared partial directory a prune could remove.
+            ci_as_job mkdir -p "$dir/zig" "$dir/zig-local" 2>/dev/null || true
         fi
     fi
     # The branches' lock is let go before anything can return: seeding is done, or never started.
     [ "$locked" != yes ] || flock -u 7
     # Whichever way $dir was made (or not), it must be a directory now (a file there is the box's damage).
     [ -d "$dir" ] || { ci_error "NRV-E1214: $dir is not a directory: remove it"; return 1; }
-    touch "$dir"
+    # The job's own directories, as the job user: a missing one is made, a link is replaced, and
+    # one the job cannot write (a file, another user's) is refused (NRV-E1228). No chown: root
+    # touches nothing in $dir.
+    ci_job_dir "$dir" "$dir/zig" "$dir/zig-local" || return 1
+    ci_as_job touch "$dir"
     # shellcheck disable=SC2034 # read by ci/woodpecker_step.sh
     CI_BRANCH_DIR="$dir" # not printed: a command substitution would drop the lock with its shell
 }
@@ -264,21 +325,21 @@ ci_main_prune() {
         echo "main's cache: space is free again, not pruning"
     elif [ "$got" = yes ]; then
         echo "emptying main's Zig caches (no other job holds them)"
-        rm -rf "$root/main/zig" "$root/main/zig-local"
-        mkdir -p "$root/main/zig" "$root/main/zig-local"
+        rm -rf "$root/main/zig" "$root/main/zig-local" # a link there is unlinked, not followed
     else
         ci_warning "NRV-W1202: other jobs held main's cache for $wait s: not pruned. To recover by hand, with the agent idle: rm -rf /var/cache/nerva-ci/main/zig-local /var/cache/nerva-ci/main/zig"
     fi
 }
 
-# ci_main_prepare ROOT USER GROUP LOW MIN_GIB: the main role's cache set-up, run as root, in this
-# order: the lock file (ours, 0600) and its fd 9, the prune (when LOW is yes), and only then the ownership of
-# main's directories. The prune recreates main/zig and main/zig-local as the caller (root), so the
-# ownership is set after it: the job runs as USER and must be able to write them. The caller takes
-# its shared lock (flock -s 9) after this returns.
+# ci_main_prepare ROOT USER LOW MIN_GIB: the main role's cache set-up, run as root, in this order:
+# the lock file (ours, 0600) and its fd 9, the prune (when LOW is yes), and only then main's
+# directories, made by USER itself (ci_job_dir): root chowns and installs nothing in main/, which a
+# job writes, so a link a job planted at main/zig, zig-local or tools is replaced or refused
+# (NRV-E1228), never followed. The prune removes main/zig and main/zig-local, so the directories
+# come after it. The caller takes its shared lock (flock -s 9) after this returns.
 ci_main_prepare() {
-    local root="$1" user="$2" group="$3" low="$4" min="$5"
+    local root="$1" CI_JOB_USER="$2" low="$3" min="$4"
     ci_main_lock_open "$root" || return 1 # root's, in the lock directory a job cannot write
     [ "$low" = no ] || { echo "Below $min GiB free"; ci_main_prune "$root" "$min"; }
-    install -d -o "$user" -g "$group" "$root/main/zig" "$root/main/zig-local" "$root/main/tools"
+    ci_job_dir "$root/main/zig" "$root/main/zig-local" "$root/main/tools"
 }

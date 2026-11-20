@@ -64,6 +64,7 @@ ci/io_uring_check.sh
 case "$job" in check | check-scripts | check-packages) ci/install_repo_tools.sh ;; esac
 
 . ci/cache.sh
+CI_JOB_USER="$user" # ci_as_job: what root would make in a cache the job writes, the job's user makes
 id "$user" >/dev/null 2>&1 || useradd --create-home --uid 1001 --user-group "$user"
 chown -R "$user:$user" "$PWD"
 ci_cache_check "$role" "$cache" || exit 1
@@ -75,9 +76,10 @@ if [ "$job" = jepsen ]; then
     [ -d "$cache/jepsen" ] || { ci_error "NRV-E1202: $cache/jepsen is not mounted: mount /var/cache/nerva-ci/jepsen"; exit 1; }
     sock=/var/run/docker.sock
     [ -S "$sock" ] || { ci_error "NRV-E1203: $sock is not mounted (see .woodpecker/jepsen.yaml)"; exit 1; }
+    # The mount's own root (a link cannot be there), so install -d on it is safe; what is inside is not.
     install -d -o "$user" -g "$user" "$cache/jepsen"
     ci_lock_file "$cache/locks/jepsen.lock" || exit 1
-    { exec 8<"$cache/locks/jepsen.lock"; } 2>/dev/null || { ci_lock_open_failed "$cache/locks/jepsen.lock"; exit 1; }
+    { exec 8<"$cache/locks/jepsen.lock"; } 2>/dev/null || { ci_lock_open_failed "$cache/locks/jepsen.lock" '<'; exit 1; }
     echo "jepsen: waiting for any other Jepsen run on this machine"
     flock -x -w "${CI_JEPSEN_WAIT:-5400}" 8 || {
         ci_error "NRV-E1209: another Jepsen run held this machine for ${CI_JEPSEN_WAIT:-5400} s: start this one again when it ends"
@@ -90,10 +92,15 @@ if [ "$job" = jepsen ]; then
     getent group "$gid" >/dev/null || groupadd --gid "$gid" dockerhost
     usermod -aG "$(getent group "$gid" | cut -d: -f1)" "$user"
     # Docker's static client, pinned: its archive is kept in the jepsen cache, checked on every use.
-    ci/docker_client.sh 29.9.3 3fb5d1f13014c18cc54945bc177c58a9056a482dada031e17d12cf2e6922c973 "$cache/jepsen/tools"
+    # The download goes into the cache the job writes, so the job's user fetches it (a link at the
+    # partial file's name is then not root's to write through); root only checks and unpacks it.
+    ci_job_dir "$cache/jepsen/tools" || exit 1
+    docker_pin=(29.9.3 3fb5d1f13014c18cc54945bc177c58a9056a482dada031e17d12cf2e6922c973 "$cache/jepsen/tools")
+    ci_as_job ci/docker_client.sh "${docker_pin[@]}" fetch
+    ci/docker_client.sh "${docker_pin[@]}" install
     stamp=$(date -u +%Y%m%dT%H%M%SZ)
     export JEPSEN_OUT="$cache/jepsen/$stamp-${CI_PIPELINE_NUMBER:-local}"
-    install -d -o "$user" -g "$user" "$JEPSEN_OUT"
+    ci_job_dir "$JEPSEN_OUT" || exit 1
     echo "jepsen: the store and memory record go to /var/cache/nerva-ci/${JEPSEN_OUT#"$cache"/} on the host"
 fi
 
@@ -103,7 +110,7 @@ cache_fs="$cache/main"
 low=no
 [ "$(df --output=avail -B1G "$cache_fs" | tail -1 | tr -d ' ')" -ge "$free_min_gib" ] || low=yes
 if [ "$role" = main ]; then
-    ci_main_prepare "$cache" "$user" "$user" "$low" "$free_min_gib" || exit 1
+    ci_main_prepare "$cache" "$user" "$low" "$free_min_gib" || exit 1
     ci_shared_lock || exit 1
     base="$cache/main"
     toolchain_write=1
@@ -112,10 +119,9 @@ else
     ci_main_lock_open "$cache" || exit 1
     ci_shared_lock || exit 1
     [ "$low" = no ] || { echo "Below $free_min_gib GiB free: emptying the branch caches nobody uses"; export CI_BRANCH_PRUNE_ALL=1; }
-    ci_branch_prepare "$cache" "$branch"
+    ci_branch_prepare "$cache" "$branch" || exit 1
     flock -u 9 2>/dev/null || true
-    base="$CI_BRANCH_DIR"
-    chown "$user:$user" "$base" "$base/zig" "$base/zig-local"
+    base="$CI_BRANCH_DIR" # made, and its zig and zig-local checked, by the job's user (ci_job_dir)
     toolchain_write=0
 fi
 df -h "$cache_fs" . | sed 's/^/  /'

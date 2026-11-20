@@ -578,7 +578,8 @@ touch "$c/locks/main.lock"
     exec 9<"$c/locks/main.lock"
     CI_PRUNE_WAIT=1 ci_main_prune "$c" 99999999
 )
-is "main pruned when idle" "" "$(ls -A "$c/main/zig-local")"
+is "main pruned when idle (the directories are made again by ci_main_prepare)" no "$([ -e "$c/main/zig-local" ] && echo yes || echo no)"
+mkdir -p "$c/main/zig-local"
 echo x >"$c/main/zig-local/entry"
 setsid flock -o -s "$c/locks/main.lock" sleep 20 &
 holder=$!
@@ -626,39 +627,191 @@ kill -- -"$holder" 2>/dev/null || true
 wait "$holder" 2>/dev/null || true
 ok "the shared lock is taken once it is free" lock_wait
 
-# The step script prepares main through ci_main_prepare, and does not set main's ownership itself
-# (the order that ci_main_prepare keeps is tested above).
-grep -q '^    ci_main_prepare ' ci/woodpecker_step.sh || { echo "FAIL woodpecker_step.sh does not call ci_main_prepare" >&2; fail=1; }
-if grep -n 'install -d .*cache/main\|chown .*cache/main' ci/woodpecker_step.sh; then
-    echo "FAIL woodpecker_step.sh sets main's ownership itself: use ci_main_prepare" >&2
+# The step script prepares main through ci_main_prepare and makes nothing in a cache a job writes
+# as root: no install -d, chown or mkdir on the caches' paths, no fd opened by a bare exec.
+grep -q '^    ci_main_prepare .* || exit 1$' ci/woodpecker_step.sh || { echo "FAIL woodpecker_step.sh does not call ci_main_prepare or ignores its failure" >&2; fail=1; }
+grep -q '^    ci_branch_prepare .* || exit 1$' ci/woodpecker_step.sh || { echo "FAIL woodpecker_step.sh ignores a failure of ci_branch_prepare" >&2; fail=1; }
+if grep -n 'install -d .*\(cache/main\|base\|JEPSEN_OUT\|cache/jepsen/\)\|chown .*\(cache\|base\)\|mkdir .*\(cache\|base\|JEPSEN_OUT\)' ci/woodpecker_step.sh; then
+    echo "FAIL woodpecker_step.sh makes or chowns something in a cache a job writes as root: use ci_job_dir" >&2
     fail=1
 fi
+if grep -n '^ *chown\|install -d\|mkdir\|chmod' ci/cache.sh | grep -v '^[0-9]*: *#' | grep -v 'chown -h\|chmod 600\|ci_as_job\|mkdir -- "\$p"'; then
+    echo "FAIL ci/cache.sh makes or chowns something as root outside the lock files" >&2
+    fail=1
+fi
+# Only ci_main_lock_open opens main's lock (fd 9), which is what gives E1226 and E1227; the jepsen
+# lock opens read-only with its mode named, so its reason is the real one.
+is "only ci_main_lock_open opens fd 9" 1 "$(grep -c 'exec 9<' ci/cache.sh ci/woodpecker_step.sh | awk -F: '{n += $2} END {print n}')"
+is "the Docker client is downloaded as the job's user, root only unpacks it" 1 "$(grep -c '^    ci_as_job ci/docker_client.sh .* fetch$' ci/woodpecker_step.sh || true)"
+is "the jepsen lock's E1227 probes a read open" 1 "$(grep -c "ci_lock_open_failed \"\$cache/locks/jepsen.lock\" '<'" ci/woodpecker_step.sh || true)"
 
-# The step's own sequence (ci_main_prepare: lock, prune, then ownership): after a prune main's
-# directories belong to the job's user. As root the user is `nobody`; as another user the owner
-# check is trivially true (the prune recreates the directories as that user), so the order is also
-# observed without root: a stub `install` drops a marker in main/zig-local after the real one, and
-# a prune that ran after install would remove it.
-mkdir "$tmp/markinstall"
-cat >"$tmp/markinstall/install" <<'EOS'
-#!/bin/sh
-/usr/bin/install "$@" || exit $?
-: >"$CI_TEST_MARK"
-EOS
-chmod +x "$tmp/markinstall/install"
+# The step's own sequence (ci_main_prepare: lock, prune, then the directories): after a prune
+# main's directories are made again by the job's user. As root the user is `nobody`.
+chmod 711 "$tmp"
 if [ "$(id -u)" = 0 ]; then ou=nobody; else ou=$(id -un); fi
-og=$(id -gn "$ou")
+chown -R "$ou" "$c/main" 2>/dev/null || true
 echo x >"$c/main/zig-local/entry"
 (
     . ci/cache.sh
-    PATH="$tmp/markinstall:$PATH" CI_TEST_MARK="$c/main/zig-local/after-install" \
-        CI_PRUNE_WAIT=1 ci_main_prepare "$c" "$ou" "$og" yes 99999999 >/dev/null
+    CI_PRUNE_WAIT=1 ci_main_prepare "$c" "$ou" yes 99999999 >/dev/null
 )
-is "prepare: main pruned, and the ownership set after the prune (not before)" "after-install" "$(ls -A "$c/main/zig-local")"
+is "prepare: main pruned, its directories made again after the prune" "no yes yes yes" "$([ -e "$c/main/zig-local/entry" ] && echo yes || echo no) $([ -d "$c/main/zig" ] && echo yes) $([ -d "$c/main/zig-local" ] && echo yes) $([ -d "$c/main/tools" ] && echo yes)"
 is "prepare: locks/main.lock is the step's own, 0600" "$(id -un) 600" "$(stat -c '%U %a' "$c/locks/main.lock")"
 is "prepare: zig owned by the job's user after a prune" "$ou" "$(stat -c %U "$c/main/zig")"
 is "prepare: zig-local owned by the job's user after a prune" "$ou" "$(stat -c %U "$c/main/zig-local")"
 is "prepare: tools owned by the job's user" "$ou" "$(stat -c %U "$c/main/tools")"
+
+# --- A job plants a link where the root step prepares its caches (review 6000214760): nothing
+# root does follows it. The job's user is `nobody` as root, else this user. For each path in each
+# role, a link to a directory and to a file (both root's, 0700 and 0600, in a directory the job
+# cannot write) is planted; the step's prepare code then runs, and must leave the target's owner,
+# mode and content alone and the path a plain directory (the link replaced) or refuse it (E1228).
+jobuser=$ou
+sd="$tmp/sentinel-dir"
+sf="$tmp/sentinel-file"
+sentinel_state() { echo "$(stat -c '%a %u %g' "$sd") $(stat -c '%a %u %g' "$sf") $(cat "$sf") $(ls -A "$sd" | tr '\n' ,)"; }
+reset_sentinels() {
+    rm -rf "$sd" "$sf"
+    mkdir -m 0700 "$sd"
+    echo precious >"$sf"
+    chmod 600 "$sf"
+}
+ci_as() { if [ "$(id -u)" = 0 ]; then setpriv --reuid "$(id -u "$jobuser")" --regid "$(id -g "$jobuser")" --init-groups "$@"; else "$@"; fi; }
+reset_sentinels
+want_state=$(sentinel_state)
+attack_tree() { # attack_tree NAME: a fresh cache root, as the host lays it out, the caches the job's
+    local r="$tmp/atk-$1"
+    rm -rf "$r"
+    mkdir -p "$r/main/zig" "$r/main/zig-local" "$r/main/tools" "$r/branches"
+    mkdir -m 0700 "$r/locks"
+    chown -R "$jobuser" "$r/main" "$r/branches" 2>/dev/null || true
+    echo "$r"
+}
+branch_key=$(. ci/cache.sh; ci_branch_key feature/atk)
+for target in "$sd" "$sf"; do
+    for path in "" zig zig-local; do
+        r=$(attack_tree b)
+        d="$r/branches/$branch_key"
+        ci_as mkdir -p "$d/zig" "$d/zig-local"
+        if [ -z "$path" ]; then
+            ci_as rm -rf "$d"
+            ci_as ln -s "$target" "$d"
+        else
+            ci_as rm -rf "${d:?}/$path"
+            ci_as ln -s "$target" "$d/$path"
+        fi
+        (
+            . ci/cache.sh
+            CI_JOB_USER=$jobuser ci_branch_prepare "$r" feature/atk >/dev/null 2>&1
+        ) || true
+        is "branch: link at '${path:-the branch directory}' to $(basename "$target") leaves the target alone" "$want_state" "$(sentinel_state)"
+        is "branch: link at '${path:-the branch directory}' replaced by a plain directory the job can write" yes "$([ -d "$d/${path}" ] && [ ! -L "$d/${path}" ] && ci_as test -w "$d/${path}" && echo yes)"
+        reset_sentinels
+    done
+done
+for target in "$sd" "$sf"; do
+    for path in zig zig-local tools; do
+        for low in no yes; do
+            r=$(attack_tree m)
+            ci_as rm -rf "${r:?}/main/$path"
+            ci_as ln -s "$target" "$r/main/$path"
+            (
+                . ci/cache.sh
+                CI_PRUNE_WAIT=1 ci_main_prepare "$r" "$jobuser" "$low" 99999999 >/dev/null 2>&1
+            ) || true
+            is "main (low=$low): link at $path to $(basename "$target") leaves the target alone" "$want_state" "$(sentinel_state)"
+            is "main (low=$low): link at $path replaced by a plain directory the job can write" yes "$([ -d "$r/main/$path" ] && [ ! -L "$r/main/$path" ] && ci_as test -w "$r/main/$path" && echo yes)"
+            reset_sentinels
+        done
+    done
+done
+# A path that is a file, or a directory the job cannot write, is refused with its code, in both roles.
+r=$(attack_tree f)
+ci_as rm -rf "$r/main/zig"
+: >"$r/main/zig"
+refuses NRV-E1228 "main: a file at main/zig" bash -c '. ci/cache.sh; CI_JOB_USER=$2 ci_main_prepare "$1" "$2" no 0' _ "$r" "$jobuser"
+is "a file at main/zig is left alone" yes "$([ -f "$r/main/zig" ] && echo yes)"
+r=$(attack_tree f2)
+chmod a-w "$r/main/zig-local"
+chown 0 "$r/main/zig-local" 2>/dev/null || true
+[ "$(id -u)" != 0 ] || chmod 755 "$r/main/zig-local"
+refuses NRV-E1228 "main: a directory the job cannot write" bash -c '. ci/cache.sh; ci_main_prepare "$1" "$2" no 0' _ "$r" "$jobuser"
+r=$(attack_tree f3)
+d="$r/branches/$branch_key"
+ci_as mkdir -p "$d"
+: >"$d/zig-local"
+chown "$jobuser" "$d/zig-local" 2>/dev/null || true
+refuses NRV-E1228 "branch: a file at zig-local" bash -c '. ci/cache.sh; CI_JOB_USER=$2 ci_branch_prepare "$1" feature/atk' _ "$r" "$jobuser"
+# The prune does not take a directory name for a path: a name with a newline in it (a job can make
+# one) used to be read as a second name, here `victim`, relative to the step's directory.
+r=$(attack_tree n)
+mkdir "$tmp/cwd" "$tmp/cwd/victim"
+echo keep >"$tmp/cwd/victim/f"
+ci_as mkdir -p "$r/branches/$(printf 'b-evil\nvictim')" "$r/branches/b-old-00000001" "$r/branches/b-old-00000002"
+touch -d "2 days ago" "$r/branches/b-old-00000001"
+touch -d "3 days ago" "$r/branches/b-old-00000002"
+(
+    cd "$tmp/cwd"
+    . "$root/ci/cache.sh"
+    CI_JOB_USER=$jobuser CI_BRANCH_CACHES=1 ci_branch_prepare "$r" feature/atk >/dev/null 2>&1
+) || true
+is "a directory name with a newline does not make the prune remove a path" keep "$(cat "$tmp/cwd/victim/f" 2>/dev/null)"
+is "a name that is no branch key is removed, and so are the old caches over the bound" "no no" "$([ -e "$r/branches/$(printf 'b-evil\nvictim')" ] && echo yes || echo no) $([ -e "$r/branches/b-old-00000002" ] && echo yes || echo no)"
+# A link named like a branch cache is unlinked by the prune, never followed.
+r=$(attack_tree l)
+ci_as ln -s "$sd" "$r/branches/b-link-00000003"
+ci_as ln -s "$sd" "$r/branches/b-link-00000003.partial.1"
+(
+    . ci/cache.sh
+    CI_JOB_USER=$jobuser ci_branch_prepare "$r" feature/atk >/dev/null 2>&1
+) || true
+is "a link named like a cache, or like a partial one, is unlinked and the target is left alone" "$want_state no no" "$(sentinel_state) $([ -e "$r/branches/b-link-00000003" ] && echo yes || echo no) $([ -L "$r/branches/b-link-00000003.partial.1" ] && echo yes || echo no)"
+
+# Lock files a prune makes are the step's own, 0600 (they used to be 0644 by root's umask, and a
+# job that could list a 0755 lock directory could take them), and a lock directory with any group
+# or other bit is refused (NRV-E1226): what Docker makes of a missing mount source is root 0755.
+r=$(attack_tree p)
+ci_as mkdir -p "$r/branches/b-pruned-00000004" "$r/branches/b-big-00000005"
+touch -d "20 days ago" "$r/branches/b-pruned-00000004"
+(
+    umask 000
+    . ci/cache.sh
+    CI_JOB_USER=$jobuser ci_branch_prepare "$r" feature/atk >/dev/null 2>&1
+    CI_JOB_USER=$jobuser CI_BRANCH_CACHE_MAX_GIB=-1 ci_branch_prepare "$r" feature/atk >/dev/null 2>&1
+) || true
+is "the lock files a prune makes are 0600" "600 600" "$(stat -c %a "$r/locks/b-pruned-00000004.lock") $(stat -c %a "$r/locks/b-big-00000005.lock")"
+is "and the step's own" "$(id -un) $(id -un)" "$(stat -c %U "$r/locks/b-pruned-00000004.lock") $(stat -c %U "$r/locks/b-big-00000005.lock")"
+mkdir -p "$tmp/lk755/main" "$tmp/lk755/branches"
+mkdir -m 0755 "$tmp/lk755/locks"
+refuses NRV-E1226 "a root 0755 lock directory (Docker's own)" ci_cache_check main "$tmp/lk755"
+out=$(ci_cache_check main "$tmp/lk755" 2>&1 || true)
+grep -q "nerva-woodpecker.sh host" <<<"$out" || { echo "FAIL E1226 for 0755 does not name the fix: $out" >&2; fail=1; }
+chmod 0750 "$tmp/lk755/locks"
+refuses NRV-E1226 "a lock directory the group can read" ci_cache_check main "$tmp/lk755"
+
+# NRV-E1227 from the read-only opens too (fd 9 here; the reason is the read open's own: a lock
+# file that is not there, which the stubbed ci_lock_file leaves out, is "No such file").
+o4="$tmp/openfail9"
+mkdir -p "$o4/main" "$o4/branches"
+mkdir -m 0700 "$o4/locks"
+open9_fail() {
+    . ci/cache.sh
+    ci_lock_file() { return 0; }
+    ci_main_lock_open "$1"
+}
+out=$(open9_fail "$o4" 2>&1 || true)
+grep -q "NRV-E1227: could not open the lock file .*main.lock (No such file or directory)" <<<"$out" || { echo "FAIL open failure (fd 9): $out" >&2; fail=1; }
+if grep -q "held for\|NRV-E1224" <<<"$out"; then echo "FAIL open failure (fd 9) reported as a wait: $out" >&2; fail=1; fi
+refuses NRV-E1227 "fd 9's open failure refuses" open9_fail "$o4"
+# The reason is the open's own, in its own mode: a write-only probe would call a read open of a
+# directory a failure ("Is a directory"), and a read probe a write open of one a success.
+: >"$o4/locks/dir9.lock"
+rm "$o4/locks/dir9.lock"
+mkdir "$o4/locks/dir9.lock"
+out=$(. ci/cache.sh; ci_lock_open_failed "$o4/locks/dir9.lock" '<' 2>&1)
+grep -q "(no reason given)" <<<"$out" || { echo "FAIL probe in read mode: $out" >&2; fail=1; }
+out=$(. ci/cache.sh; ci_lock_open_failed "$o4/locks/dir9.lock" '>>' 2>&1)
+grep -q "(Is a directory)" <<<"$out" || { echo "FAIL probe in write mode: $out" >&2; fail=1; }
 
 # --- ci/install_zig.sh: the toolchain archive is checked on every use; only main writes it ---
 z="$tmp/zrepo"

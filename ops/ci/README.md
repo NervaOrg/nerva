@@ -320,7 +320,9 @@ set:
    install -d -m 0700 -o 0 -g 0 /var/cache/nerva-ci/locks
    ```
 
-   `locks/` is root's and mounted into every step (`/cache/locks`, writable): the lock files are in it, not in the directories the jobs (uid 1001) own. A step refuses one a job could write (NRV-E1226).
+   `locks/` is root's and mounted into every step (`/cache/locks`, writable): the lock files are in it, not in the directories the jobs (uid 1001) own. A step refuses one with any group or other permission bit (NRV-E1226): a job that could list it could open a 0644 lock read only, and `flock -x` works on that.
+
+   **Upgrading a box** that ran an earlier version of these scripts: run `bash ci/nerva-woodpecker.sh host` again before the next pipeline. Docker makes a missing mount source `/var/cache/nerva-ci/locks` as root 0755, which the step now refuses (NRV-E1226); `host` makes it root 0700. Lock files made under an older version in a 0755 directory are mode 0644 and are tightened to 0600 on first use.
 
    `main/` holds the pinned Zig's archive (`tools/<sha256>.tar.xz`, checked on every use), Zig's
    global cache and a `.zig-cache` copy, written only by a push to `main` (its steps mount it
@@ -335,7 +337,14 @@ set:
    holds none: no job can hold a lock or take a step out of the sharing. (They used to be in the
    directories `ci` owns, where a job could plant a symlink for a root step to chown and chmod; an
    old `.lock` there is unused and can be deleted.) The step refuses a `locks/` that is a link or
-   that another user can write (NRV-E1226), and never follows a link at a lock path.
+   that another user can write or list (NRV-E1226), and never follows a link at a lock path.
+
+   Root never creates, chowns, chmods or writes anything in `main/`, `branches/` or `jepsen/`: a
+   job can plant a symlink anywhere in them, and a root `chown`, `install -d` or `mkdir` would follow
+   it (to `/cache/locks`, or `/etc/passwd`, which would make the job root in the next step's
+   container). The step makes what a job needs there as the job's user (`ci_as_job`), replaces a
+   symlink it finds (`rm` unlinks and never follows) and refuses what is not a plain directory the
+   job can write (NRV-E1228: `rm -rf` it on the host; it is only a cache).
    A lock that stays busy is never waited on for good: the branch caches' lock and a prune warn
    (NRV-W1202) and the job runs; a branch's own cache lock waits `CI_LOCK_WAIT` (300 s) and then
    fails NRV-E1225 (another step's prune of that cache, or a process on the host, holds it);
