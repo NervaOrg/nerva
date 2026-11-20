@@ -291,14 +291,20 @@ jobs:
         with:
           name: targets
 
-      - name: Every release target (ci/job.sh targets; builds them all except on a pull request)
+      - name: Type-check every release target (ci/job.sh targets-check)
         if: needs.changes.outputs.code != 'false'
-        run: ci/job.sh targets
+        run: ci/job.sh targets-check
 
+      # Saved here, between the two, so the cache holds the Debug artifacts of the type-check only
+      # and stays small; the release builds below are not saved.
       - uses: ./.github/actions/zig-build-cache-save
         if: needs.changes.outputs.code != 'false'
         with:
           name: targets
+
+      - name: Build every release target (ci/job.sh targets-build; not on a pull request)
+        if: needs.changes.outputs.code != 'false'
+        run: ci/job.sh targets-build
 
   # Nerva on a Mac (#278, v0.7.1 slice 2). GitHub's hosted macOS runners are free for a public
   # repository, and the jobs run ad hoc: they hold no Apple secret (mac-sign.yml's does, in its own approved

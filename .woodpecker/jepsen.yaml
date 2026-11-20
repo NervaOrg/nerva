@@ -5,8 +5,11 @@
 # hosted runner, the machine has the memory for --lazyfs-all-nodes.
 #
 # The five nodes are containers on the host's Docker, which the step reaches through its socket
-# (Trusted: volumes, network and security, since the step is privileged for /dev/fuse and uses
-# the host's network to reach the nodes' bridge). One Jepsen run at a time on a machine; the
+# (the repository is Trusted for volumes and network: the socket is a mount, and the host's
+# network reaches the nodes' bridge). The step is not privileged, and never writes main's cache
+# (it mounts it :ro, decision O4). The socket is root on the host in all but name: whoever can
+# push a jepsen/** branch, or start a run by hand, has it (decision O4, "What remains trusted").
+# One Jepsen run at a time on a machine; the
 # store and memory record stay in /var/cache/nerva-ci/jepsen/ for 14 days. The branch is not
 # deleted here: GitHub's jepsen.yml does that while it still runs on the same pushes.
 when:
@@ -18,12 +21,13 @@ when:
 steps:
   - name: jepsen
     image: docker.io/library/ubuntu:24.04@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8
-    privileged: true
     # Woodpecker 3.20 honours this for a Trusted repository; `woodpecker-cli lint`'s schema
     # warns about it all the same.
     network_mode: host
     commands:
       - ci/woodpecker_step.sh jepsen
     volumes:
-      - /var/cache/nerva-ci:/cache
+      - /var/cache/nerva-ci/main:/cache/main:ro
+      - /var/cache/nerva-ci/branches:/cache/branches
+      - /var/cache/nerva-ci/jepsen:/cache/jepsen
       - /var/run/docker.sock:/var/run/docker.sock

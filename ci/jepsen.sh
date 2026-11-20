@@ -24,16 +24,16 @@ mkdir -p "$out"
 # `args` goes to a shell word-split, so only a plain alphabet gets through, and only `test`:
 # `test-all` multiplies the time limit by the number of tests, and the job has one hour.
 if [[ "$ARGS" == *$'\n'* || "$ARGS" == *$'\r'* ]]; then
-    ci_error "args must be one line: a newline would drop everything after it"
+    ci_error "NRV-E1206: args must be one line: a newline would drop everything after it"
     exit 1
 fi
 if ! [[ "$ARGS" =~ ^test([[:space:]]+[A-Za-z0-9,._=-]+)*$ ]]; then
-    ci_error "args must be 'test' and options of letters, digits and , . _ = -: '$ARGS'"
+    ci_error "NRV-E1206: args must be 'test' and options of letters, digits and , . _ = -: '$ARGS'"
     exit 1
 fi
-[[ "$TEETH" == true || "$TEETH" == false ]] || { ci_error "TEETH must be true or false, not '$TEETH'"; exit 1; }
+[[ "$TEETH" == true || "$TEETH" == false ]] || { ci_error "NRV-E1206: TEETH must be true or false, not '$TEETH'"; exit 1; }
 [[ "$JEPSEN_LAZYFS_PATCH" == yes || "$JEPSEN_LAZYFS_PATCH" == no ]] ||
-    { ci_error "JEPSEN_LAZYFS_PATCH must be yes or no, not '$JEPSEN_LAZYFS_PATCH'"; exit 1; }
+    { ci_error "NRV-E1206: JEPSEN_LAZYFS_PATCH must be yes or no, not '$JEPSEN_LAZYFS_PATCH'"; exit 1; }
 limit=60
 read -r -a words <<< "$ARGS"
 lazyfs_fault=false
@@ -49,7 +49,7 @@ for i in "${!words[@]}"; do
         [[ ",$spec," == *,lose-unfsynced-writes,* ]] && lazyfs_fault=true
         ;;
     --test-count | --test-count=*)
-        ci_error "--test-count is refused: the 1200 s --time-limit check cannot bound a multiplied run"
+        ci_error "NRV-E1206: --test-count is refused: the 1200 s --time-limit check cannot bound a multiplied run"
         exit 1
         ;;
     --lazyfs-all-nodes | --lazyfs-all-nodes=*)
@@ -71,16 +71,19 @@ if [[ "$JEPSEN_LAZYFS_PATCH" == no ]] && { [[ $lazyfs_fault != true ]] || [[ $st
     exit 1
 fi
 if ! [[ "$limit" =~ ^[0-9]+$ ]] || ((limit > 1200)); then
-    ci_error "--time-limit must be a number of seconds, at most 1200, not '$limit'"
+    ci_error "NRV-E1206: --time-limit must be a number of seconds, at most 1200, not '$limit'"
     exit 1
 fi
 echo "Jepsen \`$ARGS\` at \`$(git rev-parse HEAD)\` (teeth: $TEETH, LazyFS patch: $JEPSEN_LAZYFS_PATCH)" | ci_summary
+
+# Before the build: without gnuplot the run's graphs, and so its result, are :unknown.
+command -v gnuplot >/dev/null || { ci_error "NRV-E1207: no gnuplot: without it Jepsen's graphs, and so the result, are :unknown"; exit 1; }
 
 # The teeth build exists from slice 1 (-Dtest-commit-keys=off); until it does, asking for it fails
 # here, loudly, and not by running the release build as if it were the teeth.
 if [[ "$TEETH" == true ]]; then
     if ! grep -q 'test-commit-keys' build.zig; then
-        ci_error "teeth needs -Dtest-commit-keys=off (R1 slice 1), which this commit's build.zig lacks"
+        ci_error "NRV-E1206: teeth needs -Dtest-commit-keys=off (R1 slice 1), which this commit's build.zig lacks"
         exit 1
     fi
     ./zig/zig build -Drelease -Dtest-commit-keys=off -p zig-out-teeth
@@ -90,7 +93,6 @@ else
     nerva=$PWD/zig-out/bin/nerva
 fi
 "$nerva" version
-command -v gnuplot >/dev/null || { ci_error "no gnuplot: without it Jepsen's graphs, and so the result, are :unknown"; exit 1; }
 timeout 60 docker info --format 'Docker {{.ServerVersion}}, {{.NCPU}} CPUs, {{.MemTotal}} bytes'
 
 # The suite's checkers (lein test), with Leiningen 2.12.0, sha256-checked (tools.sh).
@@ -112,7 +114,12 @@ free -m
 tests/jepsen/memsample.sh "$out/jepsen-memory.log" "$out/jepsen-memory-low.txt" &
 sampler=$!
 rc=0
-tests/jepsen/run.sh "$nerva" "${words[@]}" || rc=$?
+# Woodpecker masks only the secrets it holds, so the run's output passes through ci_redact, which
+# hides the key (and its first 16 characters, which the store search below also looks for).
+set +e
+tests/jepsen/run.sh "$nerva" "${words[@]}" 2>&1 | ci_redact
+rc=${PIPESTATUS[0]}
+set -e
 kill "$sampler" 2>/dev/null || true
 free -m
 echo "memory: the sample at the lowest MemAvailable"
@@ -122,7 +129,7 @@ cat "$out/jepsen-memory-low.txt" || true
 # holds it is never packed, so never shared.
 if [[ -d tests/jepsen/store ]]; then
     if grep -rliF -e "$NERVA_CLUSTER_KEY" -e "${NERVA_CLUSTER_KEY:0:16}" tests/jepsen/store; then
-        ci_error "the cluster key is in the store (files above): it is not packed; do not share it"
+        ci_error "NRV-E1210: the cluster key is in the store (files above): it is not packed; do not share it"
         exit 1
     fi
     echo "No file in store/ holds the run's cluster key" | ci_summary

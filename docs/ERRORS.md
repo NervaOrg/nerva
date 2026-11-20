@@ -47,6 +47,7 @@ a one-line summary, who is to blame, the cause and a fix. Codes are never reused
   | `09xx` | keys between replicas |
   | `10xx` | `nerva view` |
   | `11xx` | installation and packages |
+  | `12xx` | the CI scripts (`ci/`) |
 
 - **Blame:**
   - `client`: the request was wrong; fix it, do not retry it.
@@ -327,6 +328,31 @@ For `release.yml`'s own refusals (NRV-E1112 to NRV-E1116, printed as `error[NRV-
 | NRV-W1101 | On an upgrade, a `/usr/local/bin/nerva` is left behind and shadows the package's binary | `warning[NRV-W1101]: nerva package: /usr/local/bin/nerva exists and shadows this package's /usr/bin/nerva` on stderr, from the preinst or `%pre`, then a `cause` and a `fix` line; the upgrade goes on (dpkg `upgrade`, rpm 2 or more; a first install is refused with NRV-E1111 instead). `/usr/local/bin` comes before `/usr/bin` on the path and both units run `nerva` by name, so the replicas keep running that file, not the package's new binary | operator | Keep one install. If it is a tarball install, stop the replicas, run `install.sh --uninstall` from the tarball (it keeps `/var/lib/nerva`, `/etc/nerva`, the user and the enabled `nerva@N` and `nerva-api@N` instances); then start the replicas; otherwise move or remove the file. Enable any instance that is not enabled |
 | NRV-W1102 | `install.sh` found a package's `/usr/bin/nerva`, which the tarball's `/usr/local/bin/nerva` shadows | `warning[NRV-W1102]: install.sh: /usr/bin/nerva exists and /usr/local/bin/nerva shadows it` on stderr, then a `cause` and a `fix` line; the install goes on (also with `--dry-run`, not with `--uninstall`; a different nerva is refused with NRV-E1118 while units run). `/usr/local/bin` comes before `/usr/bin` on the path and both units run `nerva` by name, so the replicas run the tarball's file | operator | Leave the package installed. Removing it (`apt remove nerva`, `dnf remove nerva`) disables the enabled `nerva@N` and `nerva-api@N` instances (its maintainer script removes their links): run `systemctl enable` for each again afterwards, or none starts at the next boot. `install.sh --uninstall` keeps them while the package's unit files (`/usr/lib/systemd/system/nerva@.service`, `nerva-api@.service`) exist, one template at a time |
 | NRV-W1103 | The `alarm` job could not open or comment on the `package-repos` issue. A warning: it never changes the run's verdict | `warning[NRV-W1103]: repos_alarm.sh: <what>`; the run's verdict is unchanged | GitHub, or a missing label | Check the label exists and GitHub's status |
+
+## 12xx · The CI scripts
+
+Printed by `ci/*.sh` (`error: NRV-E12xx: <what>` or `warning: NRV-W12xx: <what>`, through `ci_error`
+and `ci_warning`, which GitHub's log shows as annotations) in a CI job, on GitHub's runners or on
+the project's Woodpecker box (`ops/ci/README.md`). Their reader is whoever reads the failed job's
+log, and `ci/ci_test.sh` (run by `ci/job.sh check-scripts`) triggers every one of them from the real
+script, except NRV-E1203 (a Woodpecker step with the Docker socket not mounted), NRV-E1209 (a second Jepsen run holding the lock for 90 minutes) and NRV-E1210 (a Jepsen run), and the
+refusal of a real daemon in NRV-E1201 (the table test makes the check fail as the kernel would).
+Decision O4.
+
+| Code | Summary | Today | Blame | Fix |
+| --- | --- | --- | --- | --- |
+| NRV-E1201 | The step cannot create an io_uring | `error: NRV-E1201: io_uring is refused here (<reason>): the host's Docker daemon needs the seccomp profile ops/ci/docker/seccomp-io_uring.json …` (`ci/io_uring_check.sh`, before any job) | operator | Run `ops/ci/woodpecker-bootstrap.sh` again on the box (it installs the profile and restarts Docker), or clear `kernel.io_uring_disabled` |
+| NRV-E1202 | The Woodpecker cache mounts are not as the pipeline's role needs | `error: NRV-E1202: …` (`ci/cache.sh`): `/cache/main` or `/cache/branches` is not mounted, main's cache is writable in a pipeline for a branch (it must be `:ro`), is read-only in a push to main, or the branches' directory is read-only; also `/cache/jepsen` not mounted | operator | Fix the `volumes:` of the step in `.woodpecker/*.yaml` (decision O4), or the host directories (`ops/ci/README.md`) |
+| NRV-E1203 | The Jepsen step has no Docker socket | `error: NRV-E1203: /var/run/docker.sock is not mounted …` | operator | Mount it as `.woodpecker/jepsen.yaml` does (the repository must be Trusted for volumes) |
+| NRV-E1204 | The pinned Docker client is for another architecture | `error: NRV-E1204: the pinned Docker client is x86_64; this machine is <arch>` (`ci/docker_client.sh`) | operator | Run Jepsen on an x86_64 agent, or pin the client for this architecture |
+| NRV-E1205 | The Docker client's download does not match its pinned sha256 | `error: NRV-E1205: docker-<version>.tgz does not match its pinned sha256 <sha>` | operator | Check the pin against download.docker.com, then change it in `ci/woodpecker_step.sh`; never skip the check |
+| NRV-E1206 | A Jepsen run was asked for with arguments the job refuses | `error: NRV-E1206: …` (`ci/jepsen.sh`): `args` is not one line of `test` and plain options, `--time-limit` over 1200 or not a number, `--test-count`, `TEETH` or `JEPSEN_LAZYFS_PATCH` not a boolean, `teeth` on a commit with no teeth build | client | Correct the dispatch's `args` |
+| NRV-E1207 | `gnuplot` is not installed where Jepsen runs | `error: NRV-E1207: no gnuplot: …` (before the build) | operator | Install `gnuplot-nox` on the runner or in the step |
+| NRV-E1208 | `ci/job.sh` was called with an unknown job or a bad argument | `error: NRV-E1208: …`, exit 2: no job, an unknown job, a missing or malformed seed, lane, demo or fuzzer, `MINUTES` not a whole number, a demo that `build.zig`'s `test:demo` does not run | client | Fix the workflow or YAML that called it |
+| NRV-E1209 | Another Jepsen run held the machine for too long | `error: NRV-E1209: another Jepsen run held this machine for <n> s …` (`ci/woodpecker_step.sh`, `CI_JEPSEN_WAIT`, 5400 s) | retry | Start the run again when the other one ends |
+| NRV-E1210 | The run's cluster key is in the Jepsen store | `error: NRV-E1210: the cluster key is in the store …` (`ci/jepsen.sh`): the store is not packed | internal | Do not share the store; find which file holds the key (listed above the error) and report it, it is a leak in the harness |
+| NRV-W1201 | A cached toolchain archive does not match its sha256 | `warning: NRV-W1201: <file> does not match its sha256: downloading the toolchain again` (`ci/install_zig.sh`); only a push to main replaces the file | operator | None: the job downloads and verifies the pinned archive itself; if it recurs, the cache directory is damaged (`ops/ci/README.md`) |
+| NRV-W1202 | A cache lock was not free in time | `warning: NRV-W1202: …` (`ci/cache.sh`): main's Zig caches were not pruned because other jobs held them, or a branch's cache was made without pruning because the branches' lock stayed busy | operator | None for this job. If the disk fills: with the agent idle, `rm -rf /var/cache/nerva-ci/main/zig-local /var/cache/nerva-ci/main/zig` (`ops/ci/README.md`, "When the disk fills") |
 
 ## Bugs
 

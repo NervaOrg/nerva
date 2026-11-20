@@ -19,11 +19,11 @@ echo c >>code.zig && git add code.zig && git commit -qm code2
 code=$(git rev-parse HEAD)
 
 fail=0
-check() { # want event prev head prev_status
+check() { # want event prev head prev_status [prev_event, default push]
     got=$(CI_PIPELINE_EVENT=$2 CI_PREV_COMMIT_SHA=$3 CI_COMMIT_SHA=$4 CI_PREV_PIPELINE_STATUS=$5 \
-        ci/changes.sh)
+        CI_PREV_PIPELINE_EVENT=${6-push} ci/changes.sh)
     if [ "$got" != "$1" ]; then
-        echo "changes.sh event=$2 prev_status=$5: got $got, want $1" >&2
+        echo "changes.sh event=$2 prev_status=$5 prev_event=${6-push}: got $got, want $1" >&2
         fail=1
     fi
 }
@@ -35,4 +35,8 @@ check true push "$docs" "$code" success
 check true push "" "$docs" success
 check true push 0000000000000000000000000000000000000000 "$docs" success
 check true manual "$base" "$docs" success
+# The previous pipeline was a manual run (NERVA_RUN=jepsen) that succeeded: it ran no CI workflow.
+check true push "$base" "$docs" success manual
+check true push "$base" "$docs" success cron
+check true push "$base" "$docs" success ""
 exit $fail

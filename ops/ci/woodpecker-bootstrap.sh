@@ -208,6 +208,41 @@ if [ "${#missing[@]}" -gt 0 ]; then
     DEBIAN_FRONTEND=noninteractive apt-get install -y -q "${missing[@]}"
 fi
 systemctl enable -q --now docker
+
+# --- Docker's seccomp profile --------------------------------------------------------------------
+# Nerva's IO is io_uring, which Docker's default profile refuses (Docker 25 and later). The steps
+# must not be privileged for it (decision O4), so the daemon gets Docker's default profile plus
+# the three io_uring syscalls (ops/ci/docker/README.md): it then applies to every container the
+# daemon creates without a profile of its own, the Woodpecker steps included. Only when the profile
+# sits beside this script. Idempotent: the daemon restarts only if the profile or daemon.json
+# changed, and a restart stops running containers (restart: unless-stopped brings them back; a
+# running pipeline fails), so rerun it when the agent is idle.
+seccomp_src="$(dirname "$(readlink -f "$0")")/docker/seccomp-io_uring.json"
+seccomp_dst=/etc/docker/seccomp-io_uring.json
+daemon_json=/etc/docker/daemon.json
+if [ -f "$seccomp_src" ]; then
+    jq -e '.syscalls | map(select(.names | index("io_uring_setup"))) | length > 0' "$seccomp_src" >/dev/null ||
+        fail "$seccomp_src does not allow io_uring_setup"
+    install -d -m 0755 /etc/docker
+    changed=no
+    cmp -s "$seccomp_src" "$seccomp_dst" || { install -m 0644 "$seccomp_src" "$seccomp_dst"; changed=yes; }
+    [ -s "$daemon_json" ] || echo '{}' > "$daemon_json"
+    merged=$(mktemp); tmpfiles+=("$merged")
+    jq --arg p "$seccomp_dst" '. + {"seccomp-profile": $p}' "$daemon_json" > "$merged" ||
+        fail "$daemon_json is not valid JSON; fix it, then rerun"
+    if [ "$(jq -S . "$merged")" != "$(jq -S . "$daemon_json")" ]; then
+        install -m 0644 "$merged" "$daemon_json"
+        changed=yes
+    fi
+    if [ "$changed" = yes ]; then
+        step "Docker $(docker version --format '{{.Server.Version}}'): installing the io_uring seccomp profile, restarting Docker"
+        systemctl restart docker
+    fi
+    docker info --format '{{json .SecurityOptions}}' | grep -q seccomp ||
+        fail "Docker runs without seccomp after the restart (docker info shows none)"
+else
+    step "no $seccomp_src: Docker keeps its default seccomp profile, which refuses io_uring (Nerva's CI steps will fail NRV-E1201)"
+fi
 if [ "$CI_KVM" = yes ]; then
     grep -q AMD /proc/cpuinfo && echo kvm_amd > /etc/modules-load.d/woodpecker-kvm.conf ||
         echo kvm_intel > /etc/modules-load.d/woodpecker-kvm.conf

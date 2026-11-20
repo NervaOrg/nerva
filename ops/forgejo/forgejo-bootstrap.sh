@@ -342,8 +342,19 @@ if ! fja user list --admin | awk 'NR > 1 {print $2}' | grep -qx "$FJ_ADMIN"; the
 elif [ "${FORGEJO_RESET_ADMIN:-}" = 1 ]; then
     step "setting a new first-login password for $FJ_ADMIN"
     pw=$(head -c 18 /dev/urandom | base64)
-    fja user change-password --username "$FJ_ADMIN" --password "$pw" \
-        --must-change-password=false >/dev/null || fail "Forgejo refused the new password"
+    # `admin user change-password --password` would put the password on the command line, where
+    # `ps` shows it to every user of the box. The API takes it in a request body from a file, with
+    # the token in a header file, neither on a command line.
+    reset_hdr=$(mktemp); cleanup+=("$reset_hdr")
+    reset_body=$(mktemp); cleanup+=("$reset_body")
+    (umask 077
+     printf 'Authorization: token %s\n' "$(fja user generate-access-token --username "$FJ_ADMIN" --raw \
+         --token-name "forgejo-reset-$(date -u +%s)" --scopes write:admin)" > "$reset_hdr"
+     jq -n --arg u "$FJ_ADMIN" --arg p "$pw" \
+         '{login_name: $u, source_id: 0, password: $p, must_change_password: false}' > "$reset_body")
+    [ "$(curl -sS -o /dev/null -w '%{http_code}' -X PATCH -H @"$reset_hdr" -H 'Content-Type: application/json' \
+        --data @"$reset_body" "https://$FJ_HOST/api/v1/admin/users/$FJ_ADMIN")" = 200 ] ||
+        fail "Forgejo refused the new password (the admin API did not answer 200)"
     rm -f "$admin_pw"; (umask 077; printf '%s\n' "$pw" > "$admin_pw"); chmod 0400 "$admin_pw"
 fi
 

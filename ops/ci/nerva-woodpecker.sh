@@ -4,14 +4,16 @@
 #
 #   On every agent box, as root:
 #     bash nerva-woodpecker.sh host
-#   Checks Docker, /dev/fuse and /dev/kvm, and creates the shared cache /var/cache/nerva-ci.
+#   Checks Docker (and that its daemon carries the io_uring seccomp profile, which
+#   woodpecker-bootstrap.sh installs), /dev/fuse and /dev/kvm, and creates the cache directories
+#   under /var/cache/nerva-ci (main, branches and jepsen: decision O4).
 #
 #   On your laptop (needs curl and jq), with a personal token from Woodpecker (your avatar, then
 #   Personal access token):
 #     WOODPECKER_SERVER=https://ci.example.org WOODPECKER_TOKEN=... bash nerva-woodpecker.sh repo OWNER/NAME
 #   Enables the repository if it is not yet, then sets: pull requests off, approval for forks,
-#   a 360-minute timeout, and Trusted for volumes, network and security. It reads the settings
-#   back and fails if any did not take.
+#   a 360-minute timeout, and Trusted for volumes and network (not security: no step is
+#   privileged, decision O4). It reads the settings back and fails if any did not take.
 #
 # Both modes can run again: each only changes what is not yet as it should be. The last line is
 # `nerva-woodpecker: OK ...` or `nerva-woodpecker: FAIL ...`.
@@ -38,8 +40,21 @@ host() {
         say "warning: no /dev/kvm (enable virtualisation in the BIOS); Nerva's workflows do not need it yet"
     fi
 
-    # The cache every workflow mounts (.woodpecker/*.yaml); uid 1001 is the `ci` user the jobs run as.
-    install -d -m 0755 -o 1001 -g 1001 /var/cache/nerva-ci
+    # No step is privileged, so io_uring needs the daemon's own profile (ops/ci/docker/README.md).
+    if ! { grep -q '"seccomp-profile"' /etc/docker/daemon.json 2>/dev/null &&
+        docker info --format '{{json .SecurityOptions}}' | grep -q seccomp; }; then
+        fail "Docker has no io_uring seccomp profile: run woodpecker-bootstrap.sh again, from the directory that holds docker/seccomp-io_uring.json (NRV-E1201)"
+    fi
+
+    # The caches the workflows mount (.woodpecker/*.yaml); uid 1001 is the `ci` user the jobs run
+    # as. main/ is written only by pipelines for a push to main, which mount it writable; the others
+    # mount it read-only and write branches/. jepsen/ keeps each Jepsen run's store.
+    install -d -m 0755 -o 1001 -g 1001 /var/cache/nerva-ci /var/cache/nerva-ci/main \
+        /var/cache/nerva-ci/branches /var/cache/nerva-ci/jepsen
+    # What the first layout left (one shared cache for every branch) is no longer read.
+    local old
+    old=$(cd /var/cache/nerva-ci && ls -d nerva-toolchain zig zig-local zig-cache 2>/dev/null | tr '\n' ' ')
+    [ -z "$old" ] || say "note: /var/cache/nerva-ci holds the old layout ($old); nothing reads it now, delete it when you like"
     local avail
     avail=$(df --output=avail -B1G /var/cache/nerva-ci | tail -1 | tr -d ' ')
     [ "$avail" -ge 100 ] ||
@@ -51,8 +66,17 @@ host() {
     say "OK host $(hostname): $cpus CPUs, $mem GiB, $avail GiB free for /var/cache/nerva-ci"
 }
 
+# The token goes to curl in a header file (-H @file), not on its command line, where `ps` would
+# show it to every user of the machine.
+api_header=
 api() { # api METHOD PATH [JSON]
-    local args=(-fsS -X "$1" -H "Authorization: Bearer $WOODPECKER_TOKEN" -H 'Content-Type: application/json')
+    if [ -z "$api_header" ]; then
+        api_header=$(mktemp)
+        trap 'rm -f "$api_header"' EXIT
+        chmod 600 "$api_header"
+        printf 'Authorization: Bearer %s\n' "$WOODPECKER_TOKEN" > "$api_header"
+    fi
+    local args=(-fsS -X "$1" -H "@$api_header" -H 'Content-Type: application/json')
     [ $# -lt 3 ] || args+=(--data "$3")
     curl "${args[@]}" "${WOODPECKER_SERVER%/}/api$2"
 }
@@ -78,20 +102,20 @@ repo() {
 
     # A fork's pull request must never run on this machine (P147e): no pull requests at all, and
     # approval for forks as a second line of defence. Trusted: the cache volume (all workflows),
-    # and the Docker socket, the host network and privileged mode (Jepsen).
+    # and the Docker socket and the host network (Jepsen). Not security: no step is privileged (decision O4).
     api PATCH "/repos/$id" '{
         "allow_pr": false,
         "require_approval": "forks",
         "timeout": 360,
-        "trusted": {"volumes": true, "network": true, "security": true}
+        "trusted": {"volumes": true, "network": true, "security": false}
     }' >/dev/null || fail "the server refused the settings (Trusted needs a Woodpecker admin's token)"
 
     local got
     got=$(api GET "/repos/$id")
     jq -e '.allow_pr == false and .require_approval == "forks" and .timeout == 360
-           and .trusted.volumes and .trusted.network and .trusted.security' <<<"$got" >/dev/null ||
+           and .trusted.volumes and .trusted.network and (.trusted.security | not)' <<<"$got" >/dev/null ||
         fail "the settings did not all take; the server has: $(jq -c '{allow_pr, require_approval, timeout, trusted}' <<<"$got")"
-    say "OK repo $name (id $id): pull requests off, approval for forks, 360 min, trusted"
+    say "OK repo $name (id $id): pull requests off, approval for forks, 360 min, trusted for volumes and network only"
 }
 
 case "${1:-}" in

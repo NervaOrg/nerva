@@ -3,6 +3,12 @@
 # Started by hand with the variable NERVA_RUN=fuzz (and MINUTES), or by a cron job named
 # fuzz-long. Never a pull request (P147e). Each entry is one workflow; the agent runs as many at
 # once as it allows, and queues the rest. A failure prints its seed and the replay command.
+# Caches (decision O4): a step for a push to main mounts main's cache writable and no branch's; any
+# other step mounts main's read-only and its own branches' directory writable. The two steps are
+# exclusive by `when:`, so a branch's pipeline never gets main's cache writable: the mount, not the
+# script, enforces it. Steps are not privileged; io_uring comes from the host Docker daemon's
+# seccomp profile (ops/ci/docker/README.md).
+
 when:
   - event: manual
     evaluate: 'NERVA_RUN == "fuzz"'
@@ -36,12 +42,21 @@ matrix:
       - { JOB: vopr-long, ARG: testing-1 }
 
 steps:
+  - name: ${JOB} ${ARG} (main)
+    image: docker.io/library/ubuntu:24.04@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8
+    commands:
+      - ci/woodpecker_step.sh ${JOB} ${ARG}
+    when:
+      - event: push
+        branch: main
+    volumes:
+      - /var/cache/nerva-ci/main:/cache/main
   - name: ${JOB} ${ARG}
     image: docker.io/library/ubuntu:24.04@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8
     commands:
       - ci/woodpecker_step.sh ${JOB} ${ARG}
-    # Docker's default seccomp profile refuses io_uring (Docker 25 and later), which Nerva's IO
-    # needs; privileged lifts it. The job itself runs as `ci` with no capabilities.
-    privileged: true
+    when:
+      - evaluate: 'CI_PIPELINE_EVENT != "push" || CI_COMMIT_BRANCH != "main"'
     volumes:
-      - /var/cache/nerva-ci:/cache
+      - /var/cache/nerva-ci/main:/cache/main:ro
+      - /var/cache/nerva-ci/branches:/cache/branches

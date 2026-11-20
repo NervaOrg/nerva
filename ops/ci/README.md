@@ -251,7 +251,11 @@ Nerva's CI is plain scripts under `ci/`. GitHub's `ci.yml` and the workflows in 
 both call `ci/job.sh <job>`, so the two run the same checks. Each `.woodpecker/*.yaml` file
 runs `ci/woodpecker_step.sh <job>` in a pinned `ubuntu:24.04` image. That script installs the
 base packages, skips a docs-only push (`ci/changes.sh`), and runs the job as an unprivileged
-user `ci` under GitHub's timeout for it.
+user `ci` under a timeout (75 minutes, 330 for the long searches; ci.yml's are 30 to 60, but here
+a push runs 16 workflows on one box beside the simulator fleet). No step is privileged, and only a
+push to `main` writes the shared caches (decision O4, `docs/decisions/O4-self-hosted-ci-trust.md`,
+which also says what a pusher of any branch can still do here: read it before giving anyone write
+access).
 
 **Only the repository's own branches run here; forks never do (P147e).** Woodpecker can run a
 pull request from a fork on this box, and a fork's code must never run on a self-hosted machine.
@@ -278,21 +282,45 @@ set:
    events. Fork pull requests run on GitHub's hosted runners only.
 2. **Settings, General:** set the repository's **Timeout** to 360 minutes, since the long fuzz
    runs take up to 330. The bootstrap lets a repository choose up to 360 (`CI_MAX_TIMEOUT`).
-3. **Settings, Project:** mark the repository **Trusted** for *volumes*, *network* and
-   *security*. Every workflow mounts the host's cache. Jepsen also mounts the host's Docker
-   socket and runs privileged on the host's network, to reach its five node containers.
-   Mounting the Docker socket gives that step root on the box: it runs only for this
-   repository's own branches.
-4. **On every agent box**, create the shared cache:
+3. **Settings, Project:** mark the repository **Trusted** for *volumes* and *network* only, and
+   not for *security*: no step is privileged. Every workflow mounts the host's cache, and
+   Jepsen also mounts the host's Docker socket and uses the host's network to reach its five
+   node containers. Mounting the Docker socket gives that step root on the box: it runs for
+   this repository's own branches, so whoever can push one has it (decision O4).
+4. **On every agent box, once: run `woodpecker-bootstrap.sh` from a checkout that has
+   `docker/seccomp-io_uring.json` beside it** (the directory `ops/ci/`), then
+   `nerva-woodpecker.sh host`. This is the owner's one-time step for decision O4. The bootstrap
+   copies Docker's default seccomp profile plus the three io_uring syscalls
+   (`ops/ci/docker/`) to `/etc/docker/seccomp-io_uring.json`, merges
+   `"seccomp-profile": "/etc/docker/seccomp-io_uring.json"` into `/etc/docker/daemon.json`
+   (keeping every other key) and restarts Docker, only if either changed. **The restart stops the
+   containers running on the box: do it with no pipeline running**; the agent and the server come
+   back (`restart: unless-stopped`). `nerva-woodpecker.sh host` refuses to go on if the daemon
+   has no such profile, and every job checks io_uring first and fails with NRV-E1201 if it is
+   refused. Without the profile there is no other way to run Nerva's IO in a step: do not make
+   the steps privileged instead.
+
+   `nerva-woodpecker.sh host` creates the cache directories:
 
    ```bash
-   install -d -m 0755 -o 1001 -g 1001 /var/cache/nerva-ci
+   install -d -m 0755 -o 1001 -g 1001 /var/cache/nerva-ci /var/cache/nerva-ci/{main,branches,jepsen}
    ```
 
-   It holds the pinned Zig (`nerva-toolchain/`), Zig's global cache, and a `.zig-cache` copy
-   per job, saved only by a push to `main` that passed. Jobs share it under a `flock`. When
-   free space drops below 40 GiB (`CI_FREE_MIN_GIB`), the next job takes the lock exclusively
-   and prunes it.
+   `main/` holds the pinned Zig's archive (`tools/<sha256>.tar.xz`, checked on every use), Zig's
+   global cache and a `.zig-cache` copy, written only by a push to `main` (its steps mount it
+   writable; every other step mounts it `:ro`). `branches/<key>/` is one branch's own copy,
+   seeded from main's, at most 8 of them, 12 GiB and 7 days each. Jobs hold a shared `flock`
+   on what they use. Below 60 GiB free (`CI_FREE_MIN_GIB`), a job for `main` waits up to 10
+   minutes (`CI_PRUNE_WAIT`) to hold `main/` alone and empties its Zig caches (never the
+   toolchain), and a branch job empties every branch cache no job is using. A lock that stays busy
+   is never waited on for good: the job warns (NRV-W1202) and runs.
+
+   **When the disk fills** (a job fails with "No space left", or NRV-W1202 keeps appearing), with
+   no pipeline running: `rm -rf /var/cache/nerva-ci/branches/*` empties every branch cache, and
+   `rm -rf /var/cache/nerva-ci/main/zig /var/cache/nerva-ci/main/zig-local` main's Zig caches. The
+   next jobs make them again. Do not delete `main/tools` unless the archive is damaged: a job
+   checks it by its sha256 and downloads it again anyway (NRV-W1201). A pipeline killed half way
+   leaves a `branches/*.partial.*` directory, which the next prune removes.
 5. **GitHub statuses:** each workflow reports as `ci/woodpecker/push/<file>`, for example
    `ci/woodpecker/push/check` or `ci/woodpecker/push/demo/1`. Whether any of them becomes a
    required check on `main` is the owner's choice. GitHub's own checks stay required either
@@ -336,16 +364,23 @@ CI_PIPELINE_EVENT=manual ci/woodpecker_step.sh check-code
   - Forgejo's SSH server, mirrors and dumps.
 
   The first run on a new box is the test. A `FAIL` line says what to fix.
-- Nerva's workflows: each `ci/woodpecker_step.sh` job was run as root in a plain Ubuntu 24.04
-  container with `/cache` mounted:
-  - `check` and `fuzz-smoke` ran in full. `fuzz-smoke` ran as a push to `main` and saved its
-    cache.
-  - `fuzz-long` and `vopr-long` ran for one minute each.
-  - A Markdown-only push skipped.
-  - `jepsen` ran up to `docker info`, against a fake socket: there was no Docker daemon to drive.
-
-  The `when` filters were checked with `woodpecker-cli exec` for push, a `jepsen/**` push,
-  manual runs and `NERVA_RUN`; the cron filter was not checked. No workflow has run on a
-  Woodpecker server yet.
+- Nerva's workflows, after decision O4 (no step privileged; main and branch caches):
+  - **Run (in a scratch directory, by `ci/ci_test.sh`, in `check-scripts`):** every refusal of
+    the `ci/` scripts but E1203, E1209 and E1210 (E1201 with a stand-in for the kernel's refusal; E1202 for a writable main cache in a branch's role and a
+    missing mount; E1204 to E1208; W1201; W1202), and `ci_redact`; the cache rules (a
+    branch's cache is a copy, not a link; main is untouched by a branch; the count bound; a cache
+    in use is not pruned; main's prune and its busy case); the toolchain archive checked and
+    replaced on main, never replaced by a branch. `ci/changes_test.sh` covers the docs-only skip.
+    The seccomp profile's merge into `daemon.json` was run with `jq` on an empty file and on a file
+    with other keys (idempotent). All the scripts pass `bash -n`; the `.woodpecker/*.yaml` and
+    `ci.yml` parse as YAML.
+  - **Not run:** no workflow has run on a Woodpecker server since this change. Not checked: that
+    `woodpecker-cli lint` accepts the two-step files; that the step's `when:` choose the mounts
+    as intended; that a `:ro` mount makes `ci_cache_check` see main as read-only (a root process
+    in the container cannot write a read-only mount, but it was not run on Docker); that
+    the profile lets a step create an io_uring on a real daemon (and so that a replica starts);
+    that Jepsen works unprivileged (it needed `privileged` before, for the step's own use of
+    `/dev/fuse`, if at all); the bootstrap's Docker restart; the Forgejo password reset through
+    the API. The first push after the owner's step is the test.
 - `nerva-woodpecker.sh`: its failure paths were run here. Its `repo` mode was checked only
   against the Woodpecker 3.20.1 client's API paths and field names, never against a server.

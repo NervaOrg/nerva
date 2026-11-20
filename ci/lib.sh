@@ -3,12 +3,12 @@
 #
 #   ci_error MESSAGE      an error line: an annotation on GitHub, `error: ...` elsewhere
 #   ci_warning MESSAGE    the same for a warning
-#   ci_mask VALUE         hides VALUE in GitHub's log; elsewhere nothing (never print it)
-#   ci_summary            appends stdin to the run's summary: GitHub's step summary, else
-#                         $CI_SUMMARY if set, else the log
+#   ci_mask VALUE         hides VALUE in GitHub's log; elsewhere VALUE is remembered for ci_redact
+#   ci_redact             a filter that replaces every masked value (and its first 16 characters)
+#                         in its input with ***: Woodpecker masks only the secrets it holds, so
+#                         anything that may print a masked value goes through it
+#   ci_summary            appends stdin to the run's summary: GitHub's step summary, else the log
 #   ci_event              push | pull_request | manual | cron | other
-#   ci_branch             the branch pushed or targeted, or empty
-#   ci_on_main_push       true when this run is a push to main (a release's call of ci.yml is one)
 
 ci_error() {
     if [ "${GITHUB_ACTIONS:-}" = true ]; then echo "::error::$*"; else echo "error: $*" >&2; fi
@@ -18,15 +18,25 @@ ci_warning() {
     if [ "${GITHUB_ACTIONS:-}" = true ]; then echo "::warning::$*"; else echo "warning: $*" >&2; fi
 }
 
+CI_MASKED=()
 ci_mask() {
-    if [ "${GITHUB_ACTIONS:-}" = true ]; then echo "::add-mask::$1"; fi
+    if [ "${GITHUB_ACTIONS:-}" = true ]; then echo "::add-mask::$1"; else CI_MASKED+=("$1"); fi
+}
+
+# Values are hex (a key from `openssl rand -hex`); anything else is refused, as sed's pattern
+# would otherwise need escaping.
+ci_redact() {
+    local script=() v
+    for v in ${CI_MASKED[@]+"${CI_MASKED[@]}"}; do
+        [[ "$v" =~ ^[0-9A-Fa-f]{16,}$ ]] || { ci_error "ci_redact: a masked value must be at least 16 hex characters"; return 1; }
+        script+=(-e "s/${v}/***/g" -e "s/${v:0:16}/***/g")
+    done
+    if [ "${#script[@]}" -eq 0 ]; then cat; else sed -u "${script[@]}"; fi
 }
 
 ci_summary() {
     if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
         cat >> "$GITHUB_STEP_SUMMARY"
-    elif [ -n "${CI_SUMMARY:-}" ]; then
-        cat >> "$CI_SUMMARY"
     else
         sed 's/^/summary: /'
     fi
@@ -42,16 +52,4 @@ ci_event() {
         # A release's call of ci.yml (workflow_call) reports its caller's event, a push.
         *) echo other ;;
     esac
-}
-
-ci_branch() {
-    if [ "${GITHUB_ACTIONS:-}" = true ]; then
-        case "${GITHUB_REF:-}" in refs/heads/*) echo "${GITHUB_REF#refs/heads/}" ;; esac
-    else
-        echo "${CI_COMMIT_BRANCH:-}"
-    fi
-}
-
-ci_on_main_push() {
-    [ "$(ci_event)" = push ] && [ "$(ci_branch)" = main ]
 }
