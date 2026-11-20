@@ -102,12 +102,12 @@ jobs:
           persist-credentials: false
 
       # GitHub's runners start empty: the pinned toolchain is restored from Actions' cache, keyed by
-      # download.sh's hash, where INSTALL_ZIG looks for it (P147e).
+      # download.sh's hash, where ci/install_zig.sh looks for it (P147e).
       - uses: actions/cache@v4
         if: needs.changes.outputs.code != 'false'
         with:
           path: ~/.cache/nerva-toolchain
-          key: nerva-toolchain-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
+          key: nerva-toolchain-v2-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
 
       - name: Install the pinned Zig
         if: needs.changes.outputs.code != 'false'
@@ -148,12 +148,12 @@ jobs:
           persist-credentials: false
 
       # GitHub's runners start empty: the pinned toolchain is restored from Actions' cache, keyed by
-      # download.sh's hash, where INSTALL_ZIG looks for it (P147e).
+      # download.sh's hash, where ci/install_zig.sh looks for it (P147e).
       - uses: actions/cache@v4
         if: needs.changes.outputs.code != 'false'
         with:
           path: ~/.cache/nerva-toolchain
-          key: nerva-toolchain-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
+          key: nerva-toolchain-v2-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
 
       - name: Install the pinned Zig
         if: needs.changes.outputs.code != 'false'
@@ -187,12 +187,12 @@ jobs:
           persist-credentials: false
 
       # GitHub's runners start empty: the pinned toolchain is restored from Actions' cache, keyed by
-      # download.sh's hash, where INSTALL_ZIG looks for it (P147e).
+      # download.sh's hash, where ci/install_zig.sh looks for it (P147e).
       - uses: actions/cache@v4
         if: needs.changes.outputs.code != 'false'
         with:
           path: ~/.cache/nerva-toolchain
-          key: nerva-toolchain-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
+          key: nerva-toolchain-v2-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
 
       - name: Install the pinned Zig
         if: needs.changes.outputs.code != 'false'
@@ -226,12 +226,12 @@ jobs:
           persist-credentials: false
 
       # GitHub's runners start empty: the pinned toolchain is restored from Actions' cache, keyed by
-      # download.sh's hash, where INSTALL_ZIG looks for it (P147e).
+      # download.sh's hash, where ci/install_zig.sh looks for it (P147e).
       - uses: actions/cache@v4
         if: needs.changes.outputs.code != 'false'
         with:
           path: ~/.cache/nerva-toolchain
-          key: nerva-toolchain-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
+          key: nerva-toolchain-v2-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
 
       - name: Install the pinned Zig
         if: needs.changes.outputs.code != 'false'
@@ -274,12 +274,12 @@ jobs:
           persist-credentials: false
 
       # GitHub's runners start empty: the pinned toolchain is restored from Actions' cache, keyed by
-      # download.sh's hash, where INSTALL_ZIG looks for it (P147e).
+      # download.sh's hash, where ci/install_zig.sh looks for it (P147e).
       - uses: actions/cache@v4
         if: needs.changes.outputs.code != 'false'
         with:
           path: ~/.cache/nerva-toolchain
-          key: nerva-toolchain-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
+          key: nerva-toolchain-v2-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
 
       - name: Install the pinned Zig
         if: needs.changes.outputs.code != 'false'
@@ -727,12 +727,12 @@ jobs:
           persist-credentials: false
 
       # GitHub's runners start empty: the pinned toolchain is restored from Actions' cache, keyed by
-      # download.sh's hash, where INSTALL_ZIG looks for it (P147e).
+      # download.sh's hash, where ci/install_zig.sh looks for it (P147e).
       - uses: actions/cache@v4
         if: needs.changes.outputs.code != 'false'
         with:
           path: ~/.cache/nerva-toolchain
-          key: nerva-toolchain-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
+          key: nerva-toolchain-v2-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
 
       - name: Install the pinned Zig
         if: needs.changes.outputs.code != 'false'
@@ -772,12 +772,12 @@ jobs:
           persist-credentials: false
 
       # GitHub's runners start empty: the pinned toolchain is restored from Actions' cache, keyed by
-      # download.sh's hash, where INSTALL_ZIG looks for it (P147e).
+      # download.sh's hash, where ci/install_zig.sh looks for it (P147e).
       - uses: actions/cache@v4
         if: needs.changes.outputs.code != 'false'
         with:
           path: ~/.cache/nerva-toolchain
-          key: nerva-toolchain-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
+          key: nerva-toolchain-v2-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
 
       - name: Install the pinned Zig
         if: needs.changes.outputs.code != 'false'
@@ -818,12 +818,12 @@ jobs:
       # The list above must stay the one test:demo runs (build.zig); ci/job.sh demo checks it.
 
       # GitHub's runners start empty: the pinned toolchain is restored from Actions' cache, keyed by
-      # download.sh's hash, where INSTALL_ZIG looks for it (P147e).
+      # download.sh's hash, where ci/install_zig.sh looks for it (P147e).
       - uses: actions/cache@v4
         if: needs.changes.outputs.code != 'false'
         with:
           path: ~/.cache/nerva-toolchain
-          key: nerva-toolchain-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
+          key: nerva-toolchain-v2-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
 
       - name: Install the pinned Zig
         if: needs.changes.outputs.code != 'false'
@@ -859,12 +859,12 @@ jobs:
           persist-credentials: false
 
       # GitHub's runners start empty: the pinned toolchain is restored from Actions' cache, keyed by
-      # download.sh's hash, where INSTALL_ZIG looks for it (P147e).
+      # download.sh's hash, where ci/install_zig.sh looks for it (P147e).
       - uses: actions/cache@v4
         if: needs.changes.outputs.code != 'false'
         with:
           path: ~/.cache/nerva-toolchain
-          key: nerva-toolchain-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
+          key: nerva-toolchain-v2-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
 
       - name: Install the pinned Zig
         if: needs.changes.outputs.code != 'false'
@@ -901,12 +901,12 @@ jobs:
           persist-credentials: false
 
       # GitHub's runners start empty: the pinned toolchain is restored from Actions' cache, keyed by
-      # download.sh's hash, where INSTALL_ZIG looks for it (P147e).
+      # download.sh's hash, where ci/install_zig.sh looks for it (P147e).
       - uses: actions/cache@v4
         if: needs.changes.outputs.code != 'false'
         with:
           path: ~/.cache/nerva-toolchain
-          key: nerva-toolchain-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
+          key: nerva-toolchain-v2-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
 
       - name: Install the pinned Zig
         if: needs.changes.outputs.code != 'false'
@@ -945,12 +945,12 @@ jobs:
           persist-credentials: false
 
       # GitHub's runners start empty: the pinned toolchain is restored from Actions' cache, keyed by
-      # download.sh's hash, where INSTALL_ZIG looks for it (P147e).
+      # download.sh's hash, where ci/install_zig.sh looks for it (P147e).
       - uses: actions/cache@v4
         if: needs.changes.outputs.code != 'false'
         with:
           path: ~/.cache/nerva-toolchain
-          key: nerva-toolchain-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
+          key: nerva-toolchain-v2-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
 
       - name: Install the pinned Zig
         if: needs.changes.outputs.code != 'false'
@@ -992,12 +992,12 @@ jobs:
           persist-credentials: false
 
       # GitHub's runners start empty: the pinned toolchain is restored from Actions' cache, keyed by
-      # download.sh's hash, where INSTALL_ZIG looks for it (P147e).
+      # download.sh's hash, where ci/install_zig.sh looks for it (P147e).
       - uses: actions/cache@v4
         if: needs.changes.outputs.code != 'false'
         with:
           path: ~/.cache/nerva-toolchain
-          key: nerva-toolchain-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
+          key: nerva-toolchain-v2-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
 
       - name: Install the pinned Zig
         if: needs.changes.outputs.code != 'false'

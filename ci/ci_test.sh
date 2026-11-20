@@ -107,25 +107,28 @@ if [ "$(id -u)" != 0 ]; then
     chmod u+w "$c/main"
 fi
 
-# A branch's cache is a plain copy of main's: not a link, and writing it leaves main's alone.
+# A branch's zig/ is a plain copy of main's (not a link, and writing it leaves main's alone);
+# main's zig-local, which a build may be writing, is not copied.
 echo seed >"$c/main/zig-local/entry"
+echo seed >"$c/main/zig/entry"
 (
     . ci/cache.sh
     ci_branch_prepare "$c" feature/one
     echo "$CI_BRANCH_DIR" >"$tmp/dir1"
 )
 d1=$(cat "$tmp/dir1")
-is "branch cache seeded" seed "$(cat "$d1/zig-local/entry")"
-is "branch cache is a copy, not a link" 1 "$(stat -c %h "$d1/zig-local/entry")"
-echo changed >>"$d1/zig-local/entry"
-is "main untouched by a branch" seed "$(cat "$c/main/zig-local/entry")"
+is "branch cache seeded" seed "$(cat "$d1/zig/entry")"
+is "main's zig-local is not copied" "" "$(ls -A "$d1/zig-local")"
+is "branch cache is a copy, not a link" 1 "$(stat -c %h "$d1/zig/entry")"
+echo changed >>"$d1/zig/entry"
+is "main untouched by a branch" seed "$(cat "$c/main/zig/entry")"
 # Main's cache over the seed limit: the branch starts empty (du rounds up to a whole GiB).
 (
     . ci/cache.sh
     CI_BRANCH_SEED_MAX_GIB=0 ci_branch_prepare "$c" feature/two 2>/dev/null
     echo "$CI_BRANCH_DIR" >"$tmp/dir2"
 )
-is "oversize main is not copied" "" "$(ls -A "$(cat "$tmp/dir2")/zig-local")"
+is "oversize main is not copied" "" "$(ls -A "$(cat "$tmp/dir2")/zig")"
 # Bounded: only the newest CI_BRANCH_CACHES others stay, and one a job holds is never removed.
 for i in 1 2 3 4 5 6; do
     mkdir "$c/branches/b-old$i-0000000$i"

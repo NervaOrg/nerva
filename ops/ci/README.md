@@ -309,7 +309,7 @@ set:
    `main/` holds the pinned Zig's archive (`tools/<sha256>.tar.xz`, checked on every use), Zig's
    global cache and a `.zig-cache` copy, written only by a push to `main` (its steps mount it
    writable; every other step mounts it `:ro`). `branches/<key>/` is one branch's own copy,
-   seeded from main's, at most 8 of them, 12 GiB and 7 days each. Jobs hold a shared `flock`
+   seeded with a copy of main's global Zig cache (`zig/`; `zig-local/` starts empty), at most 8 of them, 12 GiB and 7 days each. Jobs hold a shared `flock`
    on what they use. Below 60 GiB free (`CI_FREE_MIN_GIB`), a job for `main` waits up to 10
    minutes (`CI_PRUNE_WAIT`) to hold `main/` alone and empties its Zig caches (never the
    toolchain), and a branch job empties every branch cache no job is using. A lock that stays busy
@@ -320,7 +320,8 @@ set:
    `rm -rf /var/cache/nerva-ci/main/zig /var/cache/nerva-ci/main/zig-local` main's Zig caches. The
    next jobs make them again. Do not delete `main/tools` unless the archive is damaged: a job
    checks it by its sha256 and downloads it again anyway (NRV-W1201). A pipeline killed half way
-   leaves a `branches/*.partial.*` directory, which the next prune removes.
+   leaves a `branches/*.partial.*` directory, which the next prune removes. A branch whose builds fail with
+   `FileNotFound` has a half-written `zig-local`: `rm -rf /var/cache/nerva-ci/branches/b-<key>-*`.
 5. **GitHub statuses:** each workflow reports as `ci/woodpecker/push/<file>`, for example
    `ci/woodpecker/push/check` or `ci/woodpecker/push/demo/1`. Whether any of them becomes a
    required check on `main` is the owner's choice. GitHub's own checks stay required either

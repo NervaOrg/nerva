@@ -33,10 +33,11 @@ container on that daemon without a profile of its own; the box runs CI and nothi
   (another branch, a manual run, a cron run, a run of main that is not a push) mounts `main/`
   read-only (`:ro`) and `branches/` writable. The two steps of each workflow are exclusive by
   `when:` (`event: push, branch: main` against its negation), so no pipeline gets both.
-- A branch has its own caches: a plain copy of main's Zig caches made when the branch's cache is
+- A branch has its own caches: a plain copy of main's global Zig cache (`zig/`; not `zig-local/`,
+  which a build of main may be writing, so a branch starts it empty) made when the branch's cache is
   first needed (not made if main's is over 6 GiB; the branch then starts empty), bounded in count
   (8), age (7 days) and size (12 GiB each), pruned under a lock that skips a cache another job is
-  using. Nothing a branch writes is read by main or by another branch.
+  using. Nothing a branch writes is read by main. A branch's cache is not shielded from other branches (see "What remains trusted").
 - The toolchain is never trusted by name. Every use copies the archive from `main/tools/<sha256>.tar.xz`
   into the job's own `zig/cache` and runs `zig/download.sh`, which checks it against the sha256
   pinned in the repository and downloads it again on a mismatch (NRV-W1201). Each job unpacks into
@@ -66,7 +67,11 @@ with Docker's default capabilities, on the host's network when the step asks for
 (Allow pull requests is off; the workflows match `push` and `manual` only). The Jepsen workflow
 mounts the host's Docker socket, which is root on the box in all but name, for the five node
 containers it drives; it runs for a push to a `jepsen/**` branch or a manual run, and so for anyone
-who can push one. Main's cache holds only what a push to main built, but a pusher who bypasses the
+who can push one. **A job can write every branch's cache, not only its own:** `branches/` is
+mounted writable in every step that is not for main, and each `branches/<key>/` belongs to the same
+`ci` user, so a compromised dependency or test in branch X's job can decide what branch Y's next
+run executes. Separate users or mounts per branch would be needed to stop it; it is not done. Main's
+cache holds only what a push to main built, but a pusher who bypasses the
 mount can plant entries main's builds then use: releases are built by GitHub's `release.yml`, not
 here, so this reaches main's CI result, not a release. The owner decides who has write access to the
 repository, and that is the trust boundary of this box.

@@ -21,6 +21,10 @@ set -euo pipefail
 
 fail() { echo "nerva-woodpecker: FAIL $*" >&2; exit 1; }
 say() { echo "nerva-woodpecker: $*"; }
+io_uring_probe() { # a throwaway container on the pinned image: io_uring_setup (425) under the daemon's own profile
+    docker run --rm docker.io/library/ubuntu:24.04@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8 \
+        perl -e 'exit(syscall(425, 1, "\0" x 120) < 0 ? 1 : 0)' >/dev/null 2>&1
+}
 
 host() {
     [ "$(id -u)" = 0 ] || fail "run as root: ssh -t root@BOX bash nerva-woodpecker.sh host"
@@ -41,10 +45,8 @@ host() {
     fi
 
     # No step is privileged, so io_uring needs the daemon's own profile (ops/ci/docker/README.md).
-    if ! { grep -q '"seccomp-profile"' /etc/docker/daemon.json 2>/dev/null &&
-        docker info --format '{{json .SecurityOptions}}' | grep -q seccomp; }; then
-        fail "Docker has no io_uring seccomp profile: run woodpecker-bootstrap.sh again, from the directory that holds docker/seccomp-io_uring.json (NRV-E1201)"
-    fi
+    io_uring_probe ||
+        fail "NRV-E1201: a throwaway container cannot create an io_uring: the daemon does not run the profile ops/ci/docker/seccomp-io_uring.json; run woodpecker-bootstrap.sh again, from the directory that holds docker/seccomp-io_uring.json"
 
     # The caches the workflows mount (.woodpecker/*.yaml); uid 1001 is the `ci` user the jobs run
     # as. main/ is written only by pipelines for a push to main, which mount it writable; the others

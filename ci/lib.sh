@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Sourced by ci/*.sh. What a CI script needs from the system running it, in one place, so the
 # scripts run the same under GitHub Actions, Woodpecker or a shell (ops/ci/README.md, "Nerva on Woodpecker").
 #

@@ -62,7 +62,6 @@ case "$job" in check | check-scripts | check-packages) ci/install_repo_tools.sh 
 id "$user" >/dev/null 2>&1 || useradd --create-home --uid 1001 --user-group "$user"
 chown -R "$user:$user" "$PWD"
 ci_cache_check "$role" "$cache" || exit 1
-[ -d "$cache" ] || { ci_error "NRV-E1202: $cache is not mounted"; exit 1; }
 
 # One Jepsen run at a time on a machine: run.sh's containers, network and subnet have fixed names.
 # Taken before the cache lock, so a queued run does not hold up a prune, and bounded. Each run's
@@ -87,7 +86,8 @@ if [ "$job" = jepsen ]; then
     usermod -aG "$(getent group "$gid" | cut -d: -f1)" "$user"
     # Docker's static client, pinned: its archive is kept in the jepsen cache, checked on every use.
     ci/docker_client.sh 29.9.3 3fb5d1f13014c18cc54945bc177c58a9056a482dada031e17d12cf2e6922c973 "$cache/jepsen/tools"
-    export JEPSEN_OUT="$cache/jepsen/$(date -u +%Y%m%dT%H%M%SZ)-${CI_PIPELINE_NUMBER:-local}"
+    stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    export JEPSEN_OUT="$cache/jepsen/$stamp-${CI_PIPELINE_NUMBER:-local}"
     install -d -o "$user" -g "$user" "$JEPSEN_OUT"
     echo "jepsen: the store and memory record go to /var/cache/nerva-ci/${JEPSEN_OUT#"$cache"/} on the host"
 fi

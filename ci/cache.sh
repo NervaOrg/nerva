@@ -109,21 +109,29 @@ ci_branch_prepare() {
     else
         ci_warning "NRV-W1202: could not take the branch caches' lock in ${CI_LOCK_WAIT:-300} s; $key runs without seeding or pruning"
     fi
-    if [ ! -d "$dir" ]; then
-        partial="$dir.partial.$$"
-        mkdir -p "$partial"
-        if [ "$locked" = yes ] && [ "$(ci_dir_gib "$root/main/zig" "$root/main/zig-local")" -le "$seedgib" ]; then
-            # A plain copy: a hard link would let a branch write main's inode.
-            cp -a "$root/main/zig-local" "$partial/" 2>/dev/null || true
-            cp -a "$root/main/zig" "$partial/" 2>/dev/null || true
-        elif [ "$locked" = yes ]; then
-            echo "main's cache is over $seedgib GiB: branch $key starts empty" >&2
-        fi
-        mkdir -p "$partial/zig" "$partial/zig-local"
-        mv "$partial" "$dir"
-    fi
+    # Our own shared lock first, then the test: a prune by a job that holds fd 7 skips a cache whose
+    # lock is held, so it cannot delete $dir between the test and the use (NRV-W1202 path too).
     exec 6>>"$b/$key.lock"
     flock -s 6
+    if [ ! -d "$dir" ]; then
+        if [ "$locked" = yes ]; then
+            partial="$dir.partial.$$"
+            mkdir -p "$partial"
+            # Only the toolchain's global cache is copied (a plain copy: a hard link would let a
+            # branch write main's inode). Main's zig-local may be half written by a build running
+            # now, and the branch would keep that for days; it starts empty and fills itself.
+            if [ "$(ci_dir_gib "$root/main/zig")" -le "$seedgib" ]; then
+                cp -a "$root/main/zig" "$partial/" 2>/dev/null || true
+            else
+                echo "main's cache is over $seedgib GiB: branch $key starts empty" >&2
+            fi
+            mkdir -p "$partial/zig" "$partial/zig-local"
+            mv "$partial" "$dir"
+        else
+            # No lock on the branches' directory: no shared partial directory a prune could remove.
+            mkdir -p "$dir/zig" "$dir/zig-local"
+        fi
+    fi
     [ "$locked" != yes ] || flock -u 7
     touch "$dir"
     CI_BRANCH_DIR="$dir" # not printed: a command substitution would drop the lock with its shell

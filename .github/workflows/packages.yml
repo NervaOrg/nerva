@@ -60,7 +60,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ~/.cache/nerva-toolchain
-          key: nerva-toolchain-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
+          key: nerva-toolchain-v2-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
 
       - name: Install the pinned Zig
         run: ci/install_zig.sh
@@ -97,7 +97,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ~/.cache/nerva-toolchain
-          key: nerva-toolchain-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
+          key: nerva-toolchain-v2-${{ runner.os }}-${{ hashFiles('zig/download.sh') }}
 
       - name: Install the pinned Zig
         run: ci/install_zig.sh
