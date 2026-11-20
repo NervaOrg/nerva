@@ -344,7 +344,10 @@ refuses NRV-E1216 "host: docker is down" nw FAKE_DOCKER=down -- host
 refuses NRV-E1216 "host: no agent container" nw FAKE_DOCKER=noagent -- host
 nodocker="$tmp/nodocker"
 mkdir "$nodocker"
-for t in id dirname readlink; do ln -s "$(command -v $t)" "$nodocker/$t"; done
+for t in dirname readlink; do ln -s "$(command -v $t)" "$nodocker/$t"; done
+# A stub id stands in for root, so the root check passes and the docker check is what refuses.
+printf '#!/bin/sh\necho 0\n' >"$nodocker/id"
+chmod +x "$nodocker/id"
 refuses NRV-E1216 "host: no docker" env PATH="$nodocker" "$(command -v bash)" ops/ci/nerva-woodpecker.sh host
 refuses NRV-E1217 "host: no /dev/fuse" nw FAKE_DOCKER=ok NERVA_CI_DEV="$tmp/nodev" -- host
 mkdir "$tmp/notroot"
