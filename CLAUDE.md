@@ -130,6 +130,9 @@ own, named by its number.
   write a new one with `amends` or `supersedes`. The earlier text stays as it was.
 - Nothing builds an index yet. To learn what has been decided, read every file
   in `docs/decisions/`.
+- **Pull requests on `NervaOrg/nerva` use the prefix `O`** (O2): `docs/decisions/O<number>-<slug>.md`,
+  cited as `O<number>`, and `worklog/O<number>.md`. Its pull request numbers restart at 1, and the
+  `P` and bare numbers already in the tree are the old `NervaLog/nerva` tracker's.
 
 ### Change notes
 
@@ -340,7 +343,7 @@ work done.
 - There is no Docker, so Jepsen does not run here; it runs on the R1 host.
 - The session proxy cannot reach Cloudflare (the dashboard, the API, `nerva.pro`'s settings); the
   owner does those steps (docs/releases/packages.md, "Setup").
-- The repository lives at `NervaOrg/nerva` (P<move>). It was `Botpike/nerva-ledger`, then
+- The repository lives at `NervaOrg/nerva` (O2). It was `Botpike/nerva-ledger`, then
   `NervaLog/nerva`, whose owning account is suspended: its issues, pull requests, Actions runs,
   releases and secrets are unreachable. A `NervaLog/nerva#N` or `#N` in a file written before the
   move names that old tracker, not this one. File issues on `NervaOrg/nerva`.
