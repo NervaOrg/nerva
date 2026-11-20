@@ -2,9 +2,11 @@
 # Forgejo on one small box (Ubuntu 24.04 or Debian 12/13, x86_64 or arm64): the signed release
 # binary, SQLite, its own TLS through Let's Encrypt, its own SSH server for git on another port
 # than the box's sshd, registration closed, a nightly `forgejo dump`, and optionally pull mirrors
-# of GitHub repositories. Run it as root on the box:
+# of GitHub repositories. Run it as root on the box, from the repository root on your laptop
+# first copying it there (it lands at ~/forgejo-bootstrap.sh):
 #
-#   bash forgejo-bootstrap.sh
+#   scp ops/forgejo/forgejo-bootstrap.sh root@BOX:
+#   ssh -t root@BOX bash forgejo-bootstrap.sh
 #
 # It asks for what it does not have yet and keeps the answers in /etc/forgejo-setup/forgejo.env
 # (not secret). Safe to run again: it asks only for what is missing and changes only what differs.

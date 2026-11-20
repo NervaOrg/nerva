@@ -2,8 +2,15 @@
 # Woodpecker CI on one Ubuntu 24.04 box: Docker, the Woodpecker server, one agent and Caddy (TLS
 # from Let's Encrypt), for any project on GitHub or on a Forgejo. Run it as root on the box:
 #
-#   bash woodpecker-bootstrap.sh            the server and an agent on this box
-#   bash woodpecker-bootstrap.sh agent      only an agent, on another box, for an existing server
+# Run from the repository root, after `scp -r ops/ci root@BOX:` (the whole directory, which lands
+# at ~/ci/ on the box; the script needs docker/seccomp-io_uring.json and io_uring_probe.sh beside it):
+#
+#   bash ci/woodpecker-bootstrap.sh            the server and an agent on this box
+#   bash ci/woodpecker-bootstrap.sh agent      only an agent, on another box, for an existing server
+#
+# The box gets Docker's io_uring seccomp profile, which Nerva's CI needs (decision O4). For a
+# project that does not need io_uring: CI_SECCOMP=no bash ci/woodpecker-bootstrap.sh (Docker then
+# keeps its default profile, and Nerva's steps fail NRV-E1201).
 #
 # It asks for what it does not have yet and keeps the answers in /etc/woodpecker/ (ci.env, not
 # secret; the secret files beside it are 0640 and never put on a command line). Safe to run again:
@@ -51,6 +58,18 @@ case "$mode" in server | agent) ;; *) fail "unknown mode '$mode' (server or agen
 . /etc/os-release
 [ "${ID:-}" = ubuntu ] && [ "${VERSION_ID:-}" = 24.04 ] ||
     fail "this script is written for Ubuntu 24.04, found ${PRETTY_NAME:-unknown}"
+# Everything the profile step needs is checked here, before the script changes anything.
+here="$(dirname "$(readlink -f "$0")")"
+seccomp_src="$here/docker/seccomp-io_uring.json"
+probe="$here/io_uring_probe.sh"
+seccomp="${CI_SECCOMP:-yes}"
+case "$seccomp" in yes | no) ;; *) fail "CI_SECCOMP='$seccomp' is not yes or no" ;; esac
+if [ "$seccomp" = yes ]; then
+    for f in "$seccomp_src" "$probe"; do
+        [ -f "$f" ] ||
+            fail "NRV-E1213: $f is missing: run this from a copy of the whole ops/ci/ directory (scp -r ops/ci root@BOX:, then bash ci/woodpecker-bootstrap.sh), or CI_SECCOMP=no for a project that does not need io_uring"
+    done
+fi
 modprobe kvm_amd 2>/dev/null || modprobe kvm_intel 2>/dev/null || true
 if ! command -v jq >/dev/null || ! command -v curl >/dev/null; then
     DEBIAN_FRONTEND=noninteractive apt-get update -q
@@ -214,13 +233,12 @@ systemctl enable -q --now docker
 # must not be privileged for it (decision O4), so the daemon gets Docker's default profile plus
 # the three io_uring syscalls (ops/ci/docker/README.md): it then applies to every container the
 # daemon creates without a profile of its own, the Woodpecker steps included. Only when the profile
-# sits beside this script. Idempotent: the daemon restarts only if the profile or daemon.json
+# sits beside this script (checked in Preflight; CI_SECCOMP=no skips it). Idempotent: the daemon restarts only if the profile or daemon.json
 # changed, and a restart stops running containers (restart: unless-stopped brings them back; a
 # running pipeline fails), so rerun it when the agent is idle.
-seccomp_src="$(dirname "$(readlink -f "$0")")/docker/seccomp-io_uring.json"
 seccomp_dst=/etc/docker/seccomp-io_uring.json
 daemon_json=/etc/docker/daemon.json
-if [ -f "$seccomp_src" ]; then
+if [ "$seccomp" = yes ]; then
     jq -e '.syscalls | map(select(.names | index("io_uring_setup"))) | length > 0' "$seccomp_src" >/dev/null ||
         fail "$seccomp_src does not allow io_uring_setup"
     install -d -m 0755 /etc/docker
@@ -238,13 +256,10 @@ if [ -f "$seccomp_src" ]; then
         step "Docker $(docker version --format '{{.Server.Version}}'): installing the io_uring seccomp profile, restarting Docker"
         systemctl restart docker
     fi
-    probe="$(dirname "$(readlink -f "$0")")/io_uring_probe.sh"
-    [ -f "$probe" ] ||
-        fail "NRV-E1213: $probe is missing: run this from a copy of ops/ci/ that has io_uring_probe.sh and docker/ beside it (scp -r ops/ci root@BOX:)"
     msg=$(bash "$probe" 2>&1) ||
         fail "$msg (docker info: $(docker info --format '{{json .SecurityOptions}}'))"
 else
-    step "no $seccomp_src: Docker keeps its default seccomp profile, which refuses io_uring (Nerva's CI steps will fail NRV-E1201)"
+    step "CI_SECCOMP=no: Docker keeps its default seccomp profile, which refuses io_uring (Nerva's CI steps will fail NRV-E1201)"
 fi
 if [ "$CI_KVM" = yes ]; then
     grep -q AMD /proc/cpuinfo && echo kvm_amd > /etc/modules-load.d/woodpecker-kvm.conf ||

@@ -57,9 +57,13 @@ ci_dir_gib() {
 
 # ci_branch_prune BRANCHES KEEP MAXN MAXDAYS MAXGIB: removes the branch caches nobody is using
 # (no job holds its lock) that are beyond the MAXN most recent, older than MAXDAYS days or larger
-# than MAXGIB GiB. KEEP, the caller's own, is never removed. Call with the branches lock held.
+# than MAXGIB GiB. KEEP, the caller's own, is never removed and counts
+# against MAXN. Call with the branches lock held.
 ci_branch_prune() {
     local b="$1" keep="$2" maxn="$3" maxdays="$4" maxgib="$5" d name n=0 drop
+    # KEEP takes one of the MAXN places (it is made right after, if it is not there yet), so MAXN
+    # is the most there are, KEEP included.
+    n=1
     rm -rf "$b"/*.partial.* 2>/dev/null || true # a killed seed's; seeds run under the lock
     while IFS= read -r d; do
         d=${d%/}
@@ -131,13 +135,15 @@ ci_branch_prepare() {
             mkdir -p "$partial/zig" "$partial/zig-local"
             # -T: if a job without the lock filled $dir meanwhile, keep its directory and drop the seed.
             mv -T "$partial" "$dir" 2>/dev/null || rm -rf "$partial"
-            [ -d "$dir" ] || { ci_error "NRV-E1214: $dir is not a directory: remove it"; return 1; }
         else
             # No lock on the branches' directory: no shared partial directory a prune could remove.
-            mkdir -p "$dir/zig" "$dir/zig-local"
+            mkdir -p "$dir/zig" "$dir/zig-local" 2>/dev/null || true
         fi
     fi
+    # The branches' lock is let go before anything can return: seeding is done, or never started.
     [ "$locked" != yes ] || flock -u 7
+    # Whichever way $dir was made (or not), it must be a directory now (a file there is the box's damage).
+    [ -d "$dir" ] || { ci_error "NRV-E1214: $dir is not a directory: remove it"; return 1; }
     touch "$dir"
     # shellcheck disable=SC2034 # read by ci/woodpecker_step.sh
     CI_BRANCH_DIR="$dir" # not printed: a command substitution would drop the lock with its shell

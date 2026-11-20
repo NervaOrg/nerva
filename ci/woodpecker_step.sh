@@ -13,8 +13,10 @@
 #     pruned. Every job holds a shared lock on main/.lock; below CI_FREE_MIN_GIB free (default 60),
 #     a main job waits up to CI_PRUNE_WAIT seconds (600) to hold it alone and empties main's Zig
 #     caches (never the pinned toolchain), and a branch job empties the branch caches nobody uses.
-#   - Each job has a timeout (75 minutes; 330 for the long searches), see the `case` below.
+#   - Each job has a timeout (75 minutes; 330 for the long searches; CI_STEP_MINUTES replaces it),
+#     see the `case` below; one that runs past it fails NRV-E1215.
 set -euo pipefail
+. ci/lib.sh
 
 job="${1:?usage: ci/woodpecker_step.sh <job> [arg]}"
 arg="${2:-}"
@@ -34,6 +36,9 @@ case "$job" in
     fuzz-long | vopr-long) minutes=330 ;;
     *) minutes=75 ;;
 esac
+# CI_STEP_MINUTES (a pipeline variable) replaces it for a run.
+minutes="${CI_STEP_MINUTES:-$minutes}"
+[[ "$minutes" =~ ^[1-9][0-9]*$ ]] || { ci_error "NRV-E1208: CI_STEP_MINUTES='$minutes' is not a whole number of minutes"; exit 2; }
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get -o Acquire::Retries=5 update -qq
@@ -92,8 +97,11 @@ if [ "$job" = jepsen ]; then
     echo "jepsen: the store and memory record go to /var/cache/nerva-ci/${JEPSEN_OUT#"$cache"/} on the host"
 fi
 
+# main/ is mounted in every role (writable for main, :ro for a branch); /cache itself is only the
+# container's own directory, so it would measure the container's filesystem, not the box's cache.
+cache_fs="$cache/main"
 low=no
-[ "$(df --output=avail -B1G "$cache" | tail -1 | tr -d ' ')" -ge "$free_min_gib" ] || low=yes
+[ "$(df --output=avail -B1G "$cache_fs" | tail -1 | tr -d ' ')" -ge "$free_min_gib" ] || low=yes
 if [ "$role" = main ]; then
     touch "$cache/main/.lock"
     chown "$user:$user" "$cache/main/.lock"
@@ -113,18 +121,15 @@ else
     chown "$user:$user" "$base" "$base/zig" "$base/zig-local"
     toolchain_write=0
 fi
-df -h "$cache" . | sed 's/^/  /'
+df -h "$cache_fs" . | sed 's/^/  /'
 
-as_ci() {
-    setpriv --reuid "$user" --regid "$user" --init-groups \
-        env HOME="/home/$user" USER="$user" CI_CACHE_SHARED=1 \
-        ZIG_GLOBAL_CACHE_DIR="$base/zig" ZIG_LOCAL_CACHE_DIR="$base/zig-local" \
-        CI_TOOLCHAIN_DIR="$cache/main/tools" CI_TOOLCHAIN_WRITE="$toolchain_write" "$@"
-}
+# The command prefix that runs something as `ci`, with the caches' environment.
+as_ci=(setpriv --reuid "$user" --regid "$user" --init-groups
+    env HOME="/home/$user" USER="$user" CI_CACHE_SHARED=1
+    ZIG_GLOBAL_CACHE_DIR="$base/zig" ZIG_LOCAL_CACHE_DIR="$base/zig-local"
+    CI_TOOLCHAIN_DIR="$cache/main/tools" CI_TOOLCHAIN_WRITE="$toolchain_write")
 
-as_ci ci/install_zig.sh
+"${as_ci[@]}" ci/install_zig.sh
 status=0
-as_ci timeout --kill-after=60 "$((minutes * 60))" ci/job.sh "$job" ${arg:+"$arg"} || status=$?
-[ "$status" != 124 ] || echo "error: $job ran past its $minutes minutes" >&2
-
+ci_run_timed "$job" "$((minutes * 60))" "${as_ci[@]}" ci/job.sh "$job" ${arg:+"$arg"} || status=$?
 exit "$status"

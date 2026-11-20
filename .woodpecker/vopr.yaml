@@ -22,16 +22,8 @@ when:
       exclude: main
     evaluate: 'NERVA_RUN == ""'
 
+# (main runs vopr-main.yaml, so there is no main step here.)
 steps:
-  - name: vopr (${SEED}) (main)
-    image: docker.io/library/ubuntu:24.04@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8
-    commands:
-      - ci/woodpecker_step.sh vopr "${SEED}"
-    when:
-      - event: push
-        branch: main
-    volumes:
-      - /var/cache/nerva-ci/main:/cache/main
   - name: vopr (${SEED})
     image: docker.io/library/ubuntu:24.04@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8
     commands:

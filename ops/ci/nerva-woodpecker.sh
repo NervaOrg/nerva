@@ -2,69 +2,80 @@
 # Nerva's part of the Woodpecker setup, after woodpecker-bootstrap.sh (README.md, "Nerva on
 # Woodpecker"). Two modes:
 #
-#   On every agent box, as root:
-#     bash nerva-woodpecker.sh host     (from a copy of the whole ops/ci/ directory)
+# Run from the repository root; every path below is spelled from there.
+#
+#   On every agent box, as root (after `scp -r ops/ci root@BOX:`, which puts the directory at
+#   ~/ci/ on the box):
+#     bash ci/nerva-woodpecker.sh host
 #   Checks Docker (and that its daemon carries the io_uring seccomp profile, which
 #   woodpecker-bootstrap.sh installs), /dev/fuse and /dev/kvm, and creates the cache directories
 #   under /var/cache/nerva-ci (main, branches and jepsen: decision O4).
 #
 #   On your laptop (needs curl and jq), with a personal token from Woodpecker (your avatar, then
 #   Personal access token):
-#     WOODPECKER_SERVER=https://ci.example.org WOODPECKER_TOKEN=... bash nerva-woodpecker.sh repo OWNER/NAME
+#     WOODPECKER_SERVER=https://ci.example.org WOODPECKER_TOKEN=... bash ops/ci/nerva-woodpecker.sh repo OWNER/NAME
 #   Enables the repository if it is not yet, then sets: pull requests off, approval for forks,
 #   a 360-minute timeout, and Trusted for volumes and network (not security: no step is
 #   privileged, decision O4). It reads the settings back and fails if any did not take.
 #
 # Both modes can run again: each only changes what is not yet as it should be. The last line is
-# `nerva-woodpecker: OK ...` or `nerva-woodpecker: FAIL ...`.
+# `nerva-woodpecker: OK ...` or `nerva-woodpecker: FAIL NRV-E12xx: ...` (docs/ERRORS.md, 12xx).
+#
+# Where `host` looks, for ci/ci_test.sh (which runs it with stubs): NERVA_CI_CACHE_ROOT (default
+# /var/cache/nerva-ci), NERVA_CI_DEV (/dev) and NERVA_CI_MODULES_DIR (/etc/modules-load.d).
 set -euo pipefail
 
 fail() { echo "nerva-woodpecker: FAIL $*" >&2; exit 1; }
 say() { echo "nerva-woodpecker: $*"; }
 
 host() {
-    local probe msg
-    [ "$(id -u)" = 0 ] || fail "run as root: ssh -t root@BOX bash ci/nerva-woodpecker.sh host"
+    local probe msg root dev modules
+    root="${NERVA_CI_CACHE_ROOT:-/var/cache/nerva-ci}"
+    dev="${NERVA_CI_DEV:-/dev}"
+    modules="${NERVA_CI_MODULES_DIR:-/etc/modules-load.d}"
+    [ "$(id -u)" = 0 ] || fail "NRV-E1221: run as root: ssh -t root@BOX bash ci/nerva-woodpecker.sh host"
     probe="$(dirname "$(readlink -f "$0")")/io_uring_probe.sh"
     [ -f "$probe" ] ||
         fail "NRV-E1213: $probe is missing: run it from a copy of ops/ci/ that has io_uring_probe.sh beside it (scp -r ops/ci root@BOX:, then bash ci/nerva-woodpecker.sh host)"
-    command -v docker >/dev/null || fail "no docker: run woodpecker-bootstrap.sh on this box first"
-    docker info >/dev/null 2>&1 || fail "docker is installed but not running: systemctl status docker"
+    command -v docker >/dev/null || fail "NRV-E1216: no docker: run ci/woodpecker-bootstrap.sh on this box first"
+    docker info >/dev/null 2>&1 || fail "NRV-E1216: docker is installed but not running: systemctl status docker"
     docker ps --format '{{.Names}}' | grep -q woodpecker-agent ||
-        fail "no woodpecker-agent container: run woodpecker-bootstrap.sh (or its agent mode) first"
+        fail "NRV-E1216: no woodpecker-agent container: run ci/woodpecker-bootstrap.sh (or its agent mode) first"
 
     # Jepsen's LazyFS mounts FUSE inside the node containers.
-    [ -e /dev/fuse ] || modprobe fuse 2>/dev/null || true
-    [ -e /dev/fuse ] || fail "/dev/fuse is missing and \`modprobe fuse\` did not add it"
-    echo fuse > /etc/modules-load.d/nerva-ci.conf
+    [ -e "$dev/fuse" ] || modprobe fuse 2>/dev/null || true
+    [ -e "$dev/fuse" ] || fail "NRV-E1217: /dev/fuse is missing and \`modprobe fuse\` did not add it: install the host's fuse module (Jepsen's LazyFS needs it)"
+    echo fuse > "$modules/nerva-ci.conf"
 
-    if [ -e /dev/kvm ]; then
+    if [ -e "$dev/kvm" ]; then
         say "/dev/kvm present"
     else
         say "warning: no /dev/kvm (enable virtualisation in the BIOS); Nerva's workflows do not need it yet"
     fi
 
     # No step is privileged, so io_uring needs the daemon's own profile (ops/ci/docker/README.md).
-    msg=$(bash "$probe" 2>&1) || fail "$msg"
+    msg=$(bash "$probe" 2>&1) || fail "$msg" # the probe's own NRV-E1201, E1211 or E1212
 
     # The caches the workflows mount (.woodpecker/*.yaml); uid 1001 is the `ci` user the jobs run
     # as. main/ is written only by pipelines for a push to main, which mount it writable; the others
     # mount it read-only and write branches/. jepsen/ keeps each Jepsen run's store.
-    install -d -m 0755 -o 1001 -g 1001 /var/cache/nerva-ci /var/cache/nerva-ci/main \
-        /var/cache/nerva-ci/branches /var/cache/nerva-ci/jepsen
-    # What the first layout left (one shared cache for every branch) is no longer read.
-    local old
-    old=$(cd /var/cache/nerva-ci && ls -d nerva-toolchain zig zig-local zig-cache 2>/dev/null | tr '\n' ' ')
-    [ -z "$old" ] || say "note: /var/cache/nerva-ci holds the old layout ($old); nothing reads it now, delete it when you like"
+    install -d -m 0755 -o 1001 -g 1001 "$root" "$root/main" "$root/branches" "$root/jepsen"
+    # What the first layout left (one shared cache for every branch) is no longer read. A plain
+    # loop: on a fresh box none of them exists, which would fail an `ls` under pipefail.
+    local old="" n
+    for n in nerva-toolchain zig zig-local zig-cache; do
+        [ ! -e "$root/$n" ] || old="$old$n "
+    done
+    [ -z "$old" ] || say "note: $root holds the old layout ($old); nothing reads it now, delete it when you like"
     local avail
-    avail=$(df --output=avail -B1G /var/cache/nerva-ci | tail -1 | tr -d ' ')
+    avail=$(df --output=avail -B1G "$root" | tail -1 | tr -d ' ')
     [ "$avail" -ge 100 ] ||
-        say "warning: only $avail GiB free under /var/cache/nerva-ci; a push runs 15 workflows, the integration one alone takes 3.5 GiB"
+        say "warning: only $avail GiB free under $root; a push runs 15 workflows, the integration one alone takes 3.5 GiB"
 
     local cpus mem
     cpus=$(nproc)
     mem=$(awk '/^MemTotal:/ {print int($2 / 1048576)}' /proc/meminfo)
-    say "OK host $(hostname): $cpus CPUs, $mem GiB, $avail GiB free for /var/cache/nerva-ci"
+    say "OK host $(hostname): $cpus CPUs, $mem GiB, $avail GiB free for $root"
 }
 
 # The token goes to curl in a header file (-H @file), not on its command line, where `ps` would
@@ -84,11 +95,11 @@ api() { # api METHOD PATH [JSON]
 
 repo() {
     local name="${1:-}"
-    [[ "$name" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || fail "usage: nerva-woodpecker.sh repo OWNER/NAME"
+    [[ "$name" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || fail "NRV-E1221: usage: bash ops/ci/nerva-woodpecker.sh repo OWNER/NAME"
     : "${WOODPECKER_SERVER:?set WOODPECKER_SERVER, e.g. https://ci.example.org}"
     : "${WOODPECKER_TOKEN:?set WOODPECKER_TOKEN (Woodpecker: your avatar, then Personal access token)}"
-    command -v jq >/dev/null || fail "needs jq"
-    api GET /user >/dev/null || fail "the server or the token was refused: check WOODPECKER_SERVER and WOODPECKER_TOKEN"
+    command -v jq >/dev/null || fail "NRV-E1221: needs jq"
+    api GET /user >/dev/null || fail "NRV-E1218: the server or the token was refused: check WOODPECKER_SERVER and WOODPECKER_TOKEN"
 
     local id
     if ! id=$(api GET "/repos/lookup/$name" 2>/dev/null | jq -er .id); then
@@ -96,8 +107,8 @@ repo() {
         local remote
         remote=$(api GET '/user/repos?all=true' |
             jq -er --arg n "$name" '.[] | select(.full_name == $n) | .forge_remote_id') ||
-            fail "$name is not among your forge's repositories as Woodpecker sees them (are you an admin of it?)"
-        id=$(api POST "/repos?forge_remote_id=$remote" | jq -er .id) || fail "could not enable $name"
+            fail "NRV-E1219: $name is not among your forge's repositories as Woodpecker sees them (are you an admin of it?)"
+        id=$(api POST "/repos?forge_remote_id=$remote" | jq -er .id) || fail "NRV-E1219: could not enable $name: the server refused it (an admin's token enables a repository)"
         say "enabled $name (Woodpecker made the GitHub webhook)"
     fi
 
@@ -109,18 +120,18 @@ repo() {
         "require_approval": "forks",
         "timeout": 360,
         "trusted": {"volumes": true, "network": true, "security": false}
-    }' >/dev/null || fail "the server refused the settings (Trusted needs a Woodpecker admin's token)"
+    }' >/dev/null || fail "NRV-E1220: the server refused the settings (Trusted needs a Woodpecker admin's token)"
 
     local got
     got=$(api GET "/repos/$id")
     jq -e '.allow_pr == false and .require_approval == "forks" and .timeout == 360
            and .trusted.volumes and .trusted.network and (.trusted.security | not)' <<<"$got" >/dev/null ||
-        fail "the settings did not all take; the server has: $(jq -c '{allow_pr, require_approval, timeout, trusted}' <<<"$got")"
+        fail "NRV-E1220: the settings did not all take; the server has: $(jq -c '{allow_pr, require_approval, timeout, trusted}' <<<"$got")"
     say "OK repo $name (id $id): pull requests off, approval for forks, 360 min, trusted for volumes and network only"
 }
 
 case "${1:-}" in
 host) host ;;
 repo) repo "${2:-}" ;;
-*) fail "usage: nerva-woodpecker.sh host | repo OWNER/NAME" ;;
+*) fail "NRV-E1221: usage: bash ci/nerva-woodpecker.sh host (on the box) | bash ops/ci/nerva-woodpecker.sh repo OWNER/NAME (from the repository root)" ;;
 esac

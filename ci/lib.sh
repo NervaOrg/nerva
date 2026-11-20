@@ -10,6 +10,9 @@
 #                         anything that may print a masked value goes through it
 #   ci_summary            appends stdin to the run's summary: GitHub's step summary, else the log
 #   ci_event              push | pull_request | manual | cron | other
+#   ci_run_timed JOB SECONDS CMD...
+#                         runs CMD under `timeout`; NRV-E1215 if it ran past SECONDS (exit 124, or
+#                         137 when it ignored the TERM and was killed 60 s later, CI_KILL_AFTER)
 
 ci_error() {
     if [ "${GITHUB_ACTIONS:-}" = true ]; then echo "::error::$*"; else echo "error: $*" >&2; fi
@@ -29,10 +32,22 @@ ci_mask() {
 ci_redact() {
     local script=() v
     for v in ${CI_MASKED[@]+"${CI_MASKED[@]}"}; do
-        [[ "$v" =~ ^[0-9A-Fa-f]{16,}$ ]] || { ci_error "ci_redact: a masked value must be at least 16 hex characters"; return 1; }
+        [[ "$v" =~ ^[0-9A-Fa-f]{16,}$ ]] || { ci_error "NRV-B1201: ci_redact: a masked value must be at least 16 hex characters (a bug in the script that masked it)"; return 1; }
         script+=(-e "s/${v}/***/g" -e "s/${v:0:16}/***/g")
     done
     if [ "${#script[@]}" -eq 0 ]; then cat; else sed -u "${script[@]}"; fi
+}
+
+ci_run_timed() {
+    local job="$1" seconds="$2" status=0 limit
+    shift 2
+    timeout --kill-after="${CI_KILL_AFTER:-60}" "$seconds" "$@" || status=$?
+    if [ "$status" = 124 ] || [ "$status" = 137 ]; then
+        limit="$seconds seconds"
+        [ $((seconds % 60)) != 0 ] || limit="$((seconds / 60)) minutes"
+        ci_error "NRV-E1215: $job ran past its $limit and was stopped: a hung job, or a limit too short for this box; CI_STEP_MINUTES raises it for a run"
+    fi
+    return "$status"
 }
 
 ci_summary() {

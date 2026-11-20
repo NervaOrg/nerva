@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Table test for the CI scripts' own refusals and cache rules (NRV-E1201 to E1214, NRV-W1201 and
-# W1202, docs/ERRORS.md; decision O4). Needs flock. Takes a few seconds; touches only a scratch
-# directory. Not covered, as they need a Woodpecker step or a daemon: NRV-E1203 (the Docker socket
-# is not mounted), the io_uring check on a real refusing daemon, and "main's cache is not writable
-# in a pipeline for main" when this runs as root (root writes through a read-only mode).
+# Table test for the CI scripts' own refusals and cache rules (NRV-E1201 to E1221, NRV-B1201,
+# NRV-W1201 and W1202, docs/ERRORS.md; decision O4). Needs flock and jq. Takes a few seconds;
+# touches only a scratch directory. Not covered, as they need a Woodpecker step or a daemon:
+# NRV-E1203 (the Docker socket is not mounted), NRV-E1209 and E1210 (Jepsen), the io_uring check on
+# a real refusing daemon, woodpecker-bootstrap.sh's NRV-E1213 (its preflight wants root on Ubuntu
+# 24.04 first), and "main's cache is not writable in a pipeline for main" when this runs as root
+# (root writes through a read-only mode).
 set -eu
 root=$(cd "$(dirname "$0")/.." && pwd)
 tmp=${CI_TEST_TMP:-$(mktemp -d)}
@@ -86,6 +88,17 @@ key=$(printf 'ab%.0s' {1..32})
 out=$(env -u GITHUB_ACTIONS bash -c ". ci/lib.sh; ci_mask $key; echo \"key $key and ${key:0:16}x\" | ci_redact")
 is "ci_redact" "key *** and ***x" "$out"
 is "ci_redact without a mask" "plain" "$(env -u GITHUB_ACTIONS bash -c '. ci/lib.sh; echo plain | ci_redact')"
+refuses NRV-B1201 "ci_redact refuses a value that is not hex" env -u GITHUB_ACTIONS bash -c '. ci/lib.sh; ci_mask not-hex; echo x | ci_redact'
+
+# --- ci/lib.sh: ci_run_timed, NRV-E1215 ---
+timed() { env -u GITHUB_ACTIONS CI_KILL_AFTER=1 bash -c '. ci/lib.sh; ci_run_timed "$@"' _ "$@"; }
+refuses NRV-E1215 "a job past its time limit (TERM)" timed stubjob 1 sleep 30
+refuses NRV-E1215 "a job that ignores TERM (killed)" timed stubjob 1 sh -c 'trap "" TERM; sleep 30'
+ok "a job within its limit" timed stubjob 5 true
+rc=0
+timed stubjob 5 sh -c 'exit 7' >/dev/null 2>&1 || rc=$?
+is "a failing job keeps its own status" 7 "$rc"
+refuses NRV-E1208 "CI_STEP_MINUTES not a number" env CI_STEP_MINUTES=soon ci/woodpecker_step.sh check
 
 # --- ci/cache.sh ---
 . ci/cache.sh
@@ -141,9 +154,10 @@ sleep 0.3
     . ci/cache.sh
     CI_BRANCH_CACHES=2 ci_branch_prepare "$c" feature/three
 )
-# The caches of feature/one and /two are newer, so they take the two places; old6 is the oldest but
-# a job holds it.
+# The bound counts the job's own cache (feature/three): it and the newest other, feature/two, are
+# the two places; old6 is the oldest but a job holds it, so it stays as well.
 is "old branch caches pruned, the one in use kept" "yes" "$([ -d "$c/branches/b-old6-00000006" ] && [ ! -d "$c/branches/b-old5-00000005" ] && [ ! -d "$c/branches/b-old1-00000001" ] && echo yes)"
+is "the bound is at most CI_BRANCH_CACHES, the job's own included, and what is in use" 3 "$(find "$c/branches" -maxdepth 1 -type d -name 'b-*' | wc -l)"
 kill "$holder" 2>/dev/null || true
 wait "$holder" 2>/dev/null || true
 
@@ -184,7 +198,8 @@ d6=$(cat "$tmp/dir6")
 is "a seed does not nest in an existing cache" "" "$(find "$d6" -name '*.partial.*')"
 is "no seed directory is left behind" "" "$(find "$c/branches" -maxdepth 1 -name '*.partial.*')"
 
-# NRV-E1214: a branch's cache path that is a regular file is refused, not used.
+# NRV-E1214: a branch's cache path that is a regular file is refused, not used, and the branches'
+# lock is not kept (a caller that went on would hold every branch job up).
 branch_file() {
     . ci/cache.sh
     ci_branch_prepare "$c" feature/seven
@@ -192,7 +207,26 @@ branch_file() {
 seven=$(. ci/cache.sh; ci_branch_key feature/seven)
 : >"$c/branches/$seven"
 refuses NRV-E1214 "branch cache path is a file" branch_file
+is "the branches' lock is released after NRV-E1214" free "$(
+    . ci/cache.sh
+    ci_branch_prepare "$c" feature/seven >/dev/null 2>&1 || true
+    flock -x -n "$c/branches/.lock" true && echo free || echo held
+)"
 rm -f "$c/branches/$seven"
+# The same on the NRV-W1202 path: the lock stays busy, $dir is a file.
+eight=$(. ci/cache.sh; ci_branch_key feature/eight)
+: >"$c/branches/$eight"
+flock -x "$c/branches/.lock" sleep 20 &
+holder=$!
+sleep 0.3
+branch_file_unlocked() {
+    . ci/cache.sh
+    CI_LOCK_WAIT=1 ci_branch_prepare "$c" feature/eight
+}
+refuses NRV-E1214 "branch cache path is a file, branches' lock busy" branch_file_unlocked
+kill "$holder" 2>/dev/null || true
+wait "$holder" 2>/dev/null || true
+rm -f "$c/branches/$eight"
 
 # --- ops/ci/io_uring_probe.sh: the probe's perl never dies (exit 255); NRV-E1201 and E1211 ---
 if command -v perl >/dev/null; then
@@ -237,7 +271,96 @@ cp ops/ci/nerva-woodpecker.sh "$tmp/alone/"
 printf '#!/bin/sh\necho 0\n' >"$tmp/fakeroot/id"
 chmod +x "$tmp/fakeroot/id"
 refuses NRV-E1213 "nerva-woodpecker.sh host without the probe" env PATH="$tmp/fakeroot:$PATH" bash "$tmp/alone/nerva-woodpecker.sh" host
-# woodpecker-bootstrap.sh needs root and Docker before its probe check; it has the same check.
+# woodpecker-bootstrap.sh has the same check in its preflight (and CI_SECCOMP=no to skip it); it
+# needs root on Ubuntu 24.04 first, so it is not run here.
+
+# --- ops/ci/nerva-woodpecker.sh: host, all the way to its OK line, and NRV-E1216 to E1221 ---
+# Stubs stand in for docker, id (root), install (-o and -g need root), modprobe and curl; the cache
+# root, /dev and /etc/modules-load.d are scratch directories (NERVA_CI_*).
+hb="$tmp/hostbin"
+mkdir "$hb"
+printf '#!/bin/sh\necho 0\n' >"$hb/id"
+printf '#!/bin/sh\nexit 1\n' >"$hb/modprobe"
+cat >"$hb/install" <<'EOS'
+#!/bin/bash
+a=()
+while [ $# -gt 0 ]; do
+    case "$1" in -o | -g) shift ;; *) a+=("$1") ;; esac
+    shift
+done
+exec /usr/bin/install "${a[@]}"
+EOS
+cat >"$hb/docker" <<'EOS'
+#!/bin/sh
+case "$1" in
+    info) [ "$FAKE_DOCKER" != down ] || exit 1 ;;
+    ps) [ "$FAKE_DOCKER" = noagent ] || echo woodpecker-agent ;;
+    pull | run) exit 0 ;;
+esac
+EOS
+cat >"$hb/curl" <<'EOS'
+#!/bin/bash
+# The Woodpecker API: FAKE_API holds words that make one call fail or answer differently.
+method=GET
+url=
+while [ $# -gt 0 ]; do
+    case "$1" in -X) method="$2"; shift ;; -H | --data) shift ;; -*) ;; *) url="$1" ;; esac
+    shift
+done
+has() { case " $FAKE_API " in *" $1 "*) return 0 ;; esac; return 1; }
+case "$method $url" in
+    "GET "*/api/user) has badtoken && exit 22; echo '{}' ;;
+    "GET "*/api/repos/lookup/*) has notenabled && exit 22; echo '{"id":7}' ;;
+    "GET "*/api/user/repos*) has invisible && echo '[]' || echo '[{"full_name":"o/n","forge_remote_id":"9"}]' ;;
+    "POST "*/api/repos*) has noenable && exit 22; echo '{"id":7}' ;;
+    "PATCH "*/api/repos/7) has refuse && exit 22; echo '{}' ;;
+    "GET "*/api/repos/7)
+        if has nottaken; then
+            echo '{"allow_pr":true,"require_approval":"forks","timeout":60,"trusted":{"volumes":true,"network":true,"security":false}}'
+        else
+            echo '{"allow_pr":false,"require_approval":"forks","timeout":360,"trusted":{"volumes":true,"network":true,"security":false}}'
+        fi ;;
+    *) echo "curl stub: $method $url" >&2; exit 22 ;;
+esac
+EOS
+chmod +x "$hb"/*
+mkdir -p "$tmp/hostdev" "$tmp/nodev" "$tmp/hostmods"
+: >"$tmp/hostdev/fuse"
+nw() { # nw VAR=VALUE... -- ARGS...: runs the real script with the stubs first in PATH
+    local vars=()
+    while [ "$1" != -- ]; do vars+=("$1"); shift; done
+    shift
+    env PATH="$hb:$PATH" NERVA_CI_CACHE_ROOT="$tmp/hostcache" NERVA_CI_DEV="$tmp/hostdev" \
+        NERVA_CI_MODULES_DIR="$tmp/hostmods" "${vars[@]}" bash ops/ci/nerva-woodpecker.sh "$@"
+}
+out=$(nw FAKE_DOCKER=ok -- host 2>&1) || { echo "FAIL host on a fresh box: $out" >&2; fail=1; }
+grep -q 'nerva-woodpecker: OK host' <<<"$out" || { echo "FAIL host on a fresh box: no OK line in: $out" >&2; fail=1; }
+is "host makes the cache directories" yes "$([ -d "$tmp/hostcache/main" ] && [ -d "$tmp/hostcache/branches" ] && [ -d "$tmp/hostcache/jepsen" ] && echo yes)"
+mkdir "$tmp/hostcache/zig"
+out=$(nw FAKE_DOCKER=ok -- host 2>&1) || { echo "FAIL host run again: $out" >&2; fail=1; }
+grep -q 'old layout (zig )' <<<"$out" || { echo "FAIL host run again: the old layout is not noted in: $out" >&2; fail=1; }
+grep -q 'nerva-woodpecker: OK host' <<<"$out" || { echo "FAIL host run again: no OK line in: $out" >&2; fail=1; }
+refuses NRV-E1216 "host: docker is down" nw FAKE_DOCKER=down -- host
+refuses NRV-E1216 "host: no agent container" nw FAKE_DOCKER=noagent -- host
+nodocker="$tmp/nodocker"
+mkdir "$nodocker"
+for t in id dirname readlink; do ln -s "$(command -v $t)" "$nodocker/$t"; done
+refuses NRV-E1216 "host: no docker" env PATH="$nodocker" "$(command -v bash)" ops/ci/nerva-woodpecker.sh host
+refuses NRV-E1217 "host: no /dev/fuse" nw FAKE_DOCKER=ok NERVA_CI_DEV="$tmp/nodev" -- host
+mkdir "$tmp/notroot"
+printf '#!/bin/sh\necho 1000\n' >"$tmp/notroot/id"
+chmod +x "$tmp/notroot/id"
+refuses NRV-E1221 "host: not root" env PATH="$tmp/notroot:$PATH" bash ops/ci/nerva-woodpecker.sh host
+refuses NRV-E1221 "usage" nw FAKE_DOCKER=ok -- nonsense
+refuses NRV-E1221 "repo: a bad name" nw FAKE_DOCKER=ok -- repo not-a-name
+repo_env=(WOODPECKER_SERVER=http://woodpecker.invalid WOODPECKER_TOKEN=t)
+refuses NRV-E1218 "repo: token refused" nw "${repo_env[@]}" FAKE_API=badtoken -- repo o/n
+refuses NRV-E1219 "repo: not visible" nw "${repo_env[@]}" FAKE_API="notenabled invisible" -- repo o/n
+refuses NRV-E1219 "repo: could not enable" nw "${repo_env[@]}" FAKE_API="notenabled noenable" -- repo o/n
+refuses NRV-E1220 "repo: settings refused" nw "${repo_env[@]}" FAKE_API=refuse -- repo o/n
+refuses NRV-E1220 "repo: settings did not take" nw "${repo_env[@]}" FAKE_API=nottaken -- repo o/n
+out=$(nw "${repo_env[@]}" FAKE_API="notenabled" -- repo o/n 2>&1) || { echo "FAIL repo: $out" >&2; fail=1; }
+grep -q 'nerva-woodpecker: OK repo o/n' <<<"$out" || { echo "FAIL repo: no OK line in: $out" >&2; fail=1; }
 
 # ci_main_prune: empties main's Zig caches when nobody holds them; NRV-W1202 when others do.
 echo x >"$c/main/zig-local/entry"

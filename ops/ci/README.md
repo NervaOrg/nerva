@@ -9,6 +9,12 @@ cannot share one box as written.
 
 The scripts: `ops/ci/woodpecker-bootstrap.sh` and `ops/forgejo/forgejo-bootstrap.sh`.
 
+**Every command below is run from the repository root on your laptop**, and every path in it is
+spelled from there (`ops/ci/...`, `ops/forgejo/...`). The `ssh` commands run on the box, where
+`scp ops/ci root@BOX:` has put the directory at `~/ci/` and `scp ops/forgejo/forgejo-bootstrap.sh
+root@BOX:` the Forgejo script at `~/forgejo-bootstrap.sh`: so what runs there is `bash ci/...` and
+`bash forgejo-bootstrap.sh`, never `ops/ci/...`.
+
 Two scripts, each run once as root on a fresh Ubuntu 24.04 box, safe to run again, ending in one
 `OK` or `FAIL <why>` line:
 
@@ -96,7 +102,7 @@ until the name resolves to the box.
 ## 3a. Forgejo
 
 ```bash
-scp forgejo-bootstrap.sh root@git.myproject.org:
+scp ops/forgejo/forgejo-bootstrap.sh root@git.myproject.org:
 ```
 
 ```bash
@@ -160,7 +166,10 @@ scp -r ops/ci root@ci.myproject.org:
 ssh -t root@ci.myproject.org bash ci/woodpecker-bootstrap.sh
 ```
 
-(The whole directory: the script needs `docker/seccomp-io_uring.json` and `io_uring_probe.sh` beside it, NRV-E1213.)
+(The whole directory: the script needs `docker/seccomp-io_uring.json` and `io_uring_probe.sh` beside
+it, and refuses with NRV-E1213 in its preflight, before it changes anything, if either is missing.
+`CI_SECCOMP=no` skips the profile for a project that does not need io_uring; Nerva's steps then
+fail NRV-E1201. Add it to the `ssh` command as `ssh -t root@BOX env CI_SECCOMP=no bash ci/woodpecker-bootstrap.sh`.)
 
 It asks for:
 
@@ -253,7 +262,8 @@ Nerva's CI is plain scripts under `ci/`. GitHub's `ci.yml` and the workflows in 
 both call `ci/job.sh <job>`, so the two run the same checks. Each `.woodpecker/*.yaml` file
 runs `ci/woodpecker_step.sh <job>` in a pinned `ubuntu:24.04` image. That script installs the
 base packages, skips a docs-only push (`ci/changes.sh`), and runs the job as an unprivileged
-user `ci` under a timeout (75 minutes, 330 for the long searches; ci.yml's are 30 to 60, but here
+user `ci` under a timeout (75 minutes, 330 for the long searches; `CI_STEP_MINUTES` replaces it for a
+run, and a job that passes it fails NRV-E1215; ci.yml's are 30 to 60, but here
 a push runs 16 workflows on one box beside the simulator fleet). No step is privileged, and only a
 push to `main` writes the shared caches (decision O4, `docs/decisions/O4-self-hosted-ci-trust.md`,
 which also says what a pusher of any branch can still do here: read it before giving anyone write
@@ -273,7 +283,7 @@ ssh -t root@ci.myproject.org bash ci/nerva-woodpecker.sh host
 ```
 
 ```bash
-WOODPECKER_SERVER=https://ci.myproject.org WOODPECKER_TOKEN=... bash nerva-woodpecker.sh repo OWNER/nerva
+WOODPECKER_SERVER=https://ci.myproject.org WOODPECKER_TOKEN=... bash ops/ci/nerva-woodpecker.sh repo OWNER/nerva
 ```
 
 The token is a Woodpecker admin's: your avatar, then *Personal access token*. What the two modes
@@ -289,9 +299,9 @@ set:
    Jepsen also mounts the host's Docker socket and uses the host's network to reach its five
    node containers. Mounting the Docker socket gives that step root on the box: it runs for
    this repository's own branches, so whoever can push one has it (decision O4).
-4. **On every agent box, once: run `woodpecker-bootstrap.sh` from a checkout that has
-   `docker/seccomp-io_uring.json` beside it** (the directory `ops/ci/`), then
-   `nerva-woodpecker.sh host`. This is the owner's one-time step for decision O4. The bootstrap
+4. **On every agent box, once: run `ci/woodpecker-bootstrap.sh` from the copy of the whole `ops/ci/`
+   directory** (`docker/seccomp-io_uring.json` and `io_uring_probe.sh` beside it: it refuses with
+   NRV-E1213 before changing anything if they are not), then `bash ci/nerva-woodpecker.sh host`. This is the owner's one-time step for decision O4. The bootstrap
    copies Docker's default seccomp profile plus the three io_uring syscalls
    (`ops/ci/docker/`) to `/etc/docker/seccomp-io_uring.json`, merges
    `"seccomp-profile": "/etc/docker/seccomp-io_uring.json"` into `/etc/docker/daemon.json`
@@ -312,7 +322,7 @@ set:
    `main/` holds the pinned Zig's archive (`tools/<sha256>.tar.xz`, checked on every use), Zig's
    global cache and a `.zig-cache` copy, written only by a push to `main` (its steps mount it
    writable; every other step mounts it `:ro`). `branches/<key>/` is one branch's own copy,
-   seeded with a copy of main's global Zig cache (`zig/`; `zig-local/` starts empty), at most 8 of them, 12 GiB and 7 days each. Jobs hold a shared `flock`
+   seeded with a copy of main's global Zig cache (`zig/`; `zig-local/` starts empty), at most 8 of them (the job's own included), 12 GiB and 7 days each. Jobs hold a shared `flock`
    on what they use. Below 60 GiB free (`CI_FREE_MIN_GIB`), a job for `main` waits up to 10
    minutes (`CI_PRUNE_WAIT`) to hold `main/` alone and empties its Zig caches (never the
    toolchain), and a branch job empties every branch cache no job is using. A lock that stays busy
