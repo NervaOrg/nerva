@@ -326,10 +326,14 @@ set:
    on what they use. Below 60 GiB free (`CI_FREE_MIN_GIB`), a job for `main` waits up to
    `CI_PRUNE_WAIT` (5 s), measures free space again, and if it is still low holds `main/` alone and empties its Zig caches (never the
    toolchain), and a branch job empties every branch cache no job is using. The lock files are
-   owned by the step (root, mode 0600), so a job running as `ci` cannot open one to hold it. A lock that stays busy
-   is never waited on for good: the branch caches' lock and a prune warn (NRV-W1202) and the job runs;
-   main's shared lock, which every step takes, waits at most `CI_LOCK_WAIT` (1800 s) and then fails
-   NRV-E1224.
+   owned by the step (root, mode 0600) and the step closes its lock descriptors for the job, so a
+   job running as `ci` holds none of them and cannot open one. It can still unlink or replace a lock
+   file, because the directories they are in belong to `ci`: that only takes it out of the sharing
+   for its own lifetime, the same trust as a branch writing another branch's cache (decision O4).
+   A lock that stays busy is never waited on for good: the branch caches' lock and a prune warn
+   (NRV-W1202) and the job runs; a branch's own cache lock waits `CI_LOCK_WAIT` (300 s) and then
+   fails NRV-E1225; main's shared lock, which every step takes, waits at most `CI_MAIN_LOCK_WAIT`
+   (1800 s) and then fails NRV-E1224.
 
    **When the disk fills** (a job fails with "No space left", or NRV-W1202 keeps appearing), with
    no pipeline running: `rm -rf /var/cache/nerva-ci/branches/*` empties every branch cache, and

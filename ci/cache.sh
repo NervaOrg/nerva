@@ -53,19 +53,23 @@ ci_cache_check() {
 
 # ci_lock_file FILE: creates a lock file that only this user (root, in a step) can open. flock
 # works on a file opened read-only, so a job running as another user could otherwise take an
-# exclusive lock on a 0644 file and hold every later step up with it. A job inherits the open
-# descriptor and never opens the file itself.
+# exclusive lock on a 0644 file and hold every later step up with it. The step closes its lock
+# descriptors (6 to 9) for the job (woodpecker_step.sh), so the job holds none of them and cannot
+# open these files. What it can still do, as the owner of the directories they are in, is unlink
+# or replace one for its own lifetime: no later step then shares that lock. This is the same trust
+# as a branch writing another branch's cache (decision O4), not a boundary.
 ci_lock_file() {
     : >>"$1" 2>/dev/null || true
     chown "$(id -u):$(id -g)" "$1" 2>/dev/null || true
     chmod 600 "$1" 2>/dev/null || true
 }
 
-# ci_shared_lock: a shared lock on fd 9 (main/.lock), waiting at most CI_LOCK_WAIT seconds
-# (default 1800): a holder that never lets go must not hold a step up for good. NRV-E1224.
+# ci_shared_lock: a shared lock on fd 9 (main/.lock), waiting at most CI_MAIN_LOCK_WAIT seconds
+# (default 1800; CI_LOCK_WAIT, default 300, is the branch locks'): a holder that never lets go must
+# not hold a step up for good. NRV-E1224.
 ci_shared_lock() {
-    flock -s -w "${CI_LOCK_WAIT:-1800}" 9 || {
-        ci_error "NRV-E1224: main's cache lock was held for ${CI_LOCK_WAIT:-1800} s: a job that never ends holds it; find it on the box (docker ps, or lslocks) and stop it, then start this pipeline again"
+    flock -s -w "${CI_MAIN_LOCK_WAIT:-1800}" 9 || {
+        ci_error "NRV-E1224: main's cache lock was held for ${CI_MAIN_LOCK_WAIT:-1800} s: main's prune, or a step still alive past its timeout, holds it; lslocks on the host shows its pid; if the holder is just slow, raise CI_MAIN_LOCK_WAIT"
         return 1
     }
 }
@@ -112,7 +116,7 @@ ci_branch_prune() {
 # nobody is using goes. The lock on fd 7 (branches/.lock) serialises seeding and pruning; fd 6 is
 # taken before it is released, so no prune falls between.
 ci_branch_prepare() {
-    local root="$1" key b dir maxn maxdays maxgib seedgib partial err locked=no
+    local root="$1" key b dir maxn maxdays maxgib seedgib partial err last locked=no
     key=$(ci_branch_key "$2")
     b="$root/branches"
     dir="$b/$key"
@@ -141,7 +145,11 @@ ci_branch_prepare() {
     # (One empty b-<key>.lock stays per branch name the box has seen; a prune never unlinks them.)
     ci_lock_file "$b/$key.lock"
     exec 6>>"$b/$key.lock"
-    flock -s 6
+    flock -s -w "${CI_LOCK_WAIT:-300}" 6 || {
+        ci_error "NRV-E1225: $key's own cache lock was held for ${CI_LOCK_WAIT:-300} s: a job of this branch that never ends holds it exclusively; lslocks on the host shows its pid"
+        [ "$locked" != yes ] || flock -u 7
+        return 1
+    }
     if [ ! -d "$dir" ]; then
         if [ "$locked" = yes ]; then
             partial="$dir.partial.$$"
@@ -159,7 +167,8 @@ ci_branch_prepare() {
                 # A failed copy must not leave a partial zig/p (a half-written package would be trusted).
                 # cp's reason is kept in memory: on a full disk a file in $partial could not hold it.
                 if ! err=$(cp -a "$root/main/zig/p" "$partial/zig/" 2>&1 >/dev/null); then
-                    echo "seed copy failed: branch $key starts empty (${err##*$'\n'})" >&2
+                    last=${err##*$'\n'}
+                    echo "seed copy failed: branch $key starts empty (${last:-no message})" >&2
                     rm -rf "$partial/zig/p"
                 fi
             else

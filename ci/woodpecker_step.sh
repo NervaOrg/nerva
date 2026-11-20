@@ -125,7 +125,10 @@ as_ci=(setpriv --reuid "$user" --regid "$user" --init-groups
     ZIG_GLOBAL_CACHE_DIR="$base/zig" ZIG_LOCAL_CACHE_DIR="$base/zig-local"
     CI_TOOLCHAIN_DIR="$cache/main/tools" CI_TOOLCHAIN_WRITE="$toolchain_write")
 
-"${as_ci[@]}" ci/install_zig.sh
+# The step's locks (fds 6 to 9) stay with the step: bash's `exec N<file` is not close-on-exec, so a
+# job would inherit them and could `flock -x` one for good. Both commands close them for the child
+# only; the step's own descriptors, and so its locks, stay open until it exits.
+"${as_ci[@]}" ci/install_zig.sh 6>&- 7>&- 8>&- 9<&-
 status=0
-ci_run_timed "$job" "$((minutes * 60))" "${as_ci[@]}" ci/job.sh "$job" ${arg:+"$arg"} || status=$?
+ci_run_timed "$job" "$((minutes * 60))" "${as_ci[@]}" ci/job.sh "$job" ${arg:+"$arg"} 6>&- 7>&- 8>&- 9<&- || status=$?
 exit "$status"
