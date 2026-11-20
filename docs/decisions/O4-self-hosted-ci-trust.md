@@ -37,7 +37,8 @@ container on that daemon without a profile of its own; the box runs CI and nothi
   which a build of main may be writing, so a branch starts it empty) made when the branch's cache is
   first needed (not made if main's is over 6 GiB; the branch then starts empty), bounded in count
   (8), age (7 days) and size (12 GiB each), pruned under a lock that skips a cache another job is
-  using. Nothing a branch writes is read by main. A branch's cache is not shielded from other
+  using. The lock files are in a directory of their own, root's and not writable by a job
+  (`locks/`, mounted into every step), so a job cannot replace one. Nothing a branch writes is read by main. A branch's cache is not shielded from other
   branches (see "What remains trusted").
 - The toolchain is never trusted by name. Every use copies the archive from `main/tools/<sha256>.tar.xz`
   into the job's own `zig/cache` and runs `zig/download.sh`, which checks it against the sha256

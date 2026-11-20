@@ -28,6 +28,7 @@ steps:
       - ci/woodpecker_step.sh jepsen
     volumes:
       - /var/cache/nerva-ci/main:/cache/main:ro
+      - /var/cache/nerva-ci/locks:/cache/locks
       - /var/cache/nerva-ci/branches:/cache/branches
       - /var/cache/nerva-ci/jepsen:/cache/jepsen
       - /var/run/docker.sock:/var/run/docker.sock

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Table test for the CI scripts' own refusals and cache rules (NRV-E1201 to E1225, NRV-B1201,
+# Table test for the CI scripts' own refusals and cache rules (NRV-E1201 to E1227, NRV-B1201,
 # NRV-W1201 and W1202, docs/ERRORS.md; decision O4). Needs flock and jq. Takes a few seconds;
 # touches only a scratch directory. Not covered, as they need a Woodpecker step or a daemon:
 # NRV-E1203 (the Docker socket is not mounted), NRV-E1209 and E1210 (Jepsen), the io_uring check on
@@ -120,6 +120,7 @@ is "branch key is stable" "$(ci_branch_key main2)" "$(ci_branch_key main2)"
 
 c="$tmp/cache"
 mkdir -p "$c/main/zig" "$c/main/zig-local" "$c/main/tools" "$c/branches"
+mkdir -m 0700 "$c/locks"
 refuses NRV-E1202 "cache not laid out" ci_cache_check branch "$tmp/nowhere"
 # As root the main directory is always writable, so a branch pipeline that mounted it read-only
 # cannot be told apart here; a writable one is what a branch must be refused.
@@ -185,7 +186,7 @@ for i in 1 2 3 4 5 6; do
     mkdir "$c/branches/b-old$i-0000000$i"
     touch -d "$((i + 1)) minutes ago" "$c/branches/b-old$i-0000000$i"
 done
-setsid flock -o -s "$c/branches/b-old6-00000006.lock" sleep 20 &
+setsid flock -o -s "$c/locks/b-old6-00000006.lock" sleep 20 &
 holder=$!
 sleep 0.3
 (
@@ -203,15 +204,15 @@ wait "$holder" 2>/dev/null || true
 # an inode that no later prune opens.
 mkdir "$c/branches/b-gone-00000099"
 touch -d "40 days ago" "$c/branches/b-gone-00000099"
-: >"$c/branches/b-gone-00000099.lock"
+: >"$c/locks/b-gone-00000099.lock"
 (
     . ci/cache.sh
     ci_branch_prepare "$c" feature/four
 )
 is "old branch cache removed" no "$([ -d "$c/branches/b-gone-00000099" ] && echo yes || echo no)"
-is "its lock file stays" yes "$([ -f "$c/branches/b-gone-00000099.lock" ] && echo yes || echo no)"
+is "its lock file stays" yes "$([ -f "$c/locks/b-gone-00000099.lock" ] && echo yes || echo no)"
 # NRV-W1202: the branches' lock stays busy, so the branch's cache is made without seeding.
-setsid flock -o -x "$c/branches/.lock" sleep 20 &
+setsid flock -o -x "$c/locks/branches.lock" sleep 20 &
 holder=$!
 sleep 0.3
 out=$(
@@ -248,13 +249,13 @@ refuses NRV-E1214 "branch cache path is a file" branch_file
 is "the branches' lock is released after NRV-E1214" free "$(
     . ci/cache.sh
     ci_branch_prepare "$c" feature/seven >/dev/null 2>&1 || true
-    flock -x -n "$c/branches/.lock" true && echo free || echo held
+    flock -x -n "$c/locks/branches.lock" true && echo free || echo held
 )"
 rm -f "$c/branches/$seven"
 # The same on the NRV-W1202 path: the lock stays busy, $dir is a file.
 eight=$(. ci/cache.sh; ci_branch_key feature/eight)
 : >"$c/branches/$eight"
-setsid flock -o -x "$c/branches/.lock" sleep 20 &
+setsid flock -o -x "$c/locks/branches.lock" sleep 20 &
 holder=$!
 sleep 0.3
 branch_file_unlocked() {
@@ -269,8 +270,8 @@ rm -f "$c/branches/$eight"
 # NRV-E1225: a branch's own cache lock held exclusively does not hold a step up for good, and the
 # branches' lock is not kept. Lock files are the step's own, 0600.
 nine=$(. ci/cache.sh; ci_branch_key feature/nine)
-: >"$c/branches/$nine.lock" # 0644 by the umask; ci_branch_prepare must tighten it
-setsid flock -o -x "$c/branches/$nine.lock" sleep 20 &
+: >"$c/locks/$nine.lock" # 0644 by the umask; ci_branch_prepare must tighten it
+setsid flock -o -x "$c/locks/$nine.lock" sleep 20 &
 holder=$!
 sleep 0.3
 own_lock_wait() {
@@ -281,13 +282,119 @@ refuses NRV-E1225 "a branch's own lock held exclusively" own_lock_wait
 is "the branches' lock is released after NRV-E1225" free "$(
     . ci/cache.sh
     CI_LOCK_WAIT=1 ci_branch_prepare "$c" feature/nine >/dev/null 2>&1 || true
-    flock -x -n "$c/branches/.lock" true && echo free || echo held
+    flock -x -n "$c/locks/branches.lock" true && echo free || echo held
 )"
 kill -- -"$holder" 2>/dev/null || true
 wait "$holder" 2>/dev/null || true
-is "branches/.lock is 0600" 600 "$(stat -c %a "$c/branches/.lock")"
-is "a branch's lock file is 0600" 600 "$(stat -c %a "$c/branches/$nine.lock")"
-is "a branch's lock file is the step's own" "$(id -un)" "$(stat -c %U "$c/branches/$nine.lock")"
+is "locks/branches.lock is 0600" 600 "$(stat -c %a "$c/locks/branches.lock")"
+is "a branch's lock file is 0600" 600 "$(stat -c %a "$c/locks/$nine.lock")"
+is "a branch's lock file is the step's own" "$(id -un)" "$(stat -c %U "$c/locks/$nine.lock")"
+
+# The lock files live in <root>/locks, which a job cannot write (root's, 0700), not in the
+# directories `ci` owns: nothing is created in main/ or branches/ any more.
+is "no lock file is made in main/ or branches/" "" "$(find "$c/main" "$c/branches" -maxdepth 1 -name '*.lock' -o -maxdepth 1 -name '.lock')"
+
+# The wording of the two waits names holders that can really hold them (not "a job of this branch"
+# nor "a step still alive past its timeout": steps hold main's lock shared, and Linux grants a
+# shared lock beside shared ones, and a job cannot replace a lock file now).
+setsid flock -o -x "$c/locks/main.lock" sleep 20 &
+holder=$!
+sleep 0.3
+mainwait() {
+    . ci/cache.sh
+    exec 9<"$c/locks/main.lock"
+    CI_MAIN_LOCK_WAIT=1 ci_shared_lock
+}
+out=$(mainwait 2>&1 || true)
+kill -- -"$holder" 2>/dev/null || true
+wait "$holder" 2>/dev/null || true
+grep -q "main's prune.*process on the host" <<<"$out" || { echo "FAIL E1224 wording: $out" >&2; fail=1; }
+if grep -q "past its timeout" <<<"$out"; then echo "FAIL E1224 still blames a step past its timeout: $out" >&2; fail=1; fi
+setsid flock -o -x "$c/locks/$nine.lock" sleep 20 &
+holder=$!
+sleep 0.3
+out=$(own_lock_wait 2>&1 || true)
+kill -- -"$holder" 2>/dev/null || true
+wait "$holder" 2>/dev/null || true
+grep -q "another step's prune.*process on the host" <<<"$out" || { echo "FAIL E1225 wording: $out" >&2; fail=1; }
+if grep -q "never ends" <<<"$out"; then echo "FAIL E1225 still blames a job that never ends: $out" >&2; fail=1; fi
+
+# A link at a lock path, in the lock directory or where the lock files used to be, is never
+# followed: the target keeps its mode, owner and content (a root step used to chown and chmod it).
+victim="$tmp/victim"
+echo precious >"$victim"
+chmod 644 "$victim"
+if [ "$(id -u)" = 0 ]; then chown nobody "$victim"; fi
+want="$(stat -c '%a %u' "$victim") $(cat "$victim")"
+sym=$(. ci/cache.sh; ci_branch_key feature/sym)
+ln -s "$victim" "$c/branches/.lock" # the old places: never looked at
+ln -s "$victim" "$c/branches/$sym.lock"
+ln -s "$victim" "$c/main/.lock"
+rm -f "$c/locks/branches.lock" "$c/locks/main.lock"
+ln -s "$victim" "$c/locks/branches.lock"
+ln -s "$victim" "$c/locks/$sym.lock"
+ln -s "$victim" "$c/locks/main.lock"
+ok "a symlinked branches lock, own lock and main lock are replaced, not followed" bash -c '
+    . ci/cache.sh
+    ci_branch_prepare "$1" feature/sym
+    ci_main_lock_open "$1"' _ "$c"
+is "the symlink's target is untouched (mode, owner, content)" "$want" "$(stat -c '%a %u' "$victim") $(cat "$victim")"
+regular=yes
+for f in branches main "$sym"; do { [ -f "$c/locks/$f.lock" ] && [ ! -L "$c/locks/$f.lock" ]; } || regular=no; done
+is "the lock paths are regular files now" yes "$regular"
+is "the old places' links are untouched" "yes" "$([ -L "$c/branches/.lock" ] && [ -L "$c/main/.lock" ] && echo yes)"
+rm -f "$c/branches/.lock" "$c/branches/$sym.lock" "$c/main/.lock"
+# Something that is not a regular file at a lock path is refused (NRV-E1226), not removed.
+mkdir "$c/locks/dir.lock"
+refuses NRV-E1226 "a lock path that is a directory" bash -c '. ci/cache.sh; ci_lock_file "$1/locks/dir.lock"' _ "$c"
+is "a directory at a lock path is left alone" yes "$([ -d "$c/locks/dir.lock" ] && echo yes)"
+rmdir "$c/locks/dir.lock"
+
+# NRV-E1226 and E1202: the lock directory itself must be there, a real directory that only this
+# user can write.
+lk="$tmp/lk"
+mkdir -p "$lk/main" "$lk/branches"
+refuses NRV-E1202 "no lock directory" ci_cache_check main "$lk"
+mkdir -m 0700 "$tmp/lk-real"
+ln -s "$tmp/lk-real" "$lk/locks"
+refuses NRV-E1226 "a symlinked lock directory" ci_cache_check main "$lk"
+rm "$lk/locks"
+mkdir "$lk/locks"
+chmod 0777 "$lk/locks"
+refuses NRV-E1226 "a lock directory others can write" ci_cache_check main "$lk"
+chmod 0770 "$lk/locks"
+refuses NRV-E1226 "a lock directory the group can write" ci_cache_check main "$lk"
+chmod 0700 "$lk/locks"
+ok "a lock directory that is ours and 0700" ci_cache_check main "$lk"
+if [ "$(id -u)" = 0 ]; then
+    chown nobody "$lk/locks"
+    refuses NRV-E1226 "a lock directory of another user" ci_cache_check main "$lk"
+fi
+
+# NRV-E1227: a lock file that cannot be opened says so, with the reason, and is not reported as a
+# wait ("held for N s"). ci_lock_file is stubbed away so that the open itself is what fails (a
+# directory cannot be opened for writing); the branches' lock is not kept.
+o3="$tmp/openfail"
+mkdir -p "$o3/main" "$o3/branches"
+mkdir -m 0700 "$o3/locks"
+mkdir "$o3/locks/branches.lock"
+open_fail() { # open_fail ROOT BRANCH
+    . ci/cache.sh
+    ci_lock_file() { return 0; }
+    ci_branch_prepare "$1" "$2"
+}
+out=$(open_fail "$o3" feature/o 2>&1 || true)
+grep -q "NRV-E1227: could not open the lock file .*branches.lock (Is a directory)" <<<"$out" || { echo "FAIL open failure (fd 7): $out" >&2; fail=1; }
+if grep -q "held for\|NRV-W1202\|NRV-E1225" <<<"$out"; then echo "FAIL open failure reported as a wait: $out" >&2; fail=1; fi
+rmdir "$o3/locks/branches.lock"
+: >"$o3/locks/branches.lock"
+okey=$(. ci/cache.sh; ci_branch_key feature/o)
+mkdir "$o3/locks/$okey.lock"
+out=$(open_fail "$o3" feature/o 2>&1 || true)
+grep -q "NRV-E1227: could not open the lock file .*$okey.lock (Is a directory)" <<<"$out" || { echo "FAIL open failure (fd 6): $out" >&2; fail=1; }
+if grep -q "held for\|NRV-E1225" <<<"$out"; then echo "FAIL open failure (fd 6) reported as a wait: $out" >&2; fail=1; fi
+is "the branches' lock is released after NRV-E1227" free "$(flock -x -n "$o3/locks/branches.lock" true && echo free || echo held)"
+refuses NRV-E1227 "an open failure refuses" open_fail "$o3" feature/o
 
 # The step closes its lock descriptors (6 to 9) for the job: bash's exec does not set close-on-exec,
 # so a job would inherit them and could take them for good. Both `as_ci` commands do it.
@@ -299,7 +406,7 @@ is "both close fds 6 to 9 for the job" 2 "$closing_lines"
 # jepsen lock file is made by ci_lock_file.
 is "main's lock is taken by ci_shared_lock in both roles" 2 "$(grep -c 'ci_shared_lock || exit 1' ci/woodpecker_step.sh || true)"
 if grep -n 'flock -s 9' ci/woodpecker_step.sh; then echo "FAIL woodpecker_step.sh takes main's lock with a bare flock: use ci_shared_lock" >&2; fail=1; fi
-is "the jepsen lock file is made by ci_lock_file" 1 "$(grep -c 'ci_lock_file "$cache/jepsen/.lock"' ci/woodpecker_step.sh || true)"
+is "the jepsen lock file is made by ci_lock_file" 1 "$(grep -c 'ci_lock_file "$cache/locks/jepsen.lock"' ci/woodpecker_step.sh || true)"
 # The pattern itself, through ci_run_timed as the step runs the job: the step holds fd 9 shared
 # (as its flock does); the child, with the descriptors closed, cannot lock it (Bad file descriptor),
 # and a third opener still cannot take the lock exclusively. Without the closing it can (control).
@@ -432,7 +539,8 @@ nw() { # nw VAR=VALUE... -- ARGS...: runs the real script with the stubs first i
 }
 out=$(nw FAKE_DOCKER=ok -- host 2>&1) || { echo "FAIL host on a fresh box: $out" >&2; fail=1; }
 grep -q 'nerva-woodpecker: OK host' <<<"$out" || { echo "FAIL host on a fresh box: no OK line in: $out" >&2; fail=1; }
-is "host makes the cache directories" yes "$([ -d "$tmp/hostcache/main" ] && [ -d "$tmp/hostcache/branches" ] && [ -d "$tmp/hostcache/jepsen" ] && echo yes)"
+is "host makes the cache directories" yes "$([ -d "$tmp/hostcache/main" ] && [ -d "$tmp/hostcache/branches" ] && [ -d "$tmp/hostcache/jepsen" ] && [ -d "$tmp/hostcache/locks" ] && echo yes)"
+is "host makes the lock directory 0700" 700 "$(stat -c %a "$tmp/hostcache/locks")"
 mkdir "$tmp/hostcache/zig"
 out=$(nw FAKE_DOCKER=ok -- host 2>&1) || { echo "FAIL host run again: $out" >&2; fail=1; }
 grep -q 'old layout (zig )' <<<"$out" || { echo "FAIL host run again: the old layout is not noted in: $out" >&2; fail=1; }
@@ -464,20 +572,20 @@ grep -q 'nerva-woodpecker: OK repo o/n' <<<"$out" || { echo "FAIL repo: no OK li
 
 # ci_main_prune: empties main's Zig caches when nobody holds them; NRV-W1202 when others do.
 echo x >"$c/main/zig-local/entry"
-touch "$c/main/.lock"
+touch "$c/locks/main.lock"
 (
     . ci/cache.sh
-    exec 9<"$c/main/.lock"
+    exec 9<"$c/locks/main.lock"
     CI_PRUNE_WAIT=1 ci_main_prune "$c" 99999999
 )
 is "main pruned when idle" "" "$(ls -A "$c/main/zig-local")"
 echo x >"$c/main/zig-local/entry"
-setsid flock -o -s "$c/main/.lock" sleep 20 &
+setsid flock -o -s "$c/locks/main.lock" sleep 20 &
 holder=$!
 sleep 0.3
 out=$(
     . ci/cache.sh
-    exec 9<"$c/main/.lock"
+    exec 9<"$c/locks/main.lock"
     CI_PRUNE_WAIT=1 ci_main_prune "$c" 99999999 2>&1
 )
 kill -- -"$holder" 2>/dev/null || true
@@ -485,12 +593,12 @@ wait "$holder" 2>/dev/null || true
 grep -q NRV-W1202 <<<"$out" || { echo "FAIL prune busy: no NRV-W1202 in: $out" >&2; fail=1; }
 is "main kept when busy" entry "$(ls "$c/main/zig-local")"
 # Space is no longer low once the wait ends: not pruned, and no warning even though the lock is busy.
-setsid flock -o -s "$c/main/.lock" sleep 20 &
+setsid flock -o -s "$c/locks/main.lock" sleep 20 &
 holder=$!
 sleep 0.3
 out=$(
     . ci/cache.sh
-    exec 9<"$c/main/.lock"
+    exec 9<"$c/locks/main.lock"
     CI_PRUNE_WAIT=1 ci_main_prune "$c" 0 2>&1
 )
 kill -- -"$holder" 2>/dev/null || true
@@ -499,18 +607,18 @@ if grep -q NRV-W1202 <<<"$out"; then echo "FAIL prune busy but space free: NRV-W
 is "main kept when space is free again" entry "$(ls "$c/main/zig-local")"
 (
     . ci/cache.sh
-    exec 9<"$c/main/.lock"
+    exec 9<"$c/locks/main.lock"
     CI_PRUNE_WAIT=1 ci_main_prune "$c" 0 >/dev/null
 )
 is "main kept when idle and space is free" entry "$(ls "$c/main/zig-local")"
 
 # NRV-E1224: a job that holds main's lock for good does not hold a step up for good.
-setsid flock -o -x "$c/main/.lock" sleep 20 &
+setsid flock -o -x "$c/locks/main.lock" sleep 20 &
 holder=$!
 sleep 0.3
 lock_wait() {
     . ci/cache.sh
-    exec 9<"$c/main/.lock"
+    exec 9<"$c/locks/main.lock"
     CI_MAIN_LOCK_WAIT=1 ci_shared_lock
 }
 refuses NRV-E1224 "main's lock held exclusively" lock_wait
@@ -547,7 +655,7 @@ echo x >"$c/main/zig-local/entry"
         CI_PRUNE_WAIT=1 ci_main_prepare "$c" "$ou" "$og" yes 99999999 >/dev/null
 )
 is "prepare: main pruned, and the ownership set after the prune (not before)" "after-install" "$(ls -A "$c/main/zig-local")"
-is "prepare: main/.lock is the step's own, 0600" "$(id -un) 600" "$(stat -c '%U %a' "$c/main/.lock")"
+is "prepare: locks/main.lock is the step's own, 0600" "$(id -un) 600" "$(stat -c '%U %a' "$c/locks/main.lock")"
 is "prepare: zig owned by the job's user after a prune" "$ou" "$(stat -c %U "$c/main/zig")"
 is "prepare: zig-local owned by the job's user after a prune" "$ou" "$(stat -c %U "$c/main/zig-local")"
 is "prepare: tools owned by the job's user" "$ou" "$(stat -c %U "$c/main/tools")"

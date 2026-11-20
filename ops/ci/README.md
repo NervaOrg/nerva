@@ -317,7 +317,10 @@ set:
 
    ```bash
    install -d -m 0755 -o 1001 -g 1001 /var/cache/nerva-ci /var/cache/nerva-ci/{main,branches,jepsen}
+   install -d -m 0700 -o 0 -g 0 /var/cache/nerva-ci/locks
    ```
+
+   `locks/` is root's and mounted into every step (`/cache/locks`, writable): the lock files are in it, not in the directories the jobs (uid 1001) own. A step refuses one a job could write (NRV-E1226).
 
    `main/` holds the pinned Zig's archive (`tools/<sha256>.tar.xz`, checked on every use), Zig's
    global cache and a `.zig-cache` copy, written only by a push to `main` (its steps mount it
@@ -325,15 +328,21 @@ set:
    seeded with a copy of main's fetched packages (`zig/p` only; the rest of `zig/` and `zig-local/` start empty), at most 8 of them (the job's own included), 12 GiB and 7 days each. Jobs hold a shared `flock`
    on what they use. Below 60 GiB free (`CI_FREE_MIN_GIB`), a job for `main` waits up to
    `CI_PRUNE_WAIT` (5 s), measures free space again, and if it is still low holds `main/` alone and empties its Zig caches (never the
-   toolchain), and a branch job empties every branch cache no job is using. The lock files are
-   owned by the step (root, mode 0600) and the step closes its lock descriptors for the job, so a
-   job running as `ci` holds none of them and cannot open one. It can still unlink or replace a lock
-   file, because the directories they are in belong to `ci`: that only takes it out of the sharing
-   for its own lifetime, the same trust as a branch writing another branch's cache (decision O4).
+   toolchain), and a branch job empties every branch cache no job is using. The lock files
+   (`main.lock`, `branches.lock`, `b-<key>.lock`, `jepsen.lock`) are in `locks/`, owned by the step
+   (root, mode 0600). The directory is root's, mode 0700, so a job running as `ci` can neither
+   create, unlink, replace nor open one, and the step closes its lock descriptors for the job, so it
+   holds none: no job can hold a lock or take a step out of the sharing. (They used to be in the
+   directories `ci` owns, where a job could plant a symlink for a root step to chown and chmod; an
+   old `.lock` there is unused and can be deleted.) The step refuses a `locks/` that is a link or
+   that another user can write (NRV-E1226), and never follows a link at a lock path.
    A lock that stays busy is never waited on for good: the branch caches' lock and a prune warn
    (NRV-W1202) and the job runs; a branch's own cache lock waits `CI_LOCK_WAIT` (300 s) and then
-   fails NRV-E1225; main's shared lock, which every step takes, waits at most `CI_MAIN_LOCK_WAIT`
-   (1800 s) and then fails NRV-E1224.
+   fails NRV-E1225 (another step's prune of that cache, or a process on the host, holds it);
+   main's shared lock, which every step takes, waits at most `CI_MAIN_LOCK_WAIT` (1800 s) and then
+   fails NRV-E1224 (main's prune, running a long `rm -rf`, or a process on the host; steps hold it
+   shared, which never blocks another shared holder). `lslocks` on the host shows the pid. A lock
+   file that cannot be opened at all is NRV-E1227, with the reason, not a wait.
 
    **When the disk fills** (a job fails with "No space left", or NRV-W1202 keeps appearing), with
    no pipeline running: `rm -rf /var/cache/nerva-ci/branches/*` empties every branch cache, and

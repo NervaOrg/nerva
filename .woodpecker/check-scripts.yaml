@@ -26,6 +26,7 @@ steps:
         branch: main
     volumes:
       - /var/cache/nerva-ci/main:/cache/main
+      - /var/cache/nerva-ci/locks:/cache/locks
   - name: the scripts' tests
     image: docker.io/library/ubuntu:24.04@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8
     commands:
@@ -34,4 +35,5 @@ steps:
       - evaluate: 'CI_PIPELINE_EVENT != "push" || CI_COMMIT_BRANCH != "main"'
     volumes:
       - /var/cache/nerva-ci/main:/cache/main:ro
+      - /var/cache/nerva-ci/locks:/cache/locks
       - /var/cache/nerva-ci/branches:/cache/branches

@@ -7,7 +7,7 @@
 #     bash ci/nerva-woodpecker.sh host
 #   Checks Docker (and that its daemon carries the io_uring seccomp profile, which
 #   woodpecker-bootstrap.sh installs), /dev/fuse and /dev/kvm, and creates the cache directories
-#   under /var/cache/nerva-ci (main, branches and jepsen: decision O4).
+#   under /var/cache/nerva-ci (main, branches, jepsen and locks: decision O4).
 #
 #   `repo` runs from the repository root, on your laptop (needs curl and jq), with a personal
 #   token from Woodpecker (your avatar, then Personal access token):
@@ -58,6 +58,12 @@ host() {
     # as. main/ is written only by pipelines for a push to main, which mount it writable; the others
     # mount it read-only and write branches/. jepsen/ keeps each Jepsen run's store.
     install -d -m 0755 -o 1001 -g 1001 "$root" "$root/main" "$root/branches" "$root/jepsen"
+    # The lock files (main.lock, branches.lock, b-<key>.lock, jepsen.lock) live in a directory of
+    # their own that the jobs (uid 1001) cannot write: they own the three above, so a lock file
+    # in one could be replaced by a job, and a step running as root would then follow its link.
+    # Made root's (and, by install, set right again if a run left it otherwise); a step refuses one
+    # a job could write (NRV-E1226).
+    install -d -m 0700 -o 0 -g 0 "$root/locks"
     # What the first layout left (one shared cache for every branch) is no longer read. A plain
     # loop: on a fresh box none of them exists, which would fail an `ls` under pipefail.
     local old="" n

@@ -49,4 +49,5 @@ steps:
       - evaluate: 'CI_PIPELINE_EVENT != "push" || CI_COMMIT_BRANCH != "main"'
     volumes:
       - /var/cache/nerva-ci/main:/cache/main:ro
+      - /var/cache/nerva-ci/locks:/cache/locks
       - /var/cache/nerva-ci/branches:/cache/branches

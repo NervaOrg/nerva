@@ -10,7 +10,7 @@
 #   - /cache holds the host's /var/cache/nerva-ci, laid out and enforced as ci/cache.sh says:
 #     main/ is written by pipelines for main only (the YAML mounts it :ro for any other branch);
 #     a branch has its own caches under branches/, zig/p seeded from main's when created, bounded and
-#     pruned. Every job holds a shared lock on main/.lock; below CI_FREE_MIN_GIB free (default 60),
+#     pruned. Every job holds a shared lock on locks/main.lock (the lock directory, root's, which a job cannot write); below CI_FREE_MIN_GIB free (default 60),
 #     a main job waits up to CI_PRUNE_WAIT seconds (5) to hold it alone, measures free space again, and if still low
 #     empties main's Zig caches (never the pinned toolchain), and a branch job empties the branch caches nobody uses.
 #   - Each job has a timeout (75 minutes; 330 for the long searches; CI_STEP_MINUTES replaces it),
@@ -76,8 +76,8 @@ if [ "$job" = jepsen ]; then
     sock=/var/run/docker.sock
     [ -S "$sock" ] || { ci_error "NRV-E1203: $sock is not mounted (see .woodpecker/jepsen.yaml)"; exit 1; }
     install -d -o "$user" -g "$user" "$cache/jepsen"
-    ci_lock_file "$cache/jepsen/.lock"
-    exec 8<"$cache/jepsen/.lock"
+    ci_lock_file "$cache/locks/jepsen.lock" || exit 1
+    { exec 8<"$cache/locks/jepsen.lock"; } 2>/dev/null || { ci_lock_open_failed "$cache/locks/jepsen.lock"; exit 1; }
     echo "jepsen: waiting for any other Jepsen run on this machine"
     flock -x -w "${CI_JEPSEN_WAIT:-5400}" 8 || {
         ci_error "NRV-E1209: another Jepsen run held this machine for ${CI_JEPSEN_WAIT:-5400} s: start this one again when it ends"
@@ -103,13 +103,14 @@ cache_fs="$cache/main"
 low=no
 [ "$(df --output=avail -B1G "$cache_fs" | tail -1 | tr -d ' ')" -ge "$free_min_gib" ] || low=yes
 if [ "$role" = main ]; then
-    ci_main_prepare "$cache" "$user" "$user" "$low" "$free_min_gib"
+    ci_main_prepare "$cache" "$user" "$user" "$low" "$free_min_gib" || exit 1
     ci_shared_lock || exit 1
     base="$cache/main"
     toolchain_write=1
 else
     # main's cache is read-only here; this branch's own is a copy of it, made under main's lock.
-    if [ -e "$cache/main/.lock" ]; then exec 9<"$cache/main/.lock"; ci_shared_lock || exit 1; fi
+    ci_main_lock_open "$cache" || exit 1
+    ci_shared_lock || exit 1
     [ "$low" = no ] || { echo "Below $free_min_gib GiB free: emptying the branch caches nobody uses"; export CI_BRANCH_PRUNE_ALL=1; }
     ci_branch_prepare "$cache" "$branch"
     flock -u 9 2>/dev/null || true
