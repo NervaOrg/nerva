@@ -80,10 +80,10 @@ const changes_per_op_max = 1 << 16;
 /// The most changes one `get_changes` request returns (the `end` record excluded).
 const changes_request_max =
     nerva.Operation.get_changes.result_max(constants.message_body_size_max) - 1;
-/// `changes` reads: one request of the caller's `limit`, then requests of `changes_request_max`
-/// while a single op continues, until the op's last change (at most `changes_per_op_max`), one
-/// more when that request ends in the next op, and one to fill the last window.
-const changes_requests_max = 3 + (changes_per_op_max + changes_request_max - 1) /
+/// `changes` reads: a page is one request of the caller's `limit`, then requests of
+/// `changes_request_max` until one reads past the op's last change (at most `changes_per_op_max`),
+/// then one to fill the last window.
+const changes_requests_max = 2 + (changes_per_op_max + changes_request_max - 1) /
     changes_request_max;
 
 const Document = struct {
@@ -640,7 +640,7 @@ fn feed_put(
 
 /// Reads `feed` from the start in pages of `limit`, checking each page against what `limit`
 /// promises: it ends at an op boundary, and holds its first op and no more than `limit - 1`
-/// changes beyond it. A page costs at most `3 + ceil(changes in its first op / request max)`
+/// changes beyond it. A page costs at most `2 + ceil(changes in its first op / request max)`
 /// requests, a bound that does not depend on how many pages there are. Returns the documents.
 fn feed_pages_check(arena: std.mem.Allocator, feed: []const Change, limit: u32) !usize {
     var client = FeedClient.init(feed);
@@ -678,7 +678,7 @@ fn feed_pages_check(arena: std.mem.Allocator, feed: []const Change, limit: u32) 
             const op = try std.fmt.parseInt(u64, parsed.object.get("op").?.string, 10);
             try testing.expectEqual(client.query_op, op);
         }
-        const request_bound = 3 + (first_op_changes + changes_request_max - 1) /
+        const request_bound = 2 + (first_op_changes + changes_request_max - 1) /
             changes_request_max;
         try testing.expect(client.requests - requests_before <= request_bound);
         if (!more) return documents_total;
@@ -856,7 +856,7 @@ fn feed_ops(
 }
 
 /// Asserts that `changes` answers (`cursor`, `limit`) exactly as the model does, within
-/// `3 + ceil(first op's changes / changes_request_max)` requests, and returns what the test
+/// `2 + ceil(first op's changes / changes_request_max)` requests, and returns what the test
 /// needs of the reply.
 fn changes_same_as_model(
     arena: std.mem.Allocator,
@@ -880,7 +880,7 @@ fn changes_same_as_model(
     var first_op_changes: usize = 0;
     while (start + first_op_changes < feed.len and
         feed[start + first_op_changes].op == feed[start].op) first_op_changes += 1;
-    const request_bound = 3 + (first_op_changes + changes_request_max - 1) / changes_request_max;
+    const request_bound = 2 + (first_op_changes + changes_request_max - 1) / changes_request_max;
     try testing.expect(client.requests <= request_bound);
 
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena, reply.body, .{});

@@ -16,7 +16,7 @@ from the page's start. So after the first request (sized by `limit`) shows that 
 continues, the rest of the op is read in the largest requests one `get_changes` returns, and one
 more request of fewer than `limit` changes reads up to that window's end if the large requests
 stopped short of it. Whatever was read past the window's end is discarded. The loop is bounded by
-`3 + ceil(changes_per_op_max / changes_request_max)` requests.
+`2 + ceil(changes_per_op_max / changes_request_max)` requests.
 
 **Reason.** Reading on in requests of `limit` made one HTTP read cost about (changes in the op ÷
 `limit`) sequential cluster round trips: about 8 s for `limit=1` on an idle machine, and past the
