@@ -28,8 +28,9 @@ esac
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get -o Acquire::Retries=5 update -qq
+# What GitHub's ubuntu-24.04 runner has and the scripts use (unzip: .github/scripts/mac_zip_check.sh).
 apt-get -o Acquire::Retries=5 install -y -qq --no-install-recommends ca-certificates curl git \
-    xz-utils python3 openssl procps iproute2 gnupg >/dev/null
+    xz-utils python3 openssl procps iproute2 gnupg unzip zip jq file >/dev/null
 # Jepsen drives the host's Docker (the socket is mounted; the client is below) with a JDK, gnuplot
 # and ssh-keygen.
 [ "$job" != jepsen ] || apt-get -o Acquire::Retries=5 install -y -qq --no-install-recommends \
@@ -42,6 +43,20 @@ if [ "$code" = false ]; then
     echo "Markdown alone: nothing to prove, $job passes without running (N68)."
     exit 0
 fi
+
+# Nerva's IO is io_uring. Docker's default seccomp profile refuses it (Docker 25 and later), and a
+# replica then exits 70 with its reason in a log the tests discard: say so here instead.
+python3 - <<'EOF' || exit 1
+import ctypes, os, sys
+libc = ctypes.CDLL(None, use_errno=True)
+params = ctypes.create_string_buffer(120)  # struct io_uring_params
+fd = libc.syscall(425, 1, params)  # io_uring_setup, the same number on x86_64 and aarch64
+if fd < 0:
+    err = ctypes.get_errno()
+    sys.exit(f"error: io_uring is refused here ({os.strerror(err)}): the step must be privileged "
+             "(.woodpecker/*.yaml), or the host has kernel.io_uring_disabled set")
+os.close(fd)
+EOF
 
 [ "$job" != check ] || ci/install_repo_tools.sh
 
