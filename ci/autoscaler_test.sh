@@ -94,7 +94,7 @@ env_names=$(grep -o '"WOODPECKER_[A-Z_]*=' "$root/ops/ci/autoscaler/nerva-autosc
 for f in $env_names; do echo "--flag value (env) [\$$f]" >> "$STUB_HELP"; done
 
 uid=$(id -u)
-export NERVA_CI_ROOT_UID=$uid NERVA_AS_NO_SYSTEMD=1 NERVA_AS_POLL=0 PATH="$stubs:$PATH"
+export NERVA_CI_ROOT_UID=$uid NERVA_AS_NO_SYSTEMD=1 NERVA_AS_POLL=0 PATH="$stubs:$PATH" NERVA_AS_LOCK="$tmp/image.lock"
 etc="$tmp/etc"
 export NERVA_CI_ETC="$etc" NERVA_AS_LIB="$tmp/lib" NERVA_AS_UNITS="$tmp/units" NERVA_HCLOUD_API=https://hcloud.test/v1
 mkdir -p "$etc"
@@ -314,6 +314,24 @@ refuses "a build whose create reply is lost" NRV-E1241 build_inst
 has "the trap found the server by its name" "$STUB_LOG/curl.calls" '^GET /servers$'
 has "the trap deleted that server" "$STUB_LOG/curl.calls" '^DELETE /servers/9$'
 has "the trap deleted the key of that build" "$STUB_LOG/curl.calls" '^DELETE /ssh_keys/7$'
+# The server is locked while it is snapshotted: the first delete is refused, the trap retries.
+api_for_build
+printf '{"error":{"message":"locked"}}\n423' > "$STUB_API/DELETE__servers_8.1"
+STUB_SSH_FAIL=1 refuses "a build whose server is locked at the first delete" NRV-E1242 build_inst
+n=$((n + 1))
+[ "$(grep -c '^DELETE /servers/8$' "$STUB_LOG/curl.calls")" = 2 ] || bad "the trap did not retry the refused delete of the server"
+# Two builds at once: the second is refused and touches nothing. Names carry the second and the pid.
+api_for_build
+flock -x "$NERVA_AS_LOCK" sleep 2 &
+lockpid=$!
+sleep 0.5
+refuses "a second build while one runs" NRV-E1242 build_inst
+wait "$lockpid"
+n=$((n + 1))
+[ ! -s "$STUB_LOG/curl.calls" ] || bad "a refused second build called the Hetzner API: $(cat "$STUB_LOG/curl.calls")"
+api_for_build
+ok "a build after the lock is free" build_inst
+has "the server name has the second and the pid" "$STUB_LOG/curl.args" 'nerva-ci-image-[0-9]{8}-[0-9]{6}-[0-9]+'
 api_for_build
 
 # --- NRV-E1239: not root, a tool missing --------------------------------------------------------------
@@ -365,10 +383,15 @@ has "the metadata block is enabled at boot" "$as/nerva-ci-metadata-block.service
 has "provision installs the metadata block" "$as/provision-image.sh" 'nerva-ci-metadata-block.service'
 has "provision checks the rule is in place" "$as/provision-image.sh" 'iptables -w -C DOCKER-USER -d 169.254.169.254 -j DROP'
 ci_tmpl="$as/cloud-init.tmpl.yaml"
+# Fail closed: the agent's start is one shell command, chained after the block unit and the rule check, and a failure powers off.
 n=$((n + 1))
-{ [ "$(grep -n 'systemctl start nerva-ci-metadata-block' "$ci_tmpl" | cut -d: -f1)" -lt "$(grep -n 'docker compose' "$ci_tmpl" | cut -d: -f1)" ]; } || bad "cloud-init does not block the metadata service before it starts the agent"
+chain=$(grep -E '^  - systemctl start nerva-ci-metadata-block.service && iptables -w -C DOCKER-USER -d 169.254.169.254 -j DROP && docker compose -f /root/docker-compose.yml up -d \|\| poweroff$' "$ci_tmpl")
+[ -n "$chain" ] || bad "cloud-init does not start the agent only after the metadata block and its check, powering off otherwise"
 n=$((n + 1))
-{ [ "$(grep -n 'docker compose' "$ci_tmpl" | cut -d: -f1)" -lt "$(grep -n 'rm -f /root/docker-compose.yml' "$ci_tmpl" | cut -d: -f1)" ]; } || bad "cloud-init does not delete its copy of the token after it starts the agent"
+[ "$(grep -c 'docker compose' "$ci_tmpl")" = 1 ] || bad "cloud-init starts the agent somewhere other than the guarded line"
+n=$((n + 1))
+{ [ "$(grep -n 'docker compose' "$ci_tmpl" | head -n 1 | cut -d: -f1)" -lt "$(grep -n 'rm -f /root/docker-compose.yml' "$ci_tmpl" | cut -d: -f1)" ]; } || bad "cloud-init does not delete its copy of the token after it starts the agent"
+has "cloud-init deletes the pickled datasource" "$ci_tmpl" 'rm -f .*/var/lib/cloud/instance/obj.pkl'
 has "cloud-init deletes its user data" "$ci_tmpl" 'rm -f .*/var/lib/cloud/instance/user-data.txt'
 
 # --- Workflows: every one has a tier, a cloud one never runs for main, none is privileged ----------

@@ -15,7 +15,7 @@
 # (lib.sh `hcloud`): never in argv, the environment or a log. Needs curl, jq, ssh, ssh-keygen, rsync and flock.
 # Where it looks, for ci/autoscaler_test.sh: NERVA_CI_ETC, NERVA_HCLOUD_API, NERVA_CI_CACHE_ROOT
 # (/var/cache/nerva-ci), NERVA_AS_KEEP (2: how many snapshots prune keeps, at least 1) and NERVA_AS_POLL
-# (10: seconds between polls). Build servers and keys carry the label nerva-ci-pool=build.
+# (10: seconds between polls), NERVA_AS_LOCK (/run/lock/nerva-ci-image.lock: one build at a time). The snapshot may take 30 minutes. Build servers and keys carry the label nerva-ci-pool=build.
 # shellcheck disable=SC2154,SC2034 # etc, tool and the pins come from lib.sh (not followed: no -x)
 set -euo pipefail
 
@@ -76,13 +76,13 @@ seed_copy() {
     (cd "$1" && "${pre[@]}" rsync -aR -e "ssh ${ssh_opts[*]}" "${paths[@]}" "$2")
 }
 
-wait_for() { # wait_for DESCRIPTION JQ_EXPR PATH: polls (at most 60 x 10 s) until the jq expression holds
-    local i
-    for i in $(seq 1 60); do
+wait_for() { # wait_for DESCRIPTION JQ_EXPR PATH [POLLS]: polls (at most POLLS x 10 s, 60 = 10 minutes) until the jq expression holds
+    local i polls="${4:-60}"
+    for i in $(seq 1 "$polls"); do
         if hcloud GET "$3" | jq -e "$2" > /dev/null; then return 0; fi
         sleep "${NERVA_AS_POLL:-10}"
     done
-    fail "NRV-E1242: the image was not built: gave up waiting for $1 (10 minutes)"
+    fail "NRV-E1242: the image was not built: gave up waiting for $1 ($((polls / 6)) minutes)"
 }
 
 build() {
@@ -94,14 +94,17 @@ build() {
     seed="${NERVA_CI_CACHE_ROOT:-/var/cache/nerva-ci}/main"
     { [ -d "$seed/tools" ] || [ -d "$seed/zig/p" ]; } || fail "NRV-E1242: the image was not built: the box's main cache $seed has no tools/ or zig/p/ (run a pipeline on main first: it is the warm-cache seed)"
     for i in curl jq ssh ssh-keygen rsync flock; do command -v "$i" > /dev/null || fail "NRV-E1239: $i is not installed"; done
+    # One build at a time: two would race on autoscaler.image and the prune, and on server names.
+    exec 9> "${NERVA_AS_LOCK:-/run/lock/nerva-ci-image.lock}"
+    flock -n 9 || fail "NRV-E1242: the image was not built: another build is running (it holds ${NERVA_AS_LOCK:-/run/lock/nerva-ci-image.lock})"
     tmp=$(mktemp -d /var/tmp/nerva-image.XXXXXX)
     # shellcheck disable=SC2064
     trap "cleanup_build '$tmp'" EXIT
     sweep
-    stamp=$(date -u +%Y%m%d-%H%M)
+    stamp="$(date -u +%Y%m%d-%H%M%S)-$$"
     echo "nerva-ci-image-$stamp" > "$tmp/name"
     ssh-keygen -q -t ed25519 -N '' -f "$tmp/key" -C "nerva-ci-image-$stamp"
-    key_id=$(hcloud POST /ssh_keys "$(jq -n --arg n "nerva-ci-image-$stamp-$$" --arg k "$(cat "$tmp/key.pub")" --arg l "$POOL_LABEL" '{name: $n, public_key: $k, labels: {($l): "build"}}')" | jq -r '.ssh_key.id')
+    key_id=$(hcloud POST /ssh_keys "$(jq -n --arg n "nerva-ci-image-$stamp" --arg k "$(cat "$tmp/key.pub")" --arg l "$POOL_LABEL" '{name: $n, public_key: $k, labels: {($l): "build"}}')" | jq -r '.ssh_key.id')
     echo "$key_id" > "$tmp/key_id"
     srv_id=$(hcloud POST /servers "$(jq -n --arg n "nerva-ci-image-$stamp" --arg t "$AS_SERVER_TYPE" --arg l "$AS_LOCATION" --argjson k "$key_id" --arg p "$POOL_LABEL" \
         '{name: $n, server_type: $t, location: $l, image: "ubuntu-24.04", ssh_keys: [$k], start_after_create: true, labels: {($p): "build"}}')" | jq -r '.server.id')
@@ -125,7 +128,7 @@ build() {
     wait_for "the build server to power off" '.server.status == "off"' "/servers/$srv_id"
     img=$(hcloud POST "/servers/$srv_id/actions/create_image" "$(jq -n --arg d "nerva-ci-agent-$stamp" --arg l "$POOL_LABEL" '{type: "snapshot", description: $d, labels: {($l): "snapshot"}}')" | jq -r '.image.id')
     [[ "$img" =~ ^[0-9]+$ ]] || fail "NRV-E1242: the image was not built: Hetzner returned no snapshot id"
-    wait_for "the snapshot $img to be available" '.image.status == "available"' "/images/$img"
+    wait_for "the snapshot $img to be available" '.image.status == "available"' "/images/$img" 180
     printf '%s\n' "$img" > "$etc/autoscaler.image.new"
     chmod 0644 "$etc/autoscaler.image.new"
     mv "$etc/autoscaler.image.new" "$etc/autoscaler.image"
@@ -136,13 +139,21 @@ build() {
 # call's reply was lost, the server is looked up by its name. What no trap can reach (SIGKILL, a reboot) is
 # swept by the next build (sweep).
 cleanup_build() {
-    local rc=$? id
+    local rc=$? id i deleted=0
     set +e
     if [ ! -s "$1/srv_id" ] && [ -s "$1/name" ]; then
         id=$(hcloud GET "/servers?name=$(cat "$1/name")" 2> /dev/null | jq -r '.servers[0].id // empty' 2> /dev/null)
         [ -z "$id" ] || echo "$id" > "$1/srv_id"
     fi
-    if [ -s "$1/srv_id" ]; then id=$(cat "$1/srv_id"); (hcloud DELETE "/servers/$id" > /dev/null 2>&1) || echo "$tool: warning: could not delete the build server $id: delete it in the Hetzner console" >&2; fi
+    if [ -s "$1/srv_id" ]; then
+        # A server that is still being snapshotted is locked: the delete is refused until the snapshot ends, so retry (30 x 10 s).
+        id=$(cat "$1/srv_id")
+        for i in $(seq 1 30); do
+            if (hcloud DELETE "/servers/$id" > /dev/null 2>&1); then deleted=1; break; fi
+            sleep "${NERVA_AS_POLL:-10}"
+        done
+        [ "$deleted" = 1 ] || echo "$tool: warning: could not delete the build server $id: delete it in the Hetzner console" >&2
+    fi
     if [ -s "$1/key_id" ]; then id=$(cat "$1/key_id"); (hcloud DELETE "/ssh_keys/$id" > /dev/null 2>&1) || echo "$tool: warning: could not delete the build SSH key $id" >&2; fi
     rm -rf "$1"
     exit "$rc"

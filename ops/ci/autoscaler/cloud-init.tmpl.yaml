@@ -18,15 +18,17 @@ write_files:
           - {{ $key }}={{ $value }}
           {{- end }}
 runcmd:
-  # Before any job can run: containers cannot reach the metadata service (the snapshot's unit; the user data
-  # holds the agent token). The unit is enabled in the snapshot; this makes sure it is in place first.
-  - systemctl start nerva-ci-metadata-block.service
   {{- range .PreExec }}
   - {{ . }}
   {{- end }}
-  - docker compose -f /root/docker-compose.yml up -d
-  # The token is in the agent container now: delete cloud-init's copies of it (the metadata service keeps its own).
-  - rm -f /root/docker-compose.yml /var/lib/cloud/instance/user-data.txt /var/lib/cloud/instance/user-data.txt.i /var/lib/cloud/instance/cloud-config.txt
+  # Fails closed: the agent starts only if containers cannot reach the metadata service (the snapshot's unit, and
+  # the DOCKER-USER rule in place: the user data holds the agent token). If any step fails, the server powers
+  # itself off: it takes no job, deletes nothing, and the autoscaler reaps a server whose agent never connects.
+  # One list item, so the && chain and the || are one shell command (runcmd lines do not stop on failure).
+  - systemctl start nerva-ci-metadata-block.service && iptables -w -C DOCKER-USER -d 169.254.169.254 -j DROP && docker compose -f /root/docker-compose.yml up -d || poweroff
+  # The token is in the agent container now: delete cloud-init's copies of it (the metadata service keeps its own; obj.pkl is the pickled datasource, user data
+  # included, and cloud-init rebuilds it at the next boot).
+  - rm -f /root/docker-compose.yml /var/lib/cloud/instance/user-data.txt /var/lib/cloud/instance/user-data.txt.i /var/lib/cloud/instance/cloud-config.txt /var/lib/cloud/instance/obj.pkl
   {{- range .PostExec }}
   - {{ . }}
   {{- end }}
