@@ -12,6 +12,12 @@
 # One Jepsen run at a time on a machine; the
 # store and memory record stay in /var/cache/nerva-ci/jepsen/ for 14 days. The branch is not
 # deleted here: GitHub's jepsen.yml does that while it still runs on the same pushes.
+# Where it runs (decision O6): `tier: box`, only the CI box takes it (main, cron and manual runs, Jepsen and the long searches stay where
+# the caches and the Docker socket are).
+
+labels:
+  tier: box
+
 when:
   - event: push
     branch: 'jepsen/**'

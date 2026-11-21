@@ -1,0 +1,13 @@
+[Unit]
+Description=Containers cannot reach the cloud metadata service (decision O6: it serves the agent token in the user data)
+After=docker.service
+Requires=docker.service
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'iptables -w -C DOCKER-USER -d 169.254.169.254 -j DROP 2>/dev/null || iptables -w -I DOCKER-USER -d 169.254.169.254 -j DROP'
+
+[Install]
+WantedBy=multi-user.target

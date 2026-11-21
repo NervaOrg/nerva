@@ -1,0 +1,18 @@
+[Unit]
+Description=Nerva CI autoscaler (on-demand Hetzner Cloud agents, decision O6)
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+# The container is the autoscaler: if its docker client dies, it would go on creating servers. So it is
+# removed before every start, when the service stops, and after it ends however it ended.
+ExecStartPre=-/usr/bin/docker rm -f nerva-autoscaler
+ExecStart=/usr/local/lib/nerva-ci/ci/autoscaler/nerva-autoscaler.sh run
+ExecStop=-/usr/bin/docker rm -f nerva-autoscaler
+ExecStopPost=-/usr/bin/docker rm -f nerva-autoscaler
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

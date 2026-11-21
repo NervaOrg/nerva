@@ -855,6 +855,9 @@ fi
 is "host installs the mount roots root-owned (static)" 1 "$(grep -c 'install -d -m 0755 -o 0 -g 0 "\$root" "\$root/main" "\$root/branches" "\$root/jepsen"' ops/ci/nerva-woodpecker.sh || true)"
 refuses NRV-E1216 "host: docker is down" nw FAKE_DOCKER=down -- host
 refuses NRV-E1216 "host: no agent container" nw FAKE_DOCKER=noagent -- host
+out=$(nw FAKE_DOCKER=noagent -- host --no-agent 2>&1) || { echo "FAIL host --no-agent without an agent container (the snapshot build server): $out" >&2; fail=1; }
+grep -q 'nerva-woodpecker: OK host' <<<"$out" || { echo "FAIL host --no-agent: no OK line in: $out" >&2; fail=1; }
+refuses NRV-E1221 "host: an unknown flag" nw FAKE_DOCKER=ok -- host --nonsense
 nodocker="$tmp/nodocker"
 mkdir "$nodocker"
 for t in dirname readlink; do ln -s "$(command -v $t)" "$nodocker/$t"; done

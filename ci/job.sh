@@ -8,7 +8,8 @@
 #                                   20 minutes)
 #   ci/job.sh check-code            typecheck, format, the quickstart loop, declared views
 #   ci/job.sh check-scripts         the release, perf, fleet, Jepsen and CI scripts' tests
-#   ci/job.sh check-packages        the package repositories' tests (the longest of the scripts')
+#   ci/job.sh check-packages [N]    the package repositories' tests (the longest of the scripts'); N is
+#                                   1, 2 or 3: a third of the test classes (decision O6), else all of them
 #   ci/job.sh integration           three real replicas (~3.5 GiB of disk)
 #   ci/job.sh api                   the JSON API against a model
 #   ci/job.sh releases              mixed releases
@@ -67,6 +68,7 @@ check_scripts() {
     # on what root does need root: both CIs run it as root before this (CI_SCRIPTS_TESTED=1), and
     # only a run by hand, as anyone, comes here (it says what it skipped).
     if [ "${CI_SCRIPTS_TESTED:-}" = 1 ]; then echo "ci/ci_test.sh: already run as root by the caller"; else ci/ci_test.sh; fi
+    ci/autoscaler_test.sh # the cloud agents' scripts, the tier labels and the package shards (decision O6)
     python3 .github/scripts/test_sbom.py
     python3 .github/scripts/test_release_check.py
     python3 .github/scripts/test_mac_sign.py
@@ -82,8 +84,31 @@ check_scripts() {
     python3 -I ops/jepsen/test_jepsen_report.py
 }
 
+# The test classes of .github/scripts/test_package_repos.py in three shards of about 36 tests each
+# (decision O6). Each class is in exactly one shard: ci/autoscaler_test.sh reads this table and the
+# file's classes, and fails (NRV-E1244) on a class in none or in two, or a name that is not a class.
+# shellcheck disable=SC2034 # the three are read through ${!var} in check_packages
+package_shards_1="Ready Happy"
+# shellcheck disable=SC2034
+package_shards_2="Slice2b Parsing Roles"
+# shellcheck disable=SC2034
+package_shards_3="Bucket Publish"
+
 check_packages() {
-    python3 -I .github/scripts/test_package_repos.py
+    local shard="${1:-}" classes
+    case "$shard" in
+    "") python3 -I .github/scripts/test_package_repos.py ;;
+    1 | 2 | 3)
+        local var="package_shards_$shard"
+        classes="${!var}"
+        # shellcheck disable=SC2086 # the class names are words
+        python3 -I .github/scripts/test_package_repos.py $classes
+        ;;
+    *)
+        ci_error "NRV-E1208: usage: ci/job.sh check-packages [1|2|3]"
+        exit 2
+        ;;
+    esac
 }
 
 case "$job" in
@@ -94,7 +119,7 @@ check)
     ;;
 check-code) check_code ;;
 check-scripts) check_scripts ;;
-check-packages) check_packages ;;
+check-packages) check_packages "$arg" ;;
 integration) ./zig/zig build test:integration ;;
 api) ./zig/zig build test:api ;;
 releases) ./zig/zig build test:release ;;

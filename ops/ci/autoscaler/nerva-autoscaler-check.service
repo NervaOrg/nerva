@@ -1,0 +1,9 @@
+[Unit]
+Description=Warn of Nerva CI cloud servers over the cap or leaked (decision O6, NRV-W1208)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/nerva-ci/ci/autoscaler/nerva-autoscaler.sh check
+TimeoutStartSec=5m
