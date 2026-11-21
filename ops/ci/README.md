@@ -363,10 +363,20 @@ set:
    2. `mktemp -d` of a branch's seed directory `<key>.partial.XXXXXX` in `branches/` (O_EXCL, a name no
       job can predict), `chown -h` of it to the job, and `mv -T` of it to the branch's name. The seed
       itself (`cp -a` of main's `zig/p`, the `mkdir`s inside) is the job's user's, never root's.
-   3. `rm -rf --one-file-system` of a direct child of a mount root that the job's own uid owns and
-      cannot use (`ci_child_reset`: a file, a FIFO, a socket, or a directory the job's normalization
-      could not make usable), under the lock that keeps other jobs out, NRV-W1204; and the prune's
-      `rm -rf` of a direct child, which is the same operation.
+   3. `mv -T` of a direct child of a mount root into that mount root's own `.trash` (root's, mode 0700,
+      not a link, no ACL, the mount's file system, so `mv` never copies: NRV-E1236 if it is not):
+      a child the job's own uid owns and cannot use (`ci_child_reset`: a file, a FIFO, a socket, or a
+      directory the job's normalization could not make usable), NRV-W1204, a branch cache the prune
+      drops, a killed seed's partial directory and an old Jepsen run directory. **Root never walks a
+      job's tree under a lock other steps wait on** (`branches.lock`, `main.lock`, a key lock held
+      exclusively, the children lock): under a lock it only decides and renames. The trash is emptied
+      (`rm -rf --one-file-system` of its names, bounded by `CI_NORMALIZE_SECONDS`, NRV-W1205 if it
+      cannot) after the lock is released, and a branch's size is measured after the locks, by its own
+      step (`locks/<key>.size`, `du` bounded by `CI_BRANCH_DU_SECONDS`; a timeout counts as over every
+      bound), so the prune reads records and walks nothing. The disk-low test also watches inodes
+      (`CI_MIN_FREE_INODES`, default 100000), as a job's empty files cost no blocks. "No job can reach
+      the trash" is true by path; a job that already had a directory open when it was moved can still
+      write in it until the trash is emptied.
    4. `chown`, `chmod 0755` and `setfacl -b -k` of a mount root itself, when it is not root-owned
       0755 with no ACL (`ci_mount_root`, NRV-W1203): a link is never touched (NRV-E1229).
 
@@ -382,8 +392,9 @@ set:
    builds that read it, never a root operation. A branch's prune removes only a branch idle for 7 days, so a
    cache builds keep using is cleared only at once, with `bash ci/nerva-woodpecker.sh reset-cache main|jepsen|BRANCH|--branch BRANCH`
    on the host: main's cache has no prune, a manual pipeline uses `b-main-<sum>` (`--branch main`), and `jepsen/` has none either. It takes the same locks, moves the
-   children into `locks/trash` and empties the trash after releasing them, so a step is never held for the removal (host and the next reset remove a leftover trash; NRV-E1235 if the cache root is not safe, has an ACL, or pipelines hold a lock for `NERVA_CI_RESET_WAIT` seconds, default 60). A reset racing a main step never gives that step NRV-E1228. The making of a
-   child by root runs under `<root>-children.lock`, so concurrent steps never refuse each other; a step
+   children into `locks/trash` (the host command's own trash; steps use each mount root's `.trash`) and empties the trash after releasing them, so a step is never held for the removal (host and the next reset remove a leftover trash; NRV-E1235 if the cache root is not safe, has an ACL, or pipelines hold a lock for `NERVA_CI_RESET_WAIT` seconds, default 60). A reset racing a main step never gives that step NRV-E1228. The making of a
+   child by root runs under `<root>-children.lock`, so concurrent steps do not refuse each other over a reset (it is a rename: the one that loses the race
+   finds the other's fresh directory; NRV-E1228 stays for a child another uid owns, or one still not usable after the reset); a step
    waits `CI_CHILD_LOCK_WAIT` (30 s) for it, then NRV-E1234. A direct child that the job owns and cannot use,
    whatever its type, is reset by root (3); one another user owns is NRV-E1228 and never touched,
    and so is one that other jobs hold the lock of. Whether `main/` and `branches/` are
@@ -396,7 +407,7 @@ set:
    host; it is only a cache). Main's deeper paths in a branch's pipeline are not repaired there:
    main is mounted `:ro`, so damage below `main/zig` is repaired by the next pipeline for main.
    The normalization is bounded by `CI_NORMALIZE_SECONDS` (default 600 s); a tree it cannot get
-   through in that time is removed with NRV-W1204 and starts empty.
+   through in that time is moved aside with NRV-W1204 and starts empty.
    A lock that stays busy is never waited on for good: the branch caches' lock and a prune warn
    (NRV-W1202) and the job runs; a branch's own cache lock waits `CI_LOCK_WAIT` (300 s) and then
    fails NRV-E1225 (another step's prune of that cache, or a process on the host, holds it);

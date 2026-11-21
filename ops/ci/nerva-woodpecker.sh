@@ -28,7 +28,7 @@ fail() { echo "nerva-woodpecker: FAIL $*" >&2; exit 1; }
 say() { echo "nerva-woodpecker: $*"; }
 
 host() {
-    local probe msg root dev modules
+    local probe msg root dev modules n t
     root="${NERVA_CI_CACHE_ROOT:-/var/cache/nerva-ci}"
     dev="${NERVA_CI_DEV:-/dev}"
     modules="${NERVA_CI_MODULES_DIR:-/etc/modules-load.d}"
@@ -78,11 +78,23 @@ host() {
     # a job could write (NRV-E1226).
     install -d -m 0700 -o 0 -g 0 "$root/locks"
     # What a `reset-cache` that stopped between moving a cache aside and removing it left (it is
-    # in locks/, which no job reaches): removed.
+    # in locks/, which no job reaches by path): removed. So is what a step's prune or reset left in
+    # a mount root's own .trash (root's, 0700: ci/cache.sh, ci_trash_move); the directory stays,
+    # a step may be using it.
     [ ! -d "$root/locks/trash" ] || rm -rf --one-file-system -- "$root/locks/trash"
+    for n in main branches jepsen; do
+        t="$root/$n/.trash"
+        if [ -L "$t" ] || { [ -e "$t" ] && [ "$(stat -c %u "$t")" != 0 ]; }; then
+            # Not root's: a job made it while it owned the mount root (an earlier layout). A step
+            # refuses it (NRV-E1236); removed whole, never followed.
+            rm -rf --one-file-system -- "$t"
+        elif [ -d "$t" ]; then
+            find "$t" -mindepth 1 -maxdepth 1 -exec rm -rf --one-file-system -- {} +
+        fi
+    done
     # What the first layout left (one shared cache for every branch) is no longer read. A plain
     # loop: on a fresh box none of them exists, which would fail an `ls` under pipefail.
-    local old="" n
+    local old=""
     for n in nerva-toolchain zig zig-local zig-cache; do
         [ ! -e "$root/$n" ] || old="$old$n "
     done
@@ -174,7 +186,8 @@ has_acl() {
 # (main's, the branch's own, or the Jepsen lock; steps hold them shared, or the Jepsen one
 # exclusively, while they run) and the children lock (no step is in the middle of making the
 # directory). Under the locks each name is only RENAMED (mv -T, a rename within one file system)
-# into locks/trash, which no job can reach; the locks are let go, and then the renamed trees are
+# into locks/trash, which no job can reach by path (a job that already has a working directory
+# inside the tree keeps it, and can go on writing there while it is removed); the locks are let go, and then the renamed trees are
 # removed (rm -rf --one-file-system, never following a link). The children lock is therefore held
 # for milliseconds, whatever the size of the cache (NRV-E1234's premise), and a crash between the
 # two leaves a tree in locks/trash that the next reset-cache, or `host`, removes. The next
@@ -234,7 +247,7 @@ reset_cache() {
         if [ -L "$f" ] || { [ -e "$f" ] && [ ! -f "$f" ]; }; then fail "NRV-E1235: $f is not a regular file: remove it"; fi
         [ -e "$f" ] || (umask 077 && set -C && : >"$f") 2>/dev/null || true
     done
-    # The trash: root's, 0700, in locks/ (which no job can open), on the mount's own file system so
+    # The trash: root's, 0700, in locks/ (which no job can open by path), on the mount's own file system so
     # that moving a tree in is a rename. Whatever an earlier run left there is removed below.
     trash="$root/locks/trash"
     if [ -L "$trash" ] || { [ -e "$trash" ] && [ ! -d "$trash" ]; }; then fail "NRV-E1235: $trash is not a directory: remove it"; fi
@@ -256,9 +269,11 @@ reset_cache() {
         5) fail "NRV-E1235: a cache directory of $what under $mount could not be moved aside: look at it with ls -la" ;;
         *) fail "NRV-E1235: the lock files under $root/locks could not be opened" ;;
     esac
-    # The locks are let go: pipelines make fresh directories while the old ones are removed.
+    # The locks are let go: pipelines make fresh directories while the old ones are removed. A job
+    # still writing in a tree it had open can make one rm fail (ENOTEMPTY): tried twice.
     find "$trash" -mindepth 1 -maxdepth 1 -exec rm -rf --one-file-system -- {} + ||
-        fail "NRV-E1235: $what's cache was moved aside, so pipelines are unaffected, but $trash could not be emptied (a mount inside it?): look at it with ls -la and remove what is in the way"
+        find "$trash" -mindepth 1 -maxdepth 1 -exec rm -rf --one-file-system -- {} + ||
+        fail "NRV-E1235: $what's cache was moved aside, so pipelines are unaffected, but $trash could not be emptied (a mount inside it, or a job still writing in it?): look at it with ls -la and remove what is in the way"
     for n in "${names[@]}"; do echo "nerva-woodpecker: removed $mount/$n"; done
     say "OK reset-cache $what: the next pipeline makes its cache directories again"
 }

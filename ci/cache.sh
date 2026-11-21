@@ -26,11 +26,25 @@
 #     branch's b-<key>, main's zig, zig-local and tools, jepsen's tools and each run's directory)
 #     with mkdir and chown (ci_child_make): safe, as the parent is root's and a job cannot swap it.
 #  2. A DIRECT CHILD THE JOB OWNS BUT CANNOT USE IS RESET BY ROOT, WHATEVER ITS TYPE (a directory
-#     that is not usable, a file, a FIFO, a socket; a link is unlinked): rm -rf --one-file-system of
-#     one name directly in a root-owned directory, which never follows a link, then a fresh
-#     mkdir and chown, NRV-W1204 (ci_child_reset, under the lock that keeps the other jobs out: the
-#     key's lock for a branch, main's exclusive one for main, the Jepsen lock for jepsen). A child
-#     another uid owns is never touched: NRV-E1228.
+#     that is not usable, a file, a FIFO, a socket; a link is unlinked): root renames that one name
+#     directly in a root-owned directory into the mount root's trash (mv -T into <mount>/.trash,
+#     ci_trash_move: a rename, which never follows a link), makes a fresh child with mkdir and chown,
+#     NRV-W1204 (ci_child_reset, under the lock that keeps the other jobs out: the key's lock for a
+#     branch, main's exclusive one for main, the Jepsen lock for jepsen), and removes the trash after
+#     the locks are let go (ci_trash_empty). A child another uid owns is never touched: NRV-E1228.
+#
+#     THE DESIGN RULE for every lock other steps wait on (branches.lock, main.lock, a key lock held
+#     exclusively, the children lock): under it root only DECIDES and RENAMES. It never walks a tree a
+#     job made (rm -rf, du, find): a job's tree can hold millions of files, and a walk of it under a
+#     lock holds every other step past its wait (NRV-W1202, NRV-E1228, NRV-E1224). A tree to drop is
+#     renamed into MOUNT/.trash, which is root's alone (mode 0700, not a link, no ACL, the mount
+#     root's own file system, so mv can never fall back to a copy: NRV-E1236 otherwise, nothing moved),
+#     and removed by ci_trash_empty after `flock -u`, bounded by CI_NORMALIZE_SECONDS, which tolerates a
+#     job still writing in a moved tree (NRV-W1205 if it cannot empty it; the next call retries). A
+#     branch's size is measured by its own step after the locks (ci_branch_measure, a record in
+#     locks/<key>.size; a du that outlasts CI_BRANCH_DU_SECONDS counts as over every bound), so the
+#     prune reads records and walks nothing. Accepted: the seed's cp -a of main/zig/p runs under the
+#     branches' lock and main's shared one, and a failed cp's cleanup is the job's own rm.
 #  3. THE JOB'S OWN TREE IS NORMALIZED BY THE JOB (ci_normalize, before each use): as the job,
 #     every directory under the child gets u+rwx and loses its ACLs (access and default), a file
 #     without u+rw gets it, a FIFO or a socket is removed, and each top-level name Zig needs
@@ -42,7 +56,8 @@
 #     child still has an ACL, is not usable or a known name is still wrong, rule 2 applies.
 #
 # What the three rules guarantee: no job can make a root operation act through a path it
-# controls, and a job's damage to the directories and the top-level names above is repaired
+# controls (the paths named above, "by path": a job that already had a directory open or as its
+# working directory before it was moved aside can still write in it until the trash is emptied), and a job's damage to the directories and the top-level names above is repaired
 # before the next job runs. What they do not (the accepted limit, decision O4, nineteenth
 # review): content damage below those names is the job's own, such as a corrupt cache file or a
 # file a job leaves where a Zig cache subdirectory (zig-local/o/<hash>) is expected. It makes the
@@ -52,13 +67,18 @@
 # (main's only when the disk is low). At once, on the host, `nerva-woodpecker.sh reset-cache`
 # removes main's (`main`), a branch's (`BRANCH`, or `--branch NAME`, which reaches a manual
 # pipeline on main: it runs in the branch role, key b-main-<sum>) or jepsen's tools (`jepsen`),
-# under the same locks. Concurrent steps never refuse each other: root's make of a child runs
-# under <root>-children.lock (root-only, in locks/) and a step that finds a root-owned
-# directory waits on it for the owner change (NRV-E1234 on timeout). A main step holds main's
+# under the same locks. Concurrent steps do not refuse each other over a reset: the reset is a
+# rename under <root>-children.lock (root-only, in locks/), so the step that loses the race finds the
+# other's fresh directory, and a step that finds a root-owned directory waits on it for the owner
+# change (NRV-E1234 on timeout). What still gives NRV-E1228 is a child another uid owns, one that
+# is still not usable after the reset, and a branch's directory whose key lock other steps of that
+# branch hold at the same moment (steps that all find it unusable at once need it exclusively, and none
+# gets it: the next step, which finds the fresh directory, runs). A main step holds main's
 # lock shared from before its first probe (ci_main_prepare), so a reset never falls in the middle.
 #
 # What root does inside a mount root, in all: mkdir, chown (-h), mktemp -d, mv -T of a partial
-# directory, rm -rf --one-file-system and rm -f of a name that is a DIRECT child, and, on a mount
+# directory, mv -T of a DIRECT child into the mount root's .trash, rm -rf --one-file-system of the
+# trash's names (never under a lock others wait on), rm -f of a name that is a DIRECT child, and, on a mount
 # root itself (a mount's own root, which a job cannot swap for a link or rename: EBUSY), chown,
 # chmod 0755 and setfacl -b -k. It never acts on a deeper path, and everything below a child is made,
 # changed and removed by the job's user (ci_as_job: `mkdir`, `cp`, `touch`, `rm`, `find`, `chmod`).
@@ -108,14 +128,15 @@ ci_job_not_root() {
     fi
 }
 
-# ci_knobs_check: NRV-E1208 when CI_NORMALIZE_SECONDS or CI_CHILD_LOCK_WAIT, if set, is not a whole
-# number of seconds (1 or more). They go to timeout(1) and flock -w, where 0 means no limit or no
-# wait, and anything else is an error from a root step's tool.
+# ci_knobs_check: NRV-E1208 when CI_NORMALIZE_SECONDS, CI_CHILD_LOCK_WAIT, CI_BRANCH_DU_SECONDS or
+# CI_MIN_FREE_INODES, if set, is not a whole number (1 or more, at most six digits). The seconds go
+# to timeout(1) and flock -w, where 0 means no limit or no wait, and anything else is an error from
+# a root step's tool; the inode threshold is compared as a number.
 ci_knobs_check() {
     local n
-    for n in CI_NORMALIZE_SECONDS CI_CHILD_LOCK_WAIT; do
+    for n in CI_NORMALIZE_SECONDS CI_CHILD_LOCK_WAIT CI_BRANCH_DU_SECONDS CI_MIN_FREE_INODES; do
         [ -z "${!n:-}" ] || [[ "${!n}" =~ ^[1-9][0-9]{0,5}$ ]] || {
-            ci_error "NRV-E1208: $n='${!n}' is not a whole number of seconds (1 or more)"
+            ci_error "NRV-E1208: $n='${!n}' is not a whole number (1 or more, at most six digits; seconds, or inodes for CI_MIN_FREE_INODES)"
             return 1
         }
     done
@@ -266,6 +287,66 @@ ci_normalize() {
     ' _ "$d" "${known[@]}"
 }
 
+# ci_trash_ready MOUNT: whether MOUNT/.trash is a place root can move a tree into: made here (mode
+# 0700) if it is not there, then a real directory (never a link) of this user's, mode 0700 with no
+# ACL (so no job can open or write it by path), on the same file system as MOUNT (so that a move in
+# is a rename). NRV-E1236 and return 1 if not.
+ci_trash_ready() {
+    local mount="$1" t="$1/.trash"
+    if [ ! -e "$t" ] && [ ! -L "$t" ]; then mkdir -m 0700 -- "$t" 2>/dev/null || true; fi
+    if [ -L "$t" ] || [ ! -d "$t" ] || [ "$(stat -c %u -- "$t")" != "$(id -u)" ] || [ -n "$(find "$t" -maxdepth 0 -perm /077)" ] ||
+        ci_has_acl "$t" || [ "$(stat -c %d -- "$t")" != "$(stat -c %d -- "$mount")" ]; then
+        ci_error "NRV-E1236: $t is not a plain directory of uid $(id -u)'s, mode 0700, with no ACL, on the same file system as $mount, so a cache directory could not be moved aside (root never walks a tree a job made while it holds a lock others wait on): on the host, rm -rf it and run bash ci/nerva-woodpecker.sh host again"
+        return 1
+    fi
+}
+
+# ci_trash_move PATH: the one thing root does to a tree a job made while it holds a lock other steps
+# wait on (the design rule at the top): it RENAMES it. PATH, a DIRECT child of a mount root (root's),
+# is moved with mv -T into a box of mktemp's making in MOUNT/.trash (ci_trash_ready: root's, 0700,
+# so no job can open it by path; in the mount root itself, so that the move is a rename within one
+# mount: /cache/locks and /cache/main are separate bind mounts in a step's container, and a move
+# between them would be EXDEV, which mv answers by COPYING the tree). mv can never copy here: PATH
+# must be on the same file system as the trash too, and `--no-copy` is given where mv has it. The
+# caller lets its lock go and then calls ci_trash_empty. A link is moved as the link, never
+# followed. A concurrent step's ci_trash_empty may remove the empty box between the mktemp and the
+# mv: tried three times. NRV-E1236 if the trash is not right; return 1 without a message if the
+# move itself failed (the name stays, and the caller refuses it).
+ci_trash_move() {
+    local p="$1" mount t box n nocopy=()
+    mount=$(dirname -- "$p")
+    t="$mount/.trash"
+    ci_trash_ready "$mount" || return 1
+    [ "$(stat -c %d -- "$p" 2>/dev/null)" = "$(stat -c %d -- "$t")" ] || return 1
+    if mv --help 2>&1 | grep -q -e '--no-copy'; then nocopy=(--no-copy); fi
+    for n in 1 2 3; do
+        box=$(mktemp -d "$t/t.XXXXXX" 2>/dev/null) || {
+            ci_error "NRV-E1236: could not make a directory in $t (a full disk?): $p was left where it is"
+            return 1
+        }
+        mv -T "${nocopy[@]}" -- "$p" "$box/x" 2>/dev/null && return 0
+        [ -e "$p" ] || [ -L "$p" ] || return 1
+    done
+    return 1
+}
+
+# ci_trash_empty MOUNT: removes whatever is in MOUNT/.trash (ci_trash_move's; a crashed step's
+# included): rm -rf --one-file-system of each direct child, never following a link (GNU rm walks
+# fd-relative; the trash is root's 0700, so no job can swap a name in it). Called with no lock held
+# that another step waits on, and bounded: each try ends after CI_NORMALIZE_SECONDS (default 600).
+# A job that still has a working directory in a moved tree can keep creating files in it while
+# this runs (the rename cuts off its `..`, not its cwd), so it is tried twice; if the trash is
+# still not empty, NRV-W1205 and the next step empties it (nothing waits for it).
+ci_trash_empty() {
+    local t="$1/.trash" n
+    [ -d "$t" ] && [ ! -L "$t" ] && [ "$(stat -c %u -- "$t")" = "$(id -u)" ] || return 0
+    for n in 1 2; do
+        timeout "${CI_NORMALIZE_SECONDS:-600}" find "$t" -mindepth 1 -maxdepth 1 -exec rm -rf --one-file-system -- {} + 2>/dev/null || true
+        [ -z "$(find "$t" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ] && return 0
+    done
+    ci_warning "NRV-W1205: $t could not be emptied (a job still writing in a tree moved there, a mount inside it, or too big to remove in ${CI_NORMALIZE_SECONDS:-600} s): nothing waits for it, and the next step removes what is left"
+}
+
 # ci_children_locked PATH CMD...: runs CMD (a command or one of these functions) holding the
 # exclusive "children" lock of the mount root PATH is a direct child of (locks/<root>-children.lock:
 # main-children.lock, branches-children.lock, jepsen-children.lock), waiting at most
@@ -339,12 +420,13 @@ ci_child_make_locked() {
     [ -d "$p" ] && [ ! -L "$p" ] && [ "$(stat -c %u -- "$p")" = "$job_uid" ]
 }
 
-# ci_child_reset PATH MOUNT: rule 2. Removes PATH, a DIRECT child of MOUNT (a mount's own root,
-# root's), whatever it is, if the job's own uid owns it: the prune's own operation (rm -rf of one
-# name, never following a link, one file system). The caller holds the lock that keeps every other
-# job out of it, and makes it again (ci_child_make). Another uid's, a deeper path, a link (probe
-# unlinks those) and a name that is still there after the rm (a mount inside it) are left: return 1.
-# NRV-W1204.
+# ci_child_reset PATH MOUNT: rule 2. Takes PATH, a DIRECT child of MOUNT (a mount's own root,
+# root's), whatever it is, out of the way if the job's own uid owns it: it is MOVED into
+# MOUNT/.trash (ci_trash_move, a rename), never removed here, because the caller holds the lock
+# that keeps every other job out of it and other steps wait on that lock. The caller makes the
+# name again (ci_child_make), lets its lock go and calls ci_trash_empty. Another uid's, a deeper
+# path, a link (probe unlinks those) and a name that is still there after the move are left:
+# return 1. NRV-W1204.
 ci_child_reset() {
     local p="$1" mount="$2" was
     [ "$(dirname -- "$p")" = "${mount%/}" ] || return 1
@@ -352,7 +434,7 @@ ci_child_reset() {
     [ "$(stat -c %u -- "$p")" = "$(ci_job_uid)" ] || return 1
     was=$(stat -c '%F, mode %a' -- "$p")
     ! ci_has_acl "$p" || was="$was, with an ACL"
-    rm -rf --one-file-system -- "$p" 2>/dev/null || true
+    ci_trash_move "$p" || return 1
     [ ! -e "$p" ] || return 1
     ci_warning "NRV-W1204: $p, owned by the job's user (${CI_JOB_USER:-$(id -un)}), was not a usable directory for it (writable and searchable; was: $was): removed, to be made again (it is only a cache; a job's chmod, ACL or file); if this keeps happening, look for the script that does it"
 }
@@ -360,12 +442,22 @@ ci_child_reset() {
 # ci_child_ensure PATH MOUNT [LOCKCMD...]: PATH, a direct child of MOUNT, made a directory the job
 # can use: probed, reset if it is the job's and unusable (after LOCKCMD, which takes the exclusive
 # access that keeps other jobs out and must succeed; none when the caller already holds it), made
-# if it is not there. NRV-E1228 if it still is not one.
+# if it is not there. NRV-E1228 if it still is not one. If LOCKCMD fails (a job that is running
+# holds the lock shared), another step that was resetting the same child at the same time may
+# have made it usable: LOCKCMD must leave the caller holding what it held before (the shared lock),
+# and the child is probed once more before it is refused.
 ci_child_ensure() {
     local p="$1" mount="$2" rc=0
     shift 2
     ci_child_probe "$p" || rc=$?
-    if [ "$rc" = 11 ] && { [ $# -eq 0 ] || "$@"; } && ci_child_reset "$p" "$mount"; then rc=10; fi
+    if [ "$rc" = 11 ] && [ $# -gt 0 ]; then
+        if "$@"; then
+            if ci_child_reset "$p" "$mount"; then rc=10; fi
+        else
+            rc=0
+            ci_child_probe "$p" || rc=$?
+        fi
+    elif [ "$rc" = 11 ] && ci_child_reset "$p" "$mount"; then rc=10; fi
     if [ "$rc" = 10 ] && ci_child_make "$p"; then rc=0; fi
     [ "$rc" = 0 ] || { ci_child_refused "$p"; return 1; }
 }
@@ -519,21 +611,66 @@ ci_job_dir() {
     done
 }
 
-# ci_dir_gib DIR...: the size of the directories together, in GiB rounded up.
+# ci_dir_gib DIR...: the size of the directories together, in GiB rounded up, counting blocks (not
+# inodes: ci_disk_low watches those). A job made the trees, so the walk is bounded by
+# CI_BRANCH_DU_SECONDS (default 60, timeout(1)) and a walk that does not end in time prints 999999:
+# over every bound. Never call it with the branches' lock (fd 7) or main's (fd 9) held, except for
+# a tree a step is about to copy, whose size is its own business (ci_branch_prepare, the seed).
 ci_dir_gib() {
-    du -s -B1G "$@" 2>/dev/null | awk '{n += $1} END {print n + 0}'
+    local out rc=0
+    out=$(timeout "${CI_BRANCH_DU_SECONDS:-60}" du -s -B1G "$@" 2>/dev/null) || rc=$?
+    if [ "$rc" = 124 ]; then echo 999999; return 0; fi
+    printf '%s\n' "$out" | awk '{n += $1} END {print n + 0}'
 }
 
-# ci_branch_prune BRANCHES LOCKS KEEP MAXN MAXDAYS MAXGIB: removes the branch caches nobody is using
+# ci_disk_low DIR MIN_GIB: whether the file system of DIR has less than MIN_GIB GiB free, or fewer
+# than CI_MIN_FREE_INODES (default 100000) inodes free (df -Pi). A job can exhaust the inodes with
+# empty files, which cost no blocks, so the GiB test alone would never call the box low. A file
+# system that reports no inode count (0 or "-": btrfs, for one) has no inode test.
+ci_disk_low() {
+    local avail ifree itotal
+    avail=$(df --output=avail -B1G "$1" | tail -1 | tr -d ' ')
+    [ "$avail" -ge "$2" ] || return 0
+    read -r itotal ifree < <(df -Pi "$1" | awk 'NR == 2 {print $2, $4}')
+    [[ "${itotal:-}" =~ ^[0-9]+$ ]] && [[ "${ifree:-}" =~ ^[0-9]+$ ]] && [ "$itotal" -gt 0 ] || return 1
+    [ "$ifree" -lt "${CI_MIN_FREE_INODES:-100000}" ]
+}
+
+# ci_branch_size LOCKS KEY: the size in GiB last measured for a branch's cache (ci_branch_measure),
+# 0 if there is none. Read under the branches' lock instead of walking the tree.
+ci_branch_size() {
+    local n
+    n=$(cat -- "$1/$2.size" 2>/dev/null) || n=0
+    [[ "$n" =~ ^[0-9]{1,6}$ ]] || n=0
+    echo "$n"
+}
+
+# ci_branch_measure LOCKS KEY DIR: measures DIR, this step's own cache, and records its size in
+# LOCKS/KEY.size (root's, in the lock directory; written whole and renamed). Called with the
+# branches' lock let go and only the key's own (shared) held, so the walk stalls nobody, and
+# bounded (ci_dir_gib: a timeout is recorded as over every bound). The next prune, or the next step
+# of this branch, reads the number under the lock and drops a cache that is over the bound.
+ci_branch_measure() {
+    local f="$1/$2.size"
+    ci_dir_gib "$3" >"$f.new" 2>/dev/null && mv -f -- "$f.new" "$f" 2>/dev/null || true
+}
+
+# ci_branch_prune BRANCHES LOCKS KEEP MAXN MAXDAYS MAXGIB: drops the branch caches nobody is using
 # (no job holds its lock) that are beyond the MAXN most recent, older than MAXDAYS days or larger
-# than MAXGIB GiB. KEEP, the caller's own, is never removed and counts
-# against MAXN. Call with the branches lock held.
+# than MAXGIB GiB (as ci_branch_measure last recorded it: nothing here walks a tree). KEEP, the
+# caller's own, is never dropped and counts against MAXN. Call with the branches lock held. It only
+# DECIDES and RENAMES: a dropped cache is moved into BRANCHES/.trash (ci_trash_move), and the
+# caller removes the trash (ci_trash_empty) after it has let the lock go. The bound counts blocks;
+# the box-wide low-disk prune (CI_BRANCH_PRUNE_ALL) also watches inodes (ci_disk_low).
 ci_branch_prune() {
     local b="$1" locks="$2" keep="$3" maxn="$4" maxdays="$5" maxgib="$6" rec d name n=0 drop
     # KEEP takes one of the MAXN places (it is made right after, if it is not there yet), so MAXN
     # is the most there are, KEEP included.
     n=1
-    rm -rf "$b"/*.partial.* 2>/dev/null || true # a killed seed's; seeds run under the lock
+    ci_trash_ready "$b" || return 0 # E1236 once; nothing is dropped, and the step goes on
+    for d in "$b"/*.partial.*; do # a killed seed's; seeds run under the lock
+        if [ -e "$d" ] || [ -L "$d" ]; then ci_trash_move "$d" 2>/dev/null || true; fi
+    done
     # Names come NUL-separated from find, never from parsing ls: a job can name a directory with a
     # newline in it, and a line of that name would be taken for a path. A name that is not one
     # ci_branch_key makes, or is not a real directory, is the job's own doing and is removed (a
@@ -542,7 +679,7 @@ ci_branch_prune() {
         name=${rec#* }
         [ "$name" != "$keep" ] || continue
         if ! [[ "$name" =~ ^b-[A-Za-z0-9._-]+$ ]] || [ -L "$b/$name" ] || [ ! -d "$b/$name" ]; then
-            rm -rf -- "${b:?}/$name" 2>/dev/null || true
+            ci_trash_move "$b/$name" 2>/dev/null || true
             continue
         fi
         d="$b/$name"
@@ -550,7 +687,7 @@ ci_branch_prune() {
         drop=no
         [ "$n" -le "$maxn" ] || drop=yes
         [ -z "$(find "$d" -maxdepth 0 -mtime +"$maxdays" 2>/dev/null)" ] || drop=yes
-        [ "$(ci_dir_gib "$d")" -le "$maxgib" ] || drop=yes
+        [ "$(ci_branch_size "$locks" "$name")" -le "$maxgib" ] || drop=yes
         [ "$drop" = yes ] || continue
         (
             # Made by ci_lock_file: 0600, never followed, in the step's own lock directory.
@@ -558,20 +695,30 @@ ci_branch_prune() {
             exec 5>>"$locks/$name.lock"
             # The lock file stays: unlinking it would let a job that opened it first keep a lock
             # on an inode no later prune opens. They are empty, one per branch key.
-            flock -x -n 5 && rm -rf "$d"
+            flock -x -n 5 && ci_trash_move "$d" && rm -f -- "$locks/$name.size"
         ) 2>/dev/null || true
     done < <(find "$b" -mindepth 1 -maxdepth 1 -name 'b-*' -printf '%T@ %f\0' 2>/dev/null | sort -z -rn)
 }
 
 # ci_branch_own_lock KEY LOCKED: a shared lock on fd 6 (the branch's own lock, opened by the caller),
-# waiting at most CI_LOCK_WAIT seconds; NRV-E1225 if it is not free (and the branches' lock on fd 7
-# is let go, if LOCKED is yes).
+# waiting at most CI_LOCK_WAIT seconds; NRV-E1225 if it is not free (return 1; the branches' lock on
+# fd 7 is let go, if LOCKED is yes). If LOCKED is yes the lock is first tried without waiting: if it
+# is not free, fd 7 and main's lock (fd 9) are let go BEFORE the bounded wait, so that nobody
+# waits behind a wait (the branch then starts unseeded, as one that never got fd 7), and the
+# return is 2 (got it, but the caller no longer holds fd 7).
 ci_branch_own_lock() {
+    local rc=0
+    if [ "$2" = yes ] && ! flock -s -n 6; then
+        flock -u 7
+        flock -u 9 2>/dev/null || true
+        rc=2
+    fi
     flock -s -w "${CI_LOCK_WAIT:-300}" 6 || {
         ci_error "NRV-E1225: $1's own cache lock was held for ${CI_LOCK_WAIT:-300} s: another step's prune of this branch's cache (it holds the lock exclusively while it removes it; see NRV-W1202), or a process on the host, holds it; lslocks on the host shows its pid; if the holder is just slow, raise CI_LOCK_WAIT"
         [ "$2" != yes ] || flock -u 7
         return 1
     }
+    return "$rc"
 }
 
 # ci_branch_prepare ROOT BRANCH: creates this branch's cache (zig/p, the fetched packages, a copy of main's, if that is no
@@ -582,7 +729,8 @@ ci_branch_own_lock() {
 # nobody is using goes. The lock on fd 7 (locks/branches.lock) serialises seeding and pruning; fd 6 is
 # taken before it is released, so no prune falls between.
 ci_branch_prepare() {
-    local root="$1" key b dir locks maxn maxdays maxgib seedgib partial err last rc locked=no
+    local root="$1" key b dir locks maxn maxdays maxgib seedgib seed_size partial err last rc locked=no own_rc
+    ci_knobs_check || return 1
     key=$(ci_branch_key "$2")
     b="$root/branches"
     dir="$b/$key"
@@ -592,17 +740,23 @@ ci_branch_prepare() {
     maxgib="${CI_BRANCH_CACHE_MAX_GIB:-12}"
     seedgib="${CI_BRANCH_SEED_MAX_GIB:-6}"
     [ "${CI_BRANCH_PRUNE_ALL:-}" != 1 ] || maxn=0
+    # The size of main's package cache decides whether this branch is seeded from it. It is
+    # measured here, before the branches' lock: a walk of a tree under that lock would stall every
+    # other branch's step (the design rule at the top). Only a branch with no directory yet needs it.
+    seed_size=
+    if [ ! -e "$dir" ] && [ -d "$root/main/zig/p" ]; then seed_size=$(ci_dir_gib "$root/main/zig/p"); fi
     ci_lock_file "$locks/branches.lock" || return 1
     { exec 7>>"$locks/branches.lock"; } 2>/dev/null || { ci_lock_open_failed "$locks/branches.lock" '>>'; return 1; }
     if flock -x -w "${CI_LOCK_WAIT:-300}" 7; then
         locked=yes
         ci_branch_prune "$b" "$locks" "$key" "$maxn" "$maxdays" "$maxgib"
-        # Its own cache over the size limit starts again, if no job of this branch is using it.
-        if [ -d "$dir" ] && [ "$(ci_dir_gib "$dir")" -gt "$maxgib" ]; then
+        # Its own cache over the size limit (as the last step recorded it, ci_branch_measure: no
+        # walk here) starts again, if no job of this branch is using it: moved aside, removed below.
+        if [ -d "$dir" ] && [ "$(ci_branch_size "$locks" "$key")" -gt "$maxgib" ]; then
             (
                 ci_lock_file "$locks/$key.lock" || exit 1
                 exec 5>>"$locks/$key.lock"
-                flock -x -n 5 && echo "branch cache $key is over $maxgib GiB: starting again" >&2 && rm -rf "$dir"
+                flock -x -n 5 && echo "branch cache $key is over $maxgib GiB: starting again" >&2 && ci_trash_move "$dir" && rm -f -- "$locks/$key.size"
             ) 2>/dev/null || true
         fi
     else
@@ -617,7 +771,10 @@ ci_branch_prepare() {
         [ "$locked" != yes ] || flock -u 7
         return 1
     fi
-    ci_branch_own_lock "$key" "$locked" || return 1
+    own_rc=0
+    ci_branch_own_lock "$key" "$locked" || own_rc=$?
+    [ "$own_rc" != 1 ] || return 1
+    [ "$own_rc" != 2 ] || locked=no # not free at once: fd 7 and fd 9 were let go before the wait
     # This branch's directory (rules 2 and 3 at the top): probed, its tree normalized by the job
     # (ci_child_probe). One the job owns and cannot use, whatever it is (a directory with a chmod,
     # an ACL or a tree that cannot be normalized; a file, a FIFO, a socket), is removed and made
@@ -639,7 +796,10 @@ ci_branch_prepare() {
     if [ "$rc" = 11 ]; then
         flock -u 6
         ( { exec 5>>"$locks/$key.lock"; } 2>/dev/null && flock -x -n 5 && ci_child_reset "$dir" "$b" ) || true
-        ci_branch_own_lock "$key" "$locked" || return 1
+        own_rc=0
+        ci_branch_own_lock "$key" "$locked" || own_rc=$?
+        [ "$own_rc" != 1 ] || return 1
+        [ "$own_rc" != 2 ] || locked=no
         rc=0
         ci_child_probe "$dir" || rc=$?
     fi
@@ -661,7 +821,11 @@ ci_branch_prepare() {
             ci_as_job mkdir "$partial/zig"
             if [ ! -d "$root/main/zig/p" ]; then
                 echo "main has no package cache yet: branch $key starts empty" >&2
-            elif [ "$(ci_dir_gib "$root/main/zig/p")" -le "$seedgib" ]; then
+            elif [ -z "$seed_size" ]; then
+                # The directory was dropped after the size was taken (or was not there to measure):
+                # no walk under the lock, so it starts empty.
+                echo "branch $key starts empty (the size of main's package cache was not measured)" >&2
+            elif [ "$seed_size" -le "$seedgib" ]; then
                 # A failed copy must not leave a partial zig/p (a half-written package would be trusted).
                 # cp's reason is kept in memory: on a full disk a file in $partial could not hold it.
                 if ! err=$(ci_as_job cp -a "$root/main/zig/p" "$partial/zig/" 2>&1 >/dev/null); then
@@ -674,8 +838,9 @@ ci_branch_prepare() {
             fi
             ci_as_job mkdir -p "$partial/zig" "$partial/zig-local"
             # -T: if a job without the lock filled $dir meanwhile, keep its directory and drop the seed.
-            # Root renames one name in its own directory: nothing inside $partial is followed.
-            mv -T "$partial" "$dir" 2>/dev/null || rm -rf --one-file-system -- "$partial"
+            # Root renames one name in its own directory: nothing inside $partial is followed. A
+            # seed that lost the race is moved aside, not removed (fd 7 is held; ci_trash_empty below).
+            mv -T "$partial" "$dir" 2>/dev/null || ci_trash_move "$partial" || true
         else
             # No lock on the branches' directory (or no partial directory could be made): no
             # shared partial directory a prune could remove. It starts empty.
@@ -683,7 +848,11 @@ ci_branch_prepare() {
         fi
     fi
     # The branches' lock is let go before anything can return: seeding is done, or never started.
+    # So is main's (fd 9, the caller's: nothing after this reads main's cache). Only then does root
+    # remove what the prune and a reset moved aside: no lock another step waits on is held.
     [ "$locked" != yes ] || flock -u 7
+    flock -u 9 2>/dev/null || true
+    ci_trash_empty "$b"
     # Whichever way $dir was made (or not), it must be a directory now.
     if [ -L "$dir" ] || [ ! -d "$dir" ]; then
         if [ -e "$dir" ] || [ -L "$dir" ]; then
@@ -703,28 +872,42 @@ ci_branch_prepare() {
     # an unusable one is replaced (NRV-W1204). Nothing in $dir is root's to touch.
     ci_job_dir "$dir/zig" "$dir/zig-local" || return 1
     ci_as_job touch "$dir"
+    ci_branch_measure "$locks" "$key" "$dir" # only the key's own shared lock is held here
     # shellcheck disable=SC2034 # read by ci/woodpecker_step.sh
     CI_BRANCH_DIR="$dir" # not printed: a command substitution would drop the lock with its shell
 }
 
 # ci_main_prune ROOT MIN_GIB: empties main's Zig caches (never the pinned toolchain) when the box
-# is low on space (under MIN_GIB free) and the lock on fd 9 (locks/main.lock) is free: every job holds it
+# is low on space (under MIN_GIB GiB free, or too few inodes: ci_disk_low) and the lock on fd 9
+# (locks/main.lock) is free: every job holds it
 # shared while it runs, so this is called before the caller takes its own shared lock, which it
 # takes after, pruned or not. One pruner per push is enough, so the wait is short (CI_PRUNE_WAIT,
 # default 5 s) and, once it ends (lock taken or not), space is measured again: if another job has
 # freed it, nothing is pruned and nothing is warned. NRV-W1202 only if space is still low and the
-# lock was not free.
+# lock was not free. It only RENAMES the two caches into main/.trash while it holds the lock
+# (ci_trash_move); the caller removes them (ci_trash_empty) once the lock is shared again.
 ci_main_prune() {
-    local root="$1" min="$2" wait="${CI_PRUNE_WAIT:-5}" got=no
+    local root="$1" min="$2" wait="${CI_PRUNE_WAIT:-5}" got=no p
     flock -x -w "$wait" 9 && got=yes
-    if [ "$(df --output=avail -B1G "$root/main" | tail -1 | tr -d ' ')" -ge "$min" ]; then
+    if ! ci_disk_low "$root/main" "$min"; then
         echo "main's cache: space is free again, not pruning"
     elif [ "$got" = yes ]; then
         echo "emptying main's Zig caches (no other job holds them)"
-        rm -rf "$root/main/zig" "$root/main/zig-local" # a link there is unlinked, not followed
+        for p in zig zig-local; do # a link there is moved as the link, not followed
+            if [ -e "$root/main/$p" ] || [ -L "$root/main/$p" ]; then ci_trash_move "$root/main/$p" || true; fi
+        done
     else
         ci_warning "NRV-W1202: other jobs held main's cache for $wait s: not pruned. To recover by hand, with the agent idle: rm -rf /var/cache/nerva-ci/main/zig-local /var/cache/nerva-ci/main/zig"
     fi
+}
+
+# ci_main_exclusive: main's lock exclusively (converted from the shared one the caller holds),
+# waiting at most CI_PRUNE_WAIT seconds, as the prune does. If that fails the shared lock is
+# taken again (a failed conversion loses it) and the return is 1.
+ci_main_exclusive() {
+    flock -x -w "${CI_PRUNE_WAIT:-5}" 9 && return 0
+    ci_shared_lock
+    return 1
 }
 
 # ci_main_prepare ROOT USER LOW MIN_GIB: the main role's cache set-up, run as root, in this order:
@@ -733,10 +916,15 @@ ci_main_prune() {
 # chowned to USER by root, or reset by root if USER's and unusable (ci_child_ensure). The prune
 # removes main/zig and main/zig-local, so the directories come after it. Main's lock is held
 # SHARED from before the first probe to the return (the caller takes it again, which is no
-# change): `reset-cache main` takes it exclusively and removes zig and zig-local, so a probe, a
+# change): `reset-cache main` takes it exclusively and moves zig and zig-local aside, so a probe, a
 # normalization or a make that ran without it could meet a directory that vanished (NRV-E1228).
 # Exclusive only for a reset below (the lock is converted, which loses the shared one if that
-# fails, so every probe takes the shared one again first), and for the prune above.
+# fails, so every probe takes the shared one again first, and ci_main_exclusive takes it again
+# after a failure), and for the prune above. A reset under it is a rename (ci_child_reset), so
+# two steps that find the same child poisoned at once do not refuse each other: the loser fails to
+# get the exclusive lock while the winner's job runs, and probes again, which finds the child the
+# winner made. What can still refuse a step (NRV-E1228) is a child that needs a reset while a
+# running main job, one that is not itself resetting it, holds the lock shared.
 ci_main_prepare() {
     local root="$1" CI_JOB_USER="$2" low="$3" min="$4" p
     ci_main_lock_open "$root" || return 1 # root's, in the lock directory a job cannot write
@@ -748,7 +936,11 @@ ci_main_prepare() {
     # lock, then the children lock (ci_child_probe, ci_child_make), as `reset-cache` takes them.
     for p in zig zig-local tools; do
         ci_shared_lock || return 1
-        ci_child_ensure "$root/main/$p" "$root/main" flock -x -w "${CI_PRUNE_WAIT:-5}" 9 || return 1
+        ci_child_ensure "$root/main/$p" "$root/main" ci_main_exclusive || return 1
     done
-    ci_shared_lock
+    ci_shared_lock || return 1
+    # Whatever the prune and the resets moved aside is removed now, with main's lock shared again
+    # (every step holds it so for its whole run): root never walks a job's tree under the
+    # exclusive lock.
+    ci_trash_empty "$root/main"
 }

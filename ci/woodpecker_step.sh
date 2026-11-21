@@ -15,6 +15,10 @@
 #     pruned. Every job holds a shared lock on locks/main.lock (the lock directory, root's, which a job cannot write); below CI_FREE_MIN_GIB free (default 60),
 #     a main job waits up to CI_PRUNE_WAIT seconds (5) to hold it alone, measures free space again, and if still low
 #     empties main's Zig caches (never the pinned toolchain), and a branch job empties the branch caches nobody uses.
+#     "Low" is blocks (CI_FREE_MIN_GIB) or inodes (CI_MIN_FREE_INODES, default 100000: a job's empty files
+#     cost none). Nothing here walks a job's tree under a lock others wait on: a drop is a rename into the
+#     mount root's root-only .trash (ci/cache.sh, the design rule) and the trash is emptied after the lock
+#     is released; a branch's size is a record its own step writes after its locks (CI_BRANCH_DU_SECONDS).
 #   - Each job has a timeout (75 minutes; 330 for the long searches; CI_STEP_MINUTES replaces it),
 #     see the `case` below; one that runs past it fails NRV-E1215.
 set -euo pipefail
@@ -93,7 +97,10 @@ if [ "$job" = jepsen ]; then
         ci_error "NRV-E1209: another Jepsen run held this machine for ${CI_JEPSEN_WAIT:-5400} s: start this one again when it ends"
         exit 1
     }
-    find "$cache/jepsen" -mindepth 1 -maxdepth 1 -type d -mtime +14 -exec rm -rf {} +
+    # Run directories older than 14 days are only moved aside here (ci_trash_move: a rename), and
+    # removed after the lock is let go below.
+    while IFS= read -r -d '' old; do ci_trash_move "$old" || true; done \
+        < <(find "$cache/jepsen" -mindepth 1 -maxdepth 1 -type d ! -name .trash -mtime +14 -print0)
     # The job still runs as `ci`: root would leave root's files in the cache. The socket's group
     # lets it reach Docker, which is root on the host in all but name (decision O4).
     gid=$(stat -c %g "$sock")
@@ -118,7 +125,10 @@ fi
 # container's own directory, so it would measure the container's filesystem, not the box's cache.
 cache_fs="$cache/main"
 low=no
-[ "$(df --output=avail -B1G "$cache_fs" | tail -1 | tr -d ' ')" -ge "$free_min_gib" ] || low=yes
+ci_knobs_check || exit 2
+# Low on blocks (CI_FREE_MIN_GIB) or on inodes (CI_MIN_FREE_INODES, default 100000): a job's empty
+# files cost no blocks, and the branch's size bound counts blocks only.
+if ci_disk_low "$cache_fs" "$free_min_gib"; then low=yes; fi
 if [ "$role" = main ]; then
     ci_main_prepare "$cache" "$user" "$low" "$free_min_gib" || exit 1
     ci_shared_lock || exit 1
@@ -160,4 +170,10 @@ status=0
 # (ci_step_run_with_tests is in ci/lib.sh, with its tests: for check-scripts the tests run first,
 # bounded by CI_SCRIPTS_TEST_MINUTES, not by the job's whole limit; either failing fails the step.)
 ci_step_run_with_tests "$job" "$((test_minutes * 60))" "$((minutes * 60))" tests_cmd job_cmd || status=$?
+# A Jepsen run holds the Jepsen lock exclusively for its whole run, so what its reset of the tools
+# moved aside is removed only now, after the lock is let go (nothing is held that another step waits on).
+if [ "$job" = jepsen ]; then
+    flock -u 8 2>/dev/null || true
+    ci_trash_empty "$cache/jepsen"
+fi
 exit "$status"

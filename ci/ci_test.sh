@@ -485,7 +485,8 @@ rm -rf "${c:?}/branches/$rst"
 mkdir -p "$tmp/badrm" "$c/branches/b-rmfail-00000001"
 chown "$ou" "$c/branches/b-rmfail-00000001" 2>/dev/null || true
 printf '#!/bin/sh\nexit 1\n' >"$tmp/badrm/rm"
-chmod +x "$tmp/badrm/rm"
+cp "$tmp/badrm/rm" "$tmp/badrm/mv" # the reset moves the tree aside (ci_trash_move), it does not rm it
+chmod +x "$tmp/badrm/rm" "$tmp/badrm/mv"
 out=$(
     . ci/cache.sh
     PATH="$tmp/badrm:$PATH"
@@ -786,6 +787,23 @@ mkdir -p "$tmp/hostcache/locks/trash/zig.crashed/deep"
 : >"$tmp/hostcache/locks/trash/zig.crashed/deep/f"
 out=$(nw FAKE_DOCKER=ok -- host 2>&1) || { echo "FAIL host with a leftover trash: $out" >&2; fail=1; }
 is "host removes the trash a crashed reset-cache left" no "$([ -e "$tmp/hostcache/locks/trash" ] && echo yes || echo no)"
+# A mount root's own .trash (ci_trash_move's): a root-owned one is emptied and stays; a link or a
+# job-owned one (an earlier layout) is removed whole, never followed.
+if [ "$(id -u)" = 0 ]; then # "root-owned" means uid 0: a non-root user owns everything it makes
+    mkdir -p "$tmp/hostcache/main/.trash/box/deep"
+    chmod 0700 "$tmp/hostcache/main/.trash"
+    : >"$tmp/hostcache/main/.trash/box/deep/f"
+    mkdir -p "$tmp/hostsentinel"
+    : >"$tmp/hostsentinel/keep"
+    ln -s "$tmp/hostsentinel" "$tmp/hostcache/branches/.trash"
+    mkdir -p "$tmp/hostcache/jepsen/.trash/box"
+    chown "nobody" "$tmp/hostcache/jepsen/.trash" "$tmp/hostcache/jepsen/.trash/box"
+    out=$(nw FAKE_DOCKER=ok -- host 2>&1) || { echo "FAIL host with leftover .trash directories: $out" >&2; fail=1; }
+    is "host empties a root-owned .trash and keeps it; a link or a job-owned one is removed; the link's target is left alone" "yes yes no yes" "$([ -d "$tmp/hostcache/main/.trash" ] && echo yes) $([ -z "$(ls -A "$tmp/hostcache/main/.trash")" ] && echo yes) $([ -e "$tmp/hostcache/branches/.trash" ] || [ -e "$tmp/hostcache/jepsen/.trash" ] && echo yes || echo no) $([ -e "$tmp/hostsentinel/keep" ] && echo yes)"
+    rm -rf "$tmp/hostcache/main/.trash" "$tmp/hostcache/branches/.trash" "$tmp/hostcache/jepsen/.trash"
+else
+    skip_note "the host .trash cleanup (it tells a root-owned trash from a job-owned one)"
+fi
 is "host makes the mount roots 0755 and makes none of their directories" "755 755 755 yes" "$(stat -c %a "$tmp/hostcache/main") $(stat -c %a "$tmp/hostcache/branches") $(stat -c %a "$tmp/hostcache/jepsen") $([ -z "$(find "$tmp/hostcache/main" "$tmp/hostcache/branches" "$tmp/hostcache/jepsen" -mindepth 1)" ] && echo yes)"
 # A box that ran the earlier layout: the roots the job's, one with an ACL: run again, they are root's 0755 with no ACL.
 if [ "$(id -u)" = 0 ] && command -v setfacl >/dev/null && id nobody >/dev/null 2>&1; then
@@ -890,7 +908,7 @@ if grep -n 'install -d .*\(cache/main\|base\|JEPSEN_OUT\|cache/jepsen\)\|chown .
     fail=1
 fi
 if grep -n -E '(^|[ (;&|])(chown|install -d|mkdir|chmod|mktemp|mv|touch|cp|ln) ' ci/cache.sh | grep -v '^[0-9]*: *#' |
-    grep -v -E 'ci_error|ci_warning|ci_as_job|command -v|chown -h "|chmod 0755 -- "\$d"|chmod 600|mkdir -m 0755 -- "\$p"|mktemp -d "\$b/\$key.partial|mv -T "\$partial" "\$dir"|-exec chmod u\+r'; then
+    grep -v -E 'ci_error|ci_warning|ci_as_job|command -v|chown -h "|chmod 0755 -- "\$d"|chmod 600|mkdir -m 0755 -- "\$p"|mktemp -d "\$b/\$key.partial|mv -T "\$partial" "\$dir"|mktemp -d "\$t/t\.|mkdir -m 0700 -- "\$t"|mv -T "\$\{nocopy\[@\]\}" -- "\$p" "\$box/x"|mv --help|mv -f -- "\$f\.new"|-exec chmod u\+r'; then
     echo "FAIL ci/cache.sh makes, chowns, chmods or moves something as root outside the operations listed at its top" >&2
     fail=1
 fi
@@ -1877,7 +1895,8 @@ is "normalization batches its chmod of files" yes "$([ "$(wc -l <"$mark/chmod.lo
 mkdir -p "$tmp/rm-noop"
 chmod 755 "$tmp/rm-noop"
 printf '#!/bin/sh\nexit 0\n' >"$tmp/rm-noop/rm"
-chmod 755 "$tmp/rm-noop/rm"
+cp "$tmp/rm-noop/rm" "$tmp/rm-noop/mv" # the reset's move aside does nothing either
+chmod 755 "$tmp/rm-noop/rm" "$tmp/rm-noop/mv"
 r=$(attack_tree verdict)
 ci_as touch "$r/main/zig/h"
 probe_rc=0
@@ -1887,6 +1906,7 @@ out=$(PATH="$tmp/rm-noop:$PATH" prep_m "$r")
 grep -q "NRV-E1228: $r/main/zig is not a directory" <<<"$out" && ! grep -q RC0 <<<"$out" || { echo "FAIL a tree whose walk left a known name wrong and could not be reset is not E1228: $out" >&2; fail=1; }
 # The same with the reset able to work: W1204, made again, the step goes on.
 if [ "$(id -u)" = 0 ]; then # as one user, the stub cannot tell root's rm from the job's
+    rm -f "$tmp/rm-noop/mv" # root's reset (a move aside) works again; only the job's rm does nothing
     r=$(attack_tree verdict2)
     ci_as touch "$r/main/zig/h"
     printf '#!/bin/sh\ncase "$(id -u)" in 0) exec %s "$@" ;; *) exit 0 ;; esac\n' "$(command -v rm)" >"$tmp/rm-noop/rm"
@@ -2083,6 +2103,448 @@ out=$(. ci/cache.sh; ci_lock_open_failed "$o4/locks/dir9.lock" '<' 2>&1)
 grep -q "(no reason given)" <<<"$out" || { echo "FAIL probe in read mode: $out" >&2; fail=1; }
 out=$(. ci/cache.sh; ci_lock_open_failed "$o4/locks/dir9.lock" '>>' 2>&1)
 grep -q "(Is a directory)" <<<"$out" || { echo "FAIL probe in write mode: $out" >&2; fail=1; }
+
+# --- Review 6003115432 (the twenty-first round): root never walks a tree a job made while it holds a
+# lock other steps wait on. Under a lock root only decides and renames into MOUNT/.trash
+# (ci_trash_move); it removes the trash (ci_trash_empty) after the lock is let go. The job's user
+# is `nobody` as root, else this user.
+real_rm=$(command -v rm)
+real_du=$(command -v du)
+real_df=$(command -v df)
+real_find=$(command -v find)
+real_mktemp=$(command -v mktemp)
+mkdir -p "$tmp/stubs"
+chmod 755 "$tmp/stubs"
+# A stub for NAME that runs the real command after SCRIPT (a shell snippet, with $mark and $SPY_* known).
+mkstub() { # mkstub NAME REAL BODY
+    mkdir -p "$tmp/stubs/$1"
+    chmod 755 "$tmp/stubs/$1"
+    printf '#!/bin/sh\n%s\nexec %s "$@"\n' "$3" "$2" >"$tmp/stubs/$1/$1"
+    chmod 755 "$tmp/stubs/$1/$1"
+}
+# rm: the first `rm -rf` of the run waits (a large tree being removed), and says so in a marker.
+mkstub rm "$real_rm" "case \"\$*\" in *-rf*) if [ ! -e \"$mark/rm-started\" ]; then : >\"$mark/rm-started\"; sleep \"\${SLOW_RM:-2}\"; fi ;; esac"
+# du: the first one waits.
+mkstub du "$real_du" "if [ ! -e \"$mark/du-started\" ]; then : >\"$mark/du-started\"; sleep \"\${SLOW_DU:-2}\"; fi"
+# Spies (root only: a job cannot open the lock directory): every rm and du that root runs logs which
+# lock files somebody holds EXCLUSIVELY (a shared try fails: excl:<name>) and whether the branches'
+# lock or main's is held at all (an exclusive try fails: any:<name>).
+spy_body='if [ "$(id -u)" = 0 ] && [ -n "${SPY_LOCKS:-}" ]; then s=; for f in "$SPY_LOCKS"/*.lock; do n=$(basename "$f" .lock); flock -s -n "$f" true 2>/dev/null || s="$s excl:$n"; done; flock -x -n "$SPY_LOCKS/branches.lock" true 2>/dev/null || s="$s any:branches"; echo "NAME$s :: $*" >>"$SPY_LOG"; fi'
+mkstub spyrm "$real_rm" "${spy_body//NAME/rm}"
+mkstub spydu "$real_du" "${spy_body//NAME/du}"
+mkdir -p "$tmp/stubs/spy"
+chmod 755 "$tmp/stubs/spy"
+cp "$tmp/stubs/spyrm/spyrm" "$tmp/stubs/spy/rm"
+cp "$tmp/stubs/spydu/spydu" "$tmp/stubs/spy/du"
+spy_path="$tmp/stubs/spy"
+# find: waits when the walk is of a poisoned zig-local (a file `poison` in it), as a large tree would.
+mkstub find "$real_find" "case \"\$1\" in */zig-local) [ ! -e \"\$1/poison\" ] || sleep 3 ;; esac"
+# df: the inode table says IT inodes with IF free; the blocks are the real ones.
+mkstub df "$real_df" "case \"\$*\" in *-Pi*) printf 'Filesystem Inodes IUsed IFree IUse%% Mounted on\nstub %s 1 %s 99%% /\n' \"\${IT:-1000000}\" \"\${IF:-1000000}\"; exit 0 ;; esac"
+# mktemp: the first box ci_trash_move makes is removed again at once, as a concurrent step's
+# ci_trash_empty could.
+mkstub mktemp "$real_mktemp" "case \"\$*\" in *.trash/t.*) if [ ! -e \"$mark/mk-once\" ]; then : >\"$mark/mk-once\"; d=\$($real_mktemp \"\$@\") || exit 1; rmdir \"\$d\"; echo \"\$d\"; exit 0; fi ;; esac"
+slow_rm_dir="$tmp/stubs/rm"
+slow_du_dir="$tmp/stubs/du"
+fakefind_dir="$tmp/stubs/find"
+fakedf_dir="$tmp/stubs/df"
+mkmv_dir="$tmp/stubs/mktemp"
+nsel() { grep -c "$1" "$2" 2>/dev/null || true; }
+
+# (a) Another branch's step is prepared (the branches' lock and main's are free, no NRV-W1202) while
+# one step's reset is removing a tree: the poisoned directory is a file, so the step holds the
+# branches' lock for its reset, which only renames; the first `rm -rf` (the trash's) waits 3 s.
+r=$(attack_tree trashrm)
+plant file "$r/branches/$branch_key"
+: >"$r/locks/main.lock"
+chmod 600 "$r/locks/main.lock"
+slow_reset
+(
+    exec 9<"$r/locks/main.lock"
+    flock -s 9
+    . ci/cache.sh
+    PATH="$slow_rm_dir:$PATH" SLOW_RM=3 CI_JOB_USER=$jobuser CI_LOCK_WAIT=2 ci_branch_prepare "$r" feature/atk >"$tmp/trashrm-a.out" 2>&1 && echo RC0 >>"$tmp/trashrm-a.out"
+) &
+trashrm_pid=$!
+wait_for "$mark/rm-started" || { echo "FAIL the trash was never emptied (a)" >&2; fail=1; }
+is "a reset removing a tree holds neither the branches' lock nor main's" "free free" "$(flock -x -n "$r/locks/branches.lock" true && echo -n free || echo -n held; echo -n ' '; flock -x -n "$r/locks/main.lock" true && echo free || echo held)"
+t0=$(now)
+out=$( (. ci/cache.sh; CI_JOB_USER=$jobuser CI_LOCK_WAIT=1 ci_branch_prepare "$r" feature/other 2>&1 && echo RC0) || true)
+t1=$(now)
+is "another branch's prepare while a reset's tree is removed: RC0 and no warning" yes "$(grep -q RC0 <<<"$out" && ! grep -q "NRV-[EW]12" <<<"$out" && echo yes)"
+is "and quickly (under 2.5 s while the removal waits 3 s)" yes "$(awk -v a="$t0" -v b="$t1" 'BEGIN { print (b - a < 2.5) ? "yes" : "no" }')"
+wait "$trashrm_pid" 2>/dev/null || true
+is "the resetting step itself: W1204, RC0, a usable directory made again" yes "$(grep -q "NRV-W1204: $r/branches/$branch_key" "$tmp/trashrm-a.out" && grep -q RC0 "$tmp/trashrm-a.out" && usable "$r/branches/$branch_key/zig" && echo yes)"
+is "and the trash is empty afterwards" "" "$(ls -A "$r/branches/.trash")"
+
+# (b) A step's prune and measure keep the branches' lock short whatever another branch's cache
+# holds: the other cache is old (dropped: moved, then removed after the lock) and the step's own
+# size is measured after the lock (du waits 2 s the first time). A second step waits at most
+# CI_LOCK_WAIT=1 s for the lock, so it would get NRV-W1202 if either ran under it.
+r=$(attack_tree prunefast)
+plant dir "$r/branches/b-big-00000001"
+ci_as mkdir -p "$r/branches/b-big-00000001/zig/o/deep"
+for i in $(seq 50); do ci_as touch "$r/branches/b-big-00000001/zig/o/deep/f$i"; done
+touch -d "20 days ago" "$r/branches/b-big-00000001"
+: >"$r/locks/main.lock"
+chmod 600 "$r/locks/main.lock"
+slow_reset
+(
+    exec 9<"$r/locks/main.lock"
+    flock -s 9
+    . ci/cache.sh
+    PATH="$slow_rm_dir:$slow_du_dir:$PATH" SLOW_RM=2 SLOW_DU=2 CI_JOB_USER=$jobuser CI_LOCK_WAIT=2 ci_branch_prepare "$r" feature/atk >"$tmp/prunefast-a.out" 2>&1 && echo RC0 >>"$tmp/prunefast-a.out"
+) &
+prunefast_pid=$!
+wait_for "$mark/rm-started" || { echo "FAIL the pruned tree was never removed (b)" >&2; fail=1; }
+out=$( (. ci/cache.sh; CI_JOB_USER=$jobuser CI_LOCK_WAIT=1 ci_branch_prepare "$r" feature/d1 2>&1 && echo RC0) || true)
+is "(b) a prepare while a pruned tree is removed: RC0, no NRV-W1202" yes "$(grep -q RC0 <<<"$out" && ! grep -q "NRV-[EW]12" <<<"$out" && echo yes)"
+wait_for "$mark/du-started" || { echo "FAIL the step's own size was never measured (b)" >&2; fail=1; }
+out=$( (. ci/cache.sh; CI_JOB_USER=$jobuser CI_LOCK_WAIT=1 ci_branch_prepare "$r" feature/d2 2>&1 && echo RC0) || true)
+is "(b) a prepare while another step measures its cache: RC0, no NRV-W1202" yes "$(grep -q RC0 <<<"$out" && ! grep -q "NRV-[EW]12" <<<"$out" && echo yes)"
+wait "$prunefast_pid" 2>/dev/null || true
+is "(b) the old cache was dropped and the trash emptied" "no " "$([ -e "$r/branches/b-big-00000001" ] && echo yes || echo no) $(ls -A "$r/branches/.trash")"
+is "(b) the step's own size was recorded" yes "$([ -s "$r/locks/$branch_key.size" ] && echo yes)"
+
+# A spy on every `rm` and `du` that root runs: none of them runs while any lock is held
+# exclusively (the key's, the branches', main's, the children lock), nor, without a seed, while
+# the branches' lock or main's is held at all. The scenario: an old cache, a name that is no
+# branch's, a killed seed's partial directory, a cache whose recorded size is over the bound, and the
+# step's own directory a file (so the reset runs). Root only: a job cannot open the lock directory.
+if [ "$(id -u)" = 0 ]; then
+    r=$(attack_tree spy)
+    plant dir "$r/branches/b-old-00000002"
+    ci_as mkdir -p "$r/branches/b-old-00000002/zig/o"
+    ci_as touch "$r/branches/b-old-00000002/zig/o/f"
+    touch -d "20 days ago" "$r/branches/b-old-00000002"
+    plant dir "$r/branches/b-odd name-00000003"
+    plant dir "$r/branches/b-fat-00000004"
+    echo 999999 >"$r/locks/b-fat-00000004.size"
+    plant dir "$r/branches/$branch_key.partial.abcdef"
+    plant file "$r/branches/$branch_key"
+    : >"$r/locks/main.lock"
+    chmod 600 "$r/locks/main.lock"
+    spy_log="$tmp/spy.log"
+    : >"$spy_log"
+    chmod 666 "$spy_log"
+    out=$(
+        exec 9<"$r/locks/main.lock"
+        flock -s 9
+        . ci/cache.sh
+        PATH="$spy_path:$PATH" SPY_LOCKS="$r/locks" SPY_LOG="$spy_log" CI_BRANCH_CACHES=2 CI_JOB_USER=$jobuser CI_LOCK_WAIT=2 ci_branch_prepare "$r" feature/atk 2>&1 && echo RC0
+    ) || true
+    is "spy: the prepare worked (RC0), and the old, odd, fat and partial names are gone" "yes no no no no" "$(grep -q RC0 <<<"$out" && echo yes) $([ -e "$r/branches/b-old-00000002" ] && echo yes || echo no) $([ -e "$r/branches/b-odd name-00000003" ] && echo yes || echo no) $([ -e "$r/branches/b-fat-00000004" ] && echo yes || echo no) $([ -e "$r/branches/$branch_key.partial.abcdef" ] && echo yes || echo no)"
+    is "spy: root ran an rm and a du" "yes yes" "$(grep -q '^rm' "$spy_log" && echo yes) $(grep -q '^du' "$spy_log" && echo yes)"
+    is "spy: no root rm or du ran while a lock was held exclusively, or the branches' at all" "0" "$(grep -v '^rm .*:: -f ' "$spy_log" | grep -c -e excl: -e any: || true)"
+    # A seed: the size of main's package cache is measured (du) before the branches' lock, and the
+    # copy itself is the job's.
+    r=$(attack_tree spyseed)
+    ci_as mkdir -p "$r/main/zig/p/pkg"
+    ci_as touch "$r/main/zig/p/pkg/f"
+    : >"$r/locks/main.lock"
+    chmod 600 "$r/locks/main.lock"
+    : >"$spy_log"
+    out=$(
+        exec 9<"$r/locks/main.lock"
+        flock -s 9
+        . ci/cache.sh
+        PATH="$spy_path:$PATH" SPY_LOCKS="$r/locks" SPY_LOG="$spy_log" CI_JOB_USER=$jobuser CI_LOCK_WAIT=2 ci_branch_prepare "$r" feature/atk 2>&1 && echo RC0
+    ) || true
+    is "spy (seed): seeded (RC0), main's size was measured, and no du ran under the branches' lock" "yes yes 0" "$(grep -q RC0 <<<"$out" && [ -e "$r/branches/$branch_key/zig/p/pkg/f" ] && echo yes) $(grep -c '^du.*main/zig/p' "$spy_log" | sed 's/^[1-9].*/yes/') $(grep -c -e any:branches -e excl: "$spy_log" || true)"
+    # The same for main: the prune and a reset of a poisoned child only rename under the exclusive lock.
+    r=$(attack_tree spym)
+    rm -rf "$r/main/zig-local"
+    : >"$r/main/zig-local"
+    chown "$jobuser" "$r/main/zig-local"
+    ci_as mkdir -p "$r/main/zig/o/deep"
+    ci_as touch "$r/main/zig/o/deep/f"
+    : >"$spy_log"
+    out=$(PATH="$spy_path:$PATH" SPY_LOCKS="$r/locks" SPY_LOG="$spy_log" CI_PRUNE_WAIT=2 bash -c '. ci/cache.sh; ci_main_prepare "$1" "$2" yes 0 2>&1 && echo RC0' _ "$r" "$jobuser" || true)
+    is "spy (main): low-disk prune and a poisoned child: RC0" yes "$(grep -q RC0 <<<"$out" && echo yes)"
+    is "spy (main): root's rm ran, and never while a lock was held exclusively" "yes 0" "$(grep -q '^rm' "$spy_log" && echo yes) $(grep -c excl: "$spy_log" || true)"
+else
+    skip_note "the spy on root's rm and du while a lock is held"
+fi
+
+# (c) Two steps of one push find main's zig-local poisoned at once (its walk times out): they do not
+# refuse each other (NRV-E1228). Resetting is a rename under the exclusive lock, so the one that
+# loses the conversion finds the other's fresh directory. The walk of a poisoned zig-local waits 3 s
+# (the find stub) and CI_NORMALIZE_SECONDS=1; a reset that removed the tree under the lock instead
+# (the first `rm -rf` waits 3 s) would hold the other past its 1 s wait for the lock.
+for round in 1 2; do
+    r=$(attack_tree concurrent$round)
+    ci_as touch "$r/main/zig-local/poison"
+    slow_reset
+    (PATH="$slow_rm_dir:$fakefind_dir:$PATH" SLOW_RM=3 CI_NORMALIZE_SECONDS=1 prep_m "$r" >"$tmp/conc-a.out" 2>&1) &
+    conc_a=$!
+    (PATH="$slow_rm_dir:$fakefind_dir:$PATH" SLOW_RM=3 CI_NORMALIZE_SECONDS=1 prep_m "$r" >"$tmp/conc-b.out" 2>&1) &
+    conc_b=$!
+    wait "$conc_a" 2>/dev/null || true
+    wait "$conc_b" 2>/dev/null || true
+    is "two concurrent main prepares of a poisoned zig-local (round $round): both RC0, neither refused" "yes yes" "$(grep -q RC0 "$tmp/conc-a.out" && ! grep -q NRV-E "$tmp/conc-a.out" && echo yes) $(grep -q RC0 "$tmp/conc-b.out" && ! grep -q NRV-E "$tmp/conc-b.out" && echo yes)"
+    is "and the directory is fresh and usable" yes "$([ ! -e "$r/main/zig-local/poison" ] && usable "$r/main/zig-local" && echo yes)"
+done
+
+# (d) The shared lock is taken again for each of main's directories: after a reset of zig (which
+# holds the lock exclusively) the walks of zig-local and tools run under the SHARED one. A file at
+# zig is reset; zig-local's walk waits 3 s (the slow find stub, first walk), and an exclusive try
+# of the lock then fails (a shared holder) while a shared try works.
+r=$(attack_tree retake)
+rm -rf "$r/main/zig"
+: >"$r/main/zig"
+chown "$jobuser" "$r/main/zig"
+slow_reset
+(PATH="$slow:$PATH" prep_m "$r" >"$tmp/retake.out" 2>&1) &
+retake_pid=$!
+wait_for "$mark/started" || { echo "FAIL the walk of zig-local never started (d)" >&2; fail=1; }
+is "(d) while zig-local is walked after zig's reset the lock is held shared, not exclusively" "shared" "$(flock -s -n "$r/locks/main.lock" true && echo shared || echo exclusive)"
+wait "$retake_pid" 2>/dev/null || true
+is "(d) the step is prepared, zig made again (W1204)" yes "$(grep -q RC0 "$tmp/retake.out" && grep -q "NRV-W1204: $r/main/zig" "$tmp/retake.out" && echo yes)"
+
+# (e) The low-disk test watches inodes too (a job's empty files cost no blocks): ci_disk_low with a df
+# that says few inodes are free is low, with plenty or no count not; CI_MIN_FREE_INODES moves the
+# threshold; and the prune that follows empties main's Zig caches.
+low() { (. ci/cache.sh; PATH="$fakedf_dir:$PATH" ci_disk_low "$tmp" 0) && echo low || echo ok; } # inherits IT and IF
+is "inodes: 5 of 1,000,000 free is low (blocks are plentiful)" low "$(IT=1000000 IF=5 low)"
+is "inodes: 500,000 free is not low" ok "$(IT=1000000 IF=500000 low)"
+is "inodes: 500,000 free is low under CI_MIN_FREE_INODES=600000" low "$(CI_MIN_FREE_INODES=600000 IT=1000000 IF=500000 low)"
+is "inodes: no inode count (0, or -: btrfs) has no inode test" "ok ok" "$(IT=0 IF=0 low) $(IT=- IF=- low)"
+is "blocks: the real df still decides when the blocks are short" low "$( (. ci/cache.sh; PATH="$fakedf_dir:$PATH" IT=1000000 IF=500000 ci_disk_low "$tmp" 999999999) && echo low || echo ok)"
+r=$(attack_tree inodes)
+ci_as touch "$r/main/zig/f"
+out=$(PATH="$fakedf_dir:$PATH" IT=1000000 IF=5 CI_PRUNE_WAIT=1 bash -c '. ci/cache.sh; ci_main_lock_open "$1" && ci_main_prune "$1" 0 && ci_trash_empty "$1/main"' _ "$r" 2>&1)
+is "inodes low: main's prune empties zig (the step's low-disk path)" "yes no" "$(grep -q "emptying main's Zig caches" <<<"$out" && echo yes) $([ -e "$r/main/zig/f" ] && echo yes || echo no)"
+r=$(attack_tree inodes2)
+ci_as touch "$r/main/zig/f"
+out=$(PATH="$fakedf_dir:$PATH" IT=1000000 IF=500000 CI_PRUNE_WAIT=1 bash -c '. ci/cache.sh; ci_main_lock_open "$1" && ci_main_prune "$1" 0' _ "$r" 2>&1)
+is "inodes plentiful: not pruned" "yes yes" "$(grep -q "space is free again" <<<"$out" && echo yes) $([ -e "$r/main/zig/f" ] && echo yes)"
+
+# (f) The two new knobs are validated as the others are (NRV-E1208): a whole number, 1 or more.
+for knob in CI_BRANCH_DU_SECONDS CI_MIN_FREE_INODES; do
+    for bad in 0 abc '1;touch x' -5 1.5 ' 3' 9999999; do
+        refuses NRV-E1208 "$knob='$bad'" env "$knob=$bad" bash -c '. ci/cache.sh; ci_knobs_check'
+    done
+    ok "$knob=1 and 999999 are accepted" env "$knob=999999" bash -c '. ci/cache.sh; ci_knobs_check'
+done
+r=$(attack_tree knobs2)
+refuses NRV-E1208 "ci_branch_prepare with CI_BRANCH_DU_SECONDS=0" env CI_BRANCH_DU_SECONDS=0 CI_JOB_USER="$jobuser" bash -c '. ci/cache.sh; ci_branch_prepare "$1" feature/atk' _ "$r"
+is "a refused knob made no branch directory" no "$([ -e "$r/branches/$branch_key" ] && echo yes || echo no)"
+
+# (g) NRV-E1236: a trash that is not root's alone (a link, a file, a mode others can use, another
+# owner, an ACL, another file system) is refused and nothing is moved, whichever lock the caller
+# holds; the sentinel a link points at is left alone.
+trash_case() { # trash_case NAME: a fresh tree whose zig has a file; sets r and t
+    r=$(attack_tree trash-$1)
+    ci_as touch "$r/main/zig/f"
+    t="$r/main/.trash"
+}
+trash_refused() { # trash_refused NAME: ci_trash_move of zig is E1236, and zig is still there
+    local out rc=0
+    out=$( (. ci/cache.sh; CI_JOB_USER=$jobuser ci_trash_move "$r/main/zig") 2>&1) || rc=$?
+    is "E1236: $1: refused, nothing moved" "1 yes yes" "$rc $(grep -q NRV-E1236 <<<"$out" && echo yes) $([ -e "$r/main/zig/f" ] && echo yes)"
+}
+trash_case link
+ln -s "$sd" "$t"
+trash_refused "a link"
+is "E1236: the link's target is left alone" "$want_state" "$(sentinel_state)"
+trash_case file
+: >"$t"
+trash_refused "a file"
+trash_case mode
+mkdir -m 0755 "$t"
+trash_refused "mode 0755"
+trash_case mode2
+mkdir -m 0700 "$t"
+chmod 0710 "$t"
+trash_refused "mode 0710"
+if [ "$(id -u)" = 0 ]; then
+    trash_case owner
+    mkdir -m 0700 "$t"
+    chown "$jobuser" "$t"
+    trash_refused "owned by the job's user"
+    if command -v setfacl >/dev/null; then
+        trash_case acl
+        mkdir -m 0700 "$t"
+        if setfacl -m "u:$jobuser:---" "$t" 2>/dev/null && ci_has_acl_probe=$(. ci/cache.sh; ci_has_acl "$t" && echo yes) && [ "$ci_has_acl_probe" = yes ]; then
+            is "E1236 (acl): the mode alone would pass" "" "$(find "$t" -maxdepth 0 -perm /077)"
+            trash_refused "a mode 0700 directory with an ACL"
+        else
+            echo "note: this file system takes no ACLs: the trash ACL test was skipped" >&2
+        fi
+    fi
+    # Another file system: the trash is a mount (or the tree to move is): never moved, never copied.
+    trash_case dev
+    mkdir -m 0700 "$t"
+    if mount -t tmpfs tmpfs "$t" 2>/dev/null; then
+        ro_mounts+=("$t")
+        chmod 0700 "$t"
+        trash_refused "a trash on another file system"
+        umount "$t"
+        trash_case dev2
+        if mount -t tmpfs tmpfs "$r/main/zig" 2>/dev/null; then
+            ro_mounts+=("$r/main/zig")
+            ci_as touch "$r/main/zig/f" 2>/dev/null || : >"$r/main/zig/f"
+            rc=0
+            (. ci/cache.sh; CI_JOB_USER=$jobuser ci_trash_move "$r/main/zig") >/dev/null 2>&1 || rc=$?
+            is "a tree on another file system is not moved (mv would copy it)" "1 yes" "$rc $([ -e "$r/main/zig/f" ] && echo yes)"
+            umount "$r/main/zig"
+        else
+            echo "note: no tmpfs mount here: the other-file-system tree test was skipped" >&2
+        fi
+    else
+        echo "note: no tmpfs mount here: the other-file-system tests were skipped" >&2
+    fi
+else
+    skip_note "the trash's owner, ACL and file-system tests"
+fi
+# And the callers say so, once, and go on: the prune of a mount root and a branch's prune.
+trash_case prune
+mkdir -m 0755 "$t"
+out=$(CI_PRUNE_WAIT=1 bash -c '. ci/cache.sh; ci_main_lock_open "$1" && ci_main_prune "$1" 0' _ "$r" 2>&1 | head -5; true)
+r=$(attack_tree trash-bp)
+mkdir -m 0755 "$r/branches/.trash"
+plant dir "$r/branches/b-old-00000002"
+touch -d "20 days ago" "$r/branches/b-old-00000002"
+out=$(prep_b "$r")
+is "E1236 in a branch's prune: once, the step goes on (RC0), nothing was dropped" "1 yes yes" "$(grep -c NRV-E1236 <<<"$out") $(grep -q RC0 <<<"$out" && echo yes) $([ -e "$r/branches/b-old-00000002" ] && echo yes)"
+# A concurrent step's trash empty removing the empty box between the mktemp and the mv: tried again.
+trash_case retry
+slow_reset
+rc=0
+(. ci/cache.sh; PATH="$mkmv_dir:$PATH" CI_JOB_USER=$jobuser ci_trash_move "$r/main/zig") >/dev/null 2>&1 || rc=$?
+is "a box removed under the move: the move is tried again and succeeds" "0 no yes" "$rc $([ -e "$r/main/zig" ] && echo yes || echo no) $([ -e "$mark/mk-once" ] && echo yes)"
+
+# (h) NRV-W1205: a trash that cannot be emptied (an rm that fails, as a mount inside it would) is
+# a warning, not a refusal, and the next call removes what is left. A job that still has its
+# working directory in a moved tree and keeps writing there does not stall it: the removal is
+# bounded (CI_NORMALIZE_SECONDS) and the second call, once the job stops, empties it.
+mkdir -p "$tmp/stubs/badrm"
+chmod 755 "$tmp/stubs/badrm"
+printf '#!/bin/sh\nexit 1\n' >"$tmp/stubs/badrm/rm"
+chmod 755 "$tmp/stubs/badrm/rm"
+trash_case w1205
+(. ci/cache.sh; CI_JOB_USER=$jobuser ci_trash_move "$r/main/zig") >/dev/null 2>&1
+out=$( (. ci/cache.sh; PATH="$tmp/stubs/badrm:$PATH" ci_trash_empty "$r/main") 2>&1)
+is "W1205: a trash that cannot be emptied is a warning, and the tree is still there" "yes yes" "$(grep -q NRV-W1205 <<<"$out" && echo yes) $([ -n "$(ls -A "$r/main/.trash")" ] && echo yes)"
+out=$( (. ci/cache.sh; ci_trash_empty "$r/main") 2>&1)
+is "the next call empties it, silently" " " "$(ls -A "$r/main/.trash") $out"
+trash_case cwd
+ci_as mkdir -p "$r/main/zig/o"
+writer_flag="$tmp/writer-flag"
+: >"$writer_flag"
+chmod 644 "$writer_flag"
+ci_as sh -c 'cd "$1/o" && i=0 && while [ -e "$2" ]; do : >"f$i" 2>/dev/null; i=$((i + 1)); done' _ "$r/main/zig" "$writer_flag" 2>/dev/null &
+writer=$!
+sleep 0.5
+(. ci/cache.sh; CI_JOB_USER=$jobuser ci_trash_move "$r/main/zig") >/dev/null 2>&1
+t0=$(now)
+out=$( (. ci/cache.sh; CI_NORMALIZE_SECONDS=2 ci_trash_empty "$r/main") 2>&1)
+t1=$(now)
+is "a job writing in a moved tree: the empty ends in a bounded time (two tries of 2 s, under 10 s)" yes "$(awk -v a="$t0" -v b="$t1" 'BEGIN { print (b - a < 10) ? "yes" : "no" }')"
+rm -f "$writer_flag"
+wait "$writer" 2>/dev/null || true
+out=$( (. ci/cache.sh; ci_trash_empty "$r/main") 2>&1)
+is "and once the job has stopped the next call empties the trash" "" "$(ls -A "$r/main/.trash")"
+
+# (i) The size a step records is bounded: a du that runs past CI_BRANCH_DU_SECONDS counts as over
+# every bound (999999), and the next step starts that cache again; a record that is not a number is 0;
+# and the prune reads the records instead of walking the other branches' trees.
+mkstub du2 "$real_du" "echo \"\$*\" >>\"$mark/du.log\"; case \"\$*\" in *slowtree*) sleep 5 ;; esac"
+mv "$tmp/stubs/du2/du2" "$tmp/stubs/du2/du"
+r=$(attack_tree size)
+mkdir -p "$r/branches/slowtree"
+chown "$jobuser" "$r/branches/slowtree"
+t0=$(now)
+got=$( (. ci/cache.sh; PATH="$tmp/stubs/du2:$PATH" CI_BRANCH_DU_SECONDS=1 ci_dir_gib "$r/branches/slowtree"))
+t1=$(now)
+is "a du past CI_BRANCH_DU_SECONDS counts as over every bound, and ends in time" "999999 yes" "$got $(awk -v a="$t0" -v b="$t1" 'BEGIN { print (b - a < 4) ? "yes" : "no" }')"
+(. ci/cache.sh; PATH="$tmp/stubs/du2:$PATH" CI_BRANCH_DU_SECONDS=1 ci_branch_measure "$r/locks" bk "$r/branches/slowtree")
+is "the record of a timed-out walk is 999999" "999999" "$(. ci/cache.sh; ci_branch_size "$r/locks" bk)"
+echo abc >"$r/locks/bk.size"
+is "a record that is not a number is 0" "0" "$(. ci/cache.sh; ci_branch_size "$r/locks" bk)"
+is "no record is 0" "0" "$(. ci/cache.sh; ci_branch_size "$r/locks" none)"
+r=$(attack_tree size2)
+mk_branch "$r/branches/$branch_key"
+ci_as touch "$r/branches/$branch_key/zig/marker"
+echo 999999 >"$r/locks/$branch_key.size"
+plant dir "$r/branches/b-other-00000009"
+echo 0 >"$r/locks/b-other-00000009.size"
+slow_reset
+rm -f "$mark/du.log"
+out=$( (. ci/cache.sh; PATH="$tmp/stubs/du2:$PATH" CI_JOB_USER=$jobuser CI_LOCK_WAIT=2 ci_branch_prepare "$r" feature/atk 2>&1 && echo RC0) || true)
+is "an own cache recorded over the bound is started again (and the step goes on)" "yes no" "$(grep -q RC0 <<<"$out" && echo yes) $([ -e "$r/branches/$branch_key/zig/marker" ] && echo yes || echo no)"
+is "the prune walked no other branch's tree (du saw only this step's own directory)" "0" "$(grep -c b-other "$mark/du.log" || true)"
+is "the step recorded its own size again (a started directory: 1 GiB, rounded up)" "1" "$(cat "$r/locks/$branch_key.size")"
+# A seed that cannot be moved into place is moved aside, not removed under the branches' lock.
+mkstub mv "$(command -v mv)" "case \"\$*\" in *.partial.*) case \"\$*\" in *.trash*) ;; *) exit 1 ;; esac ;; esac"
+mkstub rmlog "$real_rm" "case \"\$*\" in *.partial.*) echo \"\$*\" >>\"$mark/rm.log\" ;; esac"
+mkdir -p "$tmp/stubs/both"
+chmod 755 "$tmp/stubs/both"
+cp "$tmp/stubs/mv/mv" "$tmp/stubs/rmlog/rmlog" "$tmp/stubs/both/"
+mv "$tmp/stubs/both/rmlog" "$tmp/stubs/both/rm"
+r=$(attack_tree seedmv)
+ci_as mkdir -p "$r/main/zig/p/pkg"
+ci_as touch "$r/main/zig/p/pkg/f"
+slow_reset
+out=$( (. ci/cache.sh; PATH="$tmp/stubs/both:$PATH" CI_JOB_USER=$jobuser CI_LOCK_WAIT=2 ci_branch_prepare "$r" feature/atk 2>&1 && echo RC0) || true)
+is "a seed that could not be moved into place: no rm of the partial directory, none left, the trash empty" "yes 0 yes" "$(grep -q NRV-E1214 <<<"$out" && echo yes) $(find "$r/branches" -maxdepth 1 -name '*.partial.*' | wc -l) $([ -z "$(ls -A "$r/branches/.trash")" ] && [ ! -e "$mark/rm.log" ] && echo yes)"
+
+# (j) A trash whose removal outlasts CI_NORMALIZE_SECONDS (the first `rm -rf` waits 30 s) is cut
+# off after it, and the second try empties it: the call ends in a few seconds, not 30.
+trash_case bound
+ci_as touch "$r/main/zig/f"
+(. ci/cache.sh; CI_JOB_USER=$jobuser ci_trash_move "$r/main/zig") >/dev/null 2>&1
+slow_reset
+t0=$(now)
+out=$( (. ci/cache.sh; PATH="$slow_rm_dir:$PATH" SLOW_RM=30 CI_NORMALIZE_SECONDS=2 ci_trash_empty "$r/main") 2>&1)
+t1=$(now)
+is "a removal past CI_NORMALIZE_SECONDS is cut off and tried again: bounded (under 10 s), trash empty" "yes " "$(awk -v a="$t0" -v b="$t1" 'BEGIN { print (b - a < 10) ? "yes" : "no" }') $(ls -A "$r/main/.trash")"
+
+# (k) With a mv that has no --no-copy (older coreutils), a tree on another file system is still
+# not moved: the device test alone keeps mv from copying it. The stub hides the option from --help.
+if [ "$(id -u)" = 0 ]; then
+    mkdir -p "$tmp/stubs/oldmv"
+    chmod 755 "$tmp/stubs/oldmv"
+    printf '#!/bin/sh\nif [ "$1" = --help ]; then %s --help 2>&1 | grep -v -e --no-copy; exit 0; fi\nexec %s "$@"\n' "$(command -v mv)" "$(command -v mv)" >"$tmp/stubs/oldmv/mv"
+    chmod 755 "$tmp/stubs/oldmv/mv"
+    trash_case oldmv
+    if mount -t tmpfs tmpfs "$r/main/zig" 2>/dev/null; then
+        ro_mounts+=("$r/main/zig")
+        : >"$r/main/zig/f"
+        rc=0
+        (. ci/cache.sh; PATH="$tmp/stubs/oldmv:$PATH" CI_JOB_USER=$jobuser ci_trash_move "$r/main/zig") >/dev/null 2>&1 || rc=$?
+        is "no --no-copy in mv: a tree on another file system is still not moved or copied" "1 yes " "$rc $([ -e "$r/main/zig/f" ] && echo yes) $(ls -A "$r/main/.trash")"
+        umount "$r/main/zig"
+    else
+        echo "note: no tmpfs mount here: the no --no-copy test was skipped" >&2
+    fi
+fi
+
+# (l) A step that cannot take its own key lock at once (another step's prune or reset of that cache
+# holds it) lets go of the branches' lock and main's before it waits: another branch is prepared and
+# main's exclusive lock is free while it waits.
+r=$(attack_tree ownlock)
+: >"$r/locks/main.lock"
+: >"$r/locks/$branch_key.lock"
+chmod 600 "$r/locks/main.lock" "$r/locks/$branch_key.lock"
+(
+    exec 5>>"$r/locks/$branch_key.lock"
+    flock -x 5
+    sleep 4
+) &
+holder=$!
+sleep 0.5
+(
+    exec 9<"$r/locks/main.lock"
+    flock -s 9
+    . ci/cache.sh
+    CI_JOB_USER=$jobuser CI_LOCK_WAIT=10 ci_branch_prepare "$r" feature/atk >"$tmp/ownlock.out" 2>&1 && echo RC0 >>"$tmp/ownlock.out"
+) &
+waiter=$!
+sleep 1.5
+is "a step waiting for its own cache lock holds neither the branches' lock nor main's" "free free" "$(flock -x -n "$r/locks/branches.lock" true && echo -n free || echo -n held; echo -n ' '; flock -x -n "$r/locks/main.lock" true && echo free || echo held)"
+wait "$holder" "$waiter" 2>/dev/null || true
+is "and then it goes on (RC0, no warning)" yes "$(grep -q RC0 "$tmp/ownlock.out" && ! grep -q 'NRV-[EW]' "$tmp/ownlock.out" && echo yes)"
 
 # --- ci/install_zig.sh: the toolchain archive is checked on every use; only main writes it ---
 z="$tmp/zrepo"
