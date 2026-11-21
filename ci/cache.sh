@@ -32,6 +32,11 @@
 #     NRV-W1204 (ci_child_reset, under the lock that keeps the other jobs out: the key's lock for a
 #     branch, main's exclusive one for main, the Jepsen lock for jepsen), and removes the trash after
 #     the locks are let go (ci_trash_empty). A child another uid owns is never touched: NRV-E1228.
+#     ONE DELIBERATE EXCEPTION (review 6004928827): the Jepsen step drains jepsen/.trash twice, right
+#     after its sweep of old run directories and right after the reset of jepsen/tools, while it holds
+#     the Jepsen lock (fd 8) that other Jepsen steps wait on, so that jepsen's marker does not hold
+#     the box-wide prunes off for a whole run. Each is bounded by CI_TRASH_SECONDS (20 s), skipped if
+#     another step is already removing, and a Jepsen job is root-equivalent through the Docker socket.
 #
 #     THE DESIGN RULE for every lock other steps wait on (branches.lock, main.lock, a key lock held
 #     exclusively, the children lock): under it root only DECIDES and RENAMES. It never walks a tree a
@@ -326,7 +331,8 @@ ci_trash_ready() {
 # followed. A concurrent step's ci_trash_empty may remove the empty box between the mktemp and the
 # mv: tried three times. NRV-E1236 if the trash is not right; return 1 without a message if the
 # move itself failed (the name stays, and the caller refuses it). A move that worked writes the
-# mount's marker (ci_trash_mark, only if there is none) for the low-disk prunes' guard (ci_trash_pending).
+# mount's marker (ci_trash_mark, only if there is none; the low-disk prunes' own moves refresh it:
+# CI_TRASH_REFRESH) for the low-disk prunes' guard (ci_trash_pending).
 ci_trash_move() {
     local p="$1" mount t box n nocopy=()
     mount=$(dirname -- "$p")
@@ -387,9 +393,10 @@ ci_trash_empty() {
             done
             exit 1
         ' _ "$t" || rc=$?
-        # Emptied: nothing is pending. Not emptied: the marker keeps the age it has (moves never
-        # refresh it), so a trash that a job keeps filling, or that nobody can empty, holds the prunes
-        # off for CI_TRASH_PENDING_MINUTES after the first move into it and no longer (ci_trash_pending).
+        # Emptied: nothing is pending (ci_trash_unmark looks again, for a move that landed since).
+        # Not emptied: the marker keeps the age it has (only a low-disk prune's own move refreshes
+        # it), so a trash that a job keeps filling, or that nobody can empty, holds the prunes off
+        # for CI_TRASH_PENDING_MINUTES after the first move into it and no longer (ci_trash_pending).
         if [ "$rc" = 0 ]; then ci_trash_unmark "$1"; else ci_warning "NRV-W1205: $t was not emptied in $secs s (a big tree, a job still writing in a tree moved there, or a mount inside it): what is left is out of the jobs' reach by path, and a later step removes it, a bounded time at a time"; fi
     )
 }
@@ -407,19 +414,35 @@ ci_trash_marker() {
 # that its age is "pending since": the first move into a trash that no drain has found empty since
 # (review 6004714906: a marker every move refreshed let a job that keeps moving things keep the
 # prunes off for ever). ci_lock_file makes it (O_EXCL, never through a link, root's, 0600; a link at
-# its name is replaced). Best effort, silent: without a lock directory (a test of one function)
-# there is no guard to keep.
+# its name is replaced). The one exception is a low-disk prune's own move (ci_main_prune, the
+# prune-all path of ci_branch_prepare: they set CI_TRASH_REFRESH=1 around their moves): that one
+# touches the marker (after ci_lock_file made it a regular file, the lock directory being root's alone), so a prune re-arms the
+# guard even when the marker is older than CI_TRASH_PENDING_MINUTES and a slow drain has not emptied
+# the trash (review 6004928827: otherwise the prune's own move left the guard off, and the next low
+# step pruned the freshly rebuilt caches again). A prune runs only when no young marker exists, so
+# this never extends a hold-off, and it limits the prunes to one per CI_TRASH_PENDING_MINUTES. Best
+# effort, silent: without a lock directory (a test of one function) there is no guard to keep.
 ci_trash_mark() {
     local f
     f=$(ci_trash_marker "$1")
     [ -d "$(dirname -- "$f")" ] || return 0
-    if [ -f "$f" ] && [ ! -L "$f" ]; then return 0; fi
+    if [ -f "$f" ] && [ ! -L "$f" ] && [ "${CI_TRASH_REFRESH:-}" != 1 ]; then return 0; fi
     ci_lock_file "$f" 2>/dev/null || return 0
+    if [ "${CI_TRASH_REFRESH:-}" = 1 ]; then touch -- "$f" 2>/dev/null || true; fi
 }
 
-# ci_trash_unmark MOUNT: removes the marker (the trash was found empty, or was emptied).
+# ci_trash_unmark MOUNT: removes the marker (the trash was found empty, or was emptied), THEN looks at
+# the trash again and writes a fresh marker if something is in it (review 6004928827). Moves run
+# under the main, key and Jepsen locks, not under the trash lock, so one can land between a drain's
+# "empty" test and this removal: its ci_trash_mark then saw the old marker and left it, and the
+# removal would leave a trash with a tree in it and no marker, which the prunes' guard cannot see.
+# A move renames, then marks, so either its mark comes after this removal or the look finds its tree.
 ci_trash_unmark() {
+    local t="$1/.trash"
     rm -f -- "$(ci_trash_marker "$1")" 2>/dev/null || true
+    if [ -d "$t" ] && [ ! -L "$t" ] && [ -n "$(find "$t" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]; then
+        CI_TRASH_REFRESH='' ci_trash_mark "$1"
+    fi
 }
 
 # ci_trash_pending ROOT: whether a trash under the cache root ROOT is being emptied, so that a
@@ -428,14 +451,19 @@ ci_trash_unmark() {
 # CI_BRANCH_PRUNE_ALL, every idle branch (review 6004317640). It is true when, for main, branches
 # or jepsen, locks/<mount>-trash.pending exists and is younger than CI_TRASH_PENDING_MINUTES
 # (default 60): something was first moved into that trash that long ago or less, and no drain has
-# found it empty since. A running removal implies a marker (a move writes it before any drain finds
-# the trash non-empty), so it is not a second clause: one with no young marker holds nothing off
-# (review 6004714906: a removal that never ends would otherwise hold the prunes off for ever).
+# found it empty since. A running removal normally has a marker (a move writes it right after its
+# rename; ci_trash_unmark looks again after it removes one, so a move that lands between a drain's
+# empty test and the removal still leaves one), so it is not a second clause: one with no young
+# marker holds nothing off (review 6004714906: a removal that never ends would otherwise hold the
+# prunes off for ever).
 # It reads state in the lock directory only, which every step mounts and no job writes: never a
 # trash, which a step can see for one mount only (a branch's step has main/ read-only and cannot
-# empty it; a main step has no branches/). The marker's age is not refreshed by later moves, so the
-# hold-off is bounded by the knob in total: a trash nobody can empty, or one a job keeps filling,
-# delays the prunes that long at most (reviews 6004471230, 6004714906). The jepsen mount is covered
+# empty it; a main step has no branches/). The marker's age is not refreshed by later moves (only by a
+# low-disk prune's own, ci_trash_mark, which runs only when no young marker holds it off), so the
+# hold-off is bounded by the knob per drain cycle (from the first move into an empty trash to the
+# drain that empties it): a trash nobody can empty, or one a job keeps filling, delays the prunes
+# that long at most, and prunes happen at most once per knob's time while it stays (reviews
+# 6004471230, 6004714906, 6004928827). The jepsen mount is covered
 # whether or not it shares the file system: a step that does not mount it cannot tell, and its
 # trash is emptied at the end of the step that swept it. Prints why, on stdout, when it returns 0.
 ci_trash_pending() {
@@ -791,19 +819,30 @@ ci_tail_seconds() {
     echo "$tail"
 }
 
-# ci_job_seconds MINUTES: the job's bound in seconds: MINUTES * 60, but never so long that the job,
-# the 120 s margin and the tail (CI_TRASH_TAIL_SECONDS, default 300) pass Woodpecker's limit on the
-# step (CI_REPO_TIMEOUT_MINUTES, default 360), counted from CI_STEP_START (ci_tail_seconds). A
-# 330-minute search after a pre-job phase of half an hour would otherwise be killed by Woodpecker
-# and reported as killed, with no tail (review 6004714906). When the bound shrinks, NRV-W1207 says
-# by how much (stderr); at least 60 s are kept. No CI_STEP_START: MINUTES * 60.
+# ci_job_seconds MINUTES [RESERVED [JOB]]: the job's bound in seconds: MINUTES * 60, but never so long
+# that the job, what comes before it that is already bounded (RESERVED seconds: for check-scripts the
+# root tests' own bound plus the kill-after, ci/woodpecker_step.sh), the kill-after grace
+# (CI_KILL_AFTER, default 60, when a whole number), the 120 s margin and the tail
+# (CI_TRASH_TAIL_SECONDS, default 300) pass Woodpecker's limit on the step (CI_REPO_TIMEOUT_MINUTES,
+# default 360), counted from CI_STEP_START (ci_tail_seconds). A 330-minute search after a pre-job
+# phase of half an hour would otherwise be killed by Woodpecker and reported as killed, with no tail
+# (review 6004714906; the tests' bound and the kill-after: review 6004928827). When the bound shrinks,
+# NRV-W1207 says by how much (stderr). When less than 60 s would be left there is no job worth
+# starting: NRV-E1215 says it was not started (stderr), and the bound printed is 0, which the caller
+# takes as "do not run it". No CI_STEP_START: MINUTES * 60.
 ci_job_seconds() {
-    local want=$(($1 * 60)) left
+    local want=$(($1 * 60)) reserved="${2:-0}" job="${3:-the job}" kill=60 used left
+    [[ "${CI_KILL_AFTER:-}" =~ ^[0-9]+$ ]] && kill="$CI_KILL_AFTER"
     if [[ "${CI_STEP_START:-}" =~ ^[0-9]+$ ]]; then
-        left=$((${CI_REPO_TIMEOUT_MINUTES:-360} * 60 - ($(date +%s) - CI_STEP_START) - 120 - ${CI_TRASH_TAIL_SECONDS:-300}))
+        used=$(($(date +%s) - CI_STEP_START))
+        left=$((${CI_REPO_TIMEOUT_MINUTES:-360} * 60 - used - 120 - ${CI_TRASH_TAIL_SECONDS:-300} - kill - reserved))
+        if [ "$left" -lt 60 ]; then
+            ci_error "NRV-E1215: $job was not started: the step has used $used s of the repository's ${CI_REPO_TIMEOUT_MINUTES:-360} minutes and Woodpecker would kill it before it could end (NRV-W1207); the repository's Timeout has to be raised (ops/ci/README.md), with CI_REPO_TIMEOUT_MINUTES to match; CI_STEP_MINUTES does not help"
+            echo 0
+            return 0
+        fi
         if [ "$left" -lt "$want" ]; then
-            [ "$left" -ge 60 ] || left=60
-            ci_warning "NRV-W1207: the job's limit is $((left / 60)) minutes, not the $1 asked for: the step has used $(($(date +%s) - CI_STEP_START)) s of the repository's ${CI_REPO_TIMEOUT_MINUTES:-360} minutes (Woodpecker would kill it, with no tail); a long job needs the repository's Timeout raised (ops/ci/README.md) and CI_REPO_TIMEOUT_MINUTES to match"
+            ci_warning "NRV-W1207: the job's limit is $((left / 60)) minutes, not the $1 asked for: the step has used $used s of the repository's ${CI_REPO_TIMEOUT_MINUTES:-360} minutes (Woodpecker would kill it, with no tail); a long job needs the repository's Timeout raised (ops/ci/README.md) and CI_REPO_TIMEOUT_MINUTES to match"
             want=$left
         fi
     fi
@@ -924,7 +963,7 @@ ci_branch_own_lock() {
 # nobody is using goes. The lock on fd 7 (locks/branches.lock) serialises seeding and pruning; fd 6 is
 # taken before it is released, so no prune falls between.
 ci_branch_prepare() {
-    local root="$1" key b dir locks maxn maxdays maxgib seedgib seed_size partial err last rc locked=no own_rc
+    local root="$1" key b dir locks maxn maxdays maxgib seedgib seed_size partial err last rc locked=no own_rc refresh
     ci_knobs_check || return 1
     key=$(ci_branch_key "$2")
     b="$root/branches"
@@ -936,8 +975,9 @@ ci_branch_prepare() {
     seedgib="${CI_BRANCH_SEED_MAX_GIB:-6}"
     # The low-disk prune of every idle cache is not made while a trash is draining: its blocks and
     # inodes are what made the disk look low (ci_trash_pending).
+    refresh=
     if [ "${CI_BRANCH_PRUNE_ALL:-}" = 1 ]; then
-        if ci_trash_hold_off "every idle branch cache" "$root"; then :; else maxn=0; fi
+        if ci_trash_hold_off "every idle branch cache" "$root"; then :; else maxn=0; refresh=1; fi
     fi
     # The size of main's package cache decides whether this branch is seeded from it. It is
     # measured here, before the branches' lock: a walk of a tree under that lock would stall every
@@ -948,7 +988,8 @@ ci_branch_prepare() {
     { exec 7>>"$locks/branches.lock"; } 2>/dev/null || { ci_lock_open_failed "$locks/branches.lock" '>>'; return 1; }
     if flock -x -w "${CI_LOCK_WAIT:-300}" 7; then
         locked=yes
-        ci_branch_prune "$b" "$locks" "$key" "$maxn" "$maxdays" "$maxgib"
+        # The prune-all's moves re-arm the guard's marker (refresh=1: ci_trash_mark); no other move does.
+        CI_TRASH_REFRESH="$refresh" ci_branch_prune "$b" "$locks" "$key" "$maxn" "$maxdays" "$maxgib"
         # Its own cache over the size limit (as the last step recorded it, ci_branch_measure: no
         # walk here) starts again, if no job of this branch is using it: moved aside, removed below.
         if [ -d "$dir" ] && [ "$(ci_branch_size "$locks" "$key")" -gt "$maxgib" ]; then
@@ -1094,7 +1135,8 @@ ci_main_prune() {
     elif [ "$got" = yes ]; then
         echo "emptying main's Zig caches (no other job holds them)"
         for p in zig zig-local; do # a link there is moved as the link, not followed
-            if [ -e "$root/main/$p" ] || [ -L "$root/main/$p" ]; then ci_trash_move "$root/main/$p" || true; fi
+            # CI_TRASH_REFRESH: this move re-arms the guard's marker (ci_trash_mark)
+            if [ -e "$root/main/$p" ] || [ -L "$root/main/$p" ]; then CI_TRASH_REFRESH=1 ci_trash_move "$root/main/$p" || true; fi
         done
     else
         ci_warning "NRV-W1202: other jobs held main's cache for $wait s: not pruned. To recover by hand, with the agent idle: rm -rf /var/cache/nerva-ci/main/zig-local /var/cache/nerva-ci/main/zig"

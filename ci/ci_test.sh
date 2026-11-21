@@ -638,7 +638,7 @@ as_ci_lines=$(grep -c '"${as_ci\[@\]}"' ci/woodpecker_step.sh || true)
 closing_lines=$(grep -c '"${as_ci\[@\]}".* 6>&- 7>&- 8>&- 9<&-' ci/woodpecker_step.sh || true)
 is "woodpecker_step.sh runs two commands as ci" 2 "$as_ci_lines"
 is "install_zig closes fds 6 to 9 for the job's user (static; the job's own are tested behaviourally)" 1 "$closing_lines"
-is "the step's tail is ci_step_run_with_tests, with the root tests and the job as arrays (static)" 2 "$(grep -c '^tests_cmd=(bash ci/ci_test.sh)$\|^ci_step_run_with_tests .* tests_cmd job_cmd || status=\$?$' ci/woodpecker_step.sh || true)"
+is "the step's tail is ci_step_run_with_tests, with the root tests and the job as arrays (static)" 2 "$(grep -c '^tests_cmd=(bash ci/ci_test.sh)$\|^ *ci_step_run_with_tests .* tests_cmd job_cmd || status=\$?$' ci/woodpecker_step.sh || true)"
 is "the root tests are bounded by their own limit, not the job's (static)" 1 "$(grep -c '"$((test_minutes \* 60))" "$job_seconds"' ci/woodpecker_step.sh || true)"
 # Both places that take main's lock use ci_shared_lock (bounded, NRV-E1224), never a bare flock; the
 # jepsen lock file is made by ci_lock_file.
@@ -654,7 +654,7 @@ is "jepsen's lock (fd 8) is let go before its trash is emptied, by the tail (sta
 lock8_l=$(grep -n 'flock -x -w "\${CI_JEPSEN_WAIT:-5400}" 8' "$ws" | cut -d: -f1)
 pre_j=$(grep -n '^    ci_trash_empty "\$cache/jepsen" #' "$ws" | cut -d: -f1)
 is "jepsen's old trash is emptied before the step takes the Jepsen lock others wait on (static)" yes "$([ -n "$lock8_l" ] && [ -n "$pre_j" ] && [ "$pre_j" -lt "$lock8_l" ] && echo yes)"
-run_l=$(grep -n '^ci_step_run_with_tests ' "$ws" | cut -d: -f1)
+run_l=$(grep -n '^ *ci_step_run_with_tests ' "$ws" | cut -d: -f1)
 finish_l=$(grep -n '^ci_step_finish "\$role" "\$cache" "\${CI_BRANCH_DIR:-}" "\$job"$' "$ws" | cut -d: -f1)
 is "the step measures and empties its trash after the job, in its tail (static)" yes "$([ -n "$run_l" ] && [ -n "$finish_l" ] && [ "$run_l" -lt "$finish_l" ] && echo yes)"
 is "the old run directories are swept by ci_jepsen_sweep, with no age test of its own (static)" "1 0" "$(grep -c '^    ci_jepsen_sweep "\$cache/jepsen"$' "$ws" || true) $(grep -c -e '-mtime' "$ws" || true)"
@@ -2530,6 +2530,73 @@ ci_as touch "$r/main/zig/f"
 (. ci/cache.sh; CI_JOB_USER=$jobuser ci_trash_move "$r/main/zig")
 is "a link at the marker's name is replaced, never followed" "yes $want_state" "$([ -f "$r/locks/main-trash.pending" ] && [ ! -L "$r/locks/main-trash.pending" ] && echo yes) $(sentinel_state)"
 
+# (e2-5b) The SHOULD of review 6004928827: a marker older than CI_TRASH_PENDING_MINUTES with the trash
+# still not empty (a slow drain) must not leave the prunes unguarded after a prune's OWN move: the low-disk
+# prunes (ci_main_prune; the prune-all path of ci_branch_prepare) refresh the marker after their moves.
+# Old marker + non-empty trash (the stub rm cannot empty it), box low, two prepares: the first prunes
+# (it may: no young marker) and re-arms, so what the job rebuilds survives the second, which says
+# NRV-W1206. Mutants: ci_main_prune's CI_TRASH_REFRESH=1 removed; ci_branch_prepare's refresh=1 removed;
+# ci_trash_mark ignoring CI_TRASH_REFRESH.
+r=$(attack_tree refresh-main)
+mkdir -m 0700 "$r/main/.trash"
+mkdir "$r/main/.trash/left-over"
+: >"$r/locks/main-trash.pending"
+chmod 600 "$r/locks/main-trash.pending"
+pending_age "$r/locks/main-trash.pending" 90
+ci_as touch "$r/main/zig/f"
+out=$(prep_low_main "$r")
+is "old marker, trash not empty, box low: the first main prepare prunes main/zig, no W1206" "no no yes" "$([ -e "$r/main/zig/f" ] && echo yes || echo no) $(grep -q NRV-W1206 <<<"$out" && echo yes || echo no) $(grep -q RC0 <<<"$out" && echo yes)"
+is "the prune's own move re-armed the marker (younger than 5 minutes, still a root-only file)" "yes 600" "$([ -n "$(find "$r/locks/main-trash.pending" -maxdepth 0 -mmin -5 2>/dev/null)" ] && echo yes) $(stat -c %a "$r/locks/main-trash.pending" 2>/dev/null)"
+ci_as touch "$r/main/zig/f"
+out=$(prep_low_main "$r")
+is "... so main/zig, rebuilt by the job, survives the second prepare, which says NRV-W1206" "yes yes yes" "$([ -e "$r/main/zig/f" ] && echo yes) $(grep -q "NRV-W1206: not pruning main's Zig caches" <<<"$out" && echo yes) $(grep -q RC0 <<<"$out" && echo yes)"
+r=$(attack_tree refresh-branch)
+mkdir -m 0700 "$r/branches/.trash"
+mkdir "$r/branches/.trash/left-over"
+: >"$r/locks/branches-trash.pending"
+chmod 600 "$r/locks/branches-trash.pending"
+pending_age "$r/locks/branches-trash.pending" 90
+mk_branch "$r/branches/b-idle-00000003"
+out=$(prep_all_branch "$r")
+is "old marker, trash not empty, prune-all: the first branch prepare drops the idle cache, no W1206" "no no yes" "$([ -d "$r/branches/b-idle-00000003" ] && echo yes || echo no) $(grep -q NRV-W1206 <<<"$out" && echo yes || echo no) $(grep -q RC0 <<<"$out" && echo yes)"
+is "the prune-all's own moves re-armed the branches marker" "yes" "$([ -n "$(find "$r/locks/branches-trash.pending" -maxdepth 0 -mmin -5 2>/dev/null)" ] && echo yes)"
+mk_branch "$r/branches/b-idle-00000004"
+out=$(prep_all_branch "$r")
+is "... so a cache made since survives the second prepare, which says NRV-W1206" "yes yes yes" "$([ -d "$r/branches/b-idle-00000004" ] && echo yes) $(grep -q "NRV-W1206: not pruning every idle branch cache" <<<"$out" && echo yes) $(grep -q RC0 <<<"$out" && echo yes)"
+# Every other move leaves an old marker alone (only a prune's refreshes): a reset or a seed's move.
+r=$(attack_tree norefresh)
+: >"$r/locks/main-trash.pending"
+pending_age "$r/locks/main-trash.pending" 90
+ci_as touch "$r/main/zig/f"
+(. ci/cache.sh; CI_JOB_USER=$jobuser ci_trash_move "$r/main/zig")
+is "a move that is not a low-disk prune's leaves an old marker old" "yes" "$([ -z "$(find "$r/locks/main-trash.pending" -maxdepth 0 -mmin -5 2>/dev/null)" ] && echo yes)"
+
+# (e2-5c) The NIT of review 6004928827, the lost-marker race: moves run under the main, key and Jepsen
+# locks, not the trash lock, so one can land after a drain's "empty" test and before its unmark. The
+# unmark now removes the marker and then looks at the trash again, writing a fresh one if it is not
+# empty. Functional (a trash with a tree, then without), and with the race itself: a stub rm that, as it
+# removes the marker, puts a tree in the trash (what the move's rename does at that instant).
+# Mutant: ci_trash_unmark is the bare rm -f again.
+r=$(attack_tree recheck)
+(. ci/cache.sh; ci_trash_ready "$r/main")
+mkdir "$r/main/.trash/landed"
+: >"$r/locks/main-trash.pending"
+pending_age "$r/locks/main-trash.pending" 90
+(. ci/cache.sh; ci_trash_unmark "$r/main")
+is "unmark with a tree in the trash: a fresh marker (not the 90-minute-old one) is there" "yes" "$([ -n "$(find "$r/locks/main-trash.pending" -maxdepth 0 -mmin -5 2>/dev/null)" ] && echo yes)"
+rmdir "$r/main/.trash/landed"
+(. ci/cache.sh; ci_trash_unmark "$r/main")
+is "unmark with an empty trash: no marker" "no" "$([ -e "$r/locks/main-trash.pending" ] && echo yes || echo no)"
+mkdir -p "$tmp/stubs/race"
+realrm=$(command -v rm)
+printf '#!/bin/sh\nfor a; do case "$a" in *-trash.pending) mkdir -p "$RACE_DIR/landed" ;; esac; done\nexec %s "$@"\n' "$realrm" >"$tmp/stubs/race/rm"
+chmod 755 "$tmp/stubs/race/rm"
+r=$(attack_tree race)
+(. ci/cache.sh; ci_trash_ready "$r/main")
+: >"$r/locks/main-trash.pending"
+(PATH="$tmp/stubs/race:$PATH" RACE_DIR="$r/main/.trash" bash -c '. ci/cache.sh; ci_trash_empty "$1"' _ "$r/main")
+is "a move that lands as the drain unmarks an empty trash: the trash has a tree and a marker" "yes yes" "$([ -d "$r/main/.trash/landed" ] && echo yes) $([ -e "$r/locks/main-trash.pending" ] && echo yes)"
+
 # (e2-6) Jepsen's trash: the step that swept it empties it in its tail, with the tail bound
 # (ci_step_finish with the job), and no other step does. Mutant: `jepsen` not added to the tail's mounts.
 r=$(attack_tree jep)
@@ -2545,9 +2612,16 @@ is "the jepsen step's tail empties jepsen's trash and its marker" "yes no" "$([ 
 # CI_TRASH_SECONDS (the default: no secs argument), so that its marker does not hold the box-wide
 # prunes off for a whole Jepsen run (review 6004714906). Mutant: the drain line removed.
 sweep_l=$(grep -n '^    ci_jepsen_sweep "\$cache/jepsen"$' "$ws" | cut -d: -f1)
-jdrain_l=$(grep -n '^    ci_trash_empty "\$cache/jepsen"$' "$ws" | cut -d: -f1)
+jdrain_l=$(grep -n '^    ci_trash_empty "\$cache/jepsen"$' "$ws" | cut -d: -f1 | head -n 1)
+jdrain2_l=$(grep -n '^    ci_trash_empty "\$cache/jepsen"$' "$ws" | cut -d: -f1 | tail -n 1)
+tools_l=$(grep -n '^    ci_child_ensure "\$cache/jepsen/tools" "\$cache/jepsen" || exit 1$' "$ws" | cut -d: -f1)
 unlock_l=$(grep -n '^    flock -u 8 2>/dev/null || true$' "$ws" | cut -d: -f1)
 is "the jepsen step drains jepsen/.trash after the sweep and before it lets fd 8 go (static)" yes "$([ -n "$sweep_l" ] && [ -n "$jdrain_l" ] && [ -n "$unlock_l" ] && [ "$sweep_l" -lt "$jdrain_l" ] && [ "$jdrain_l" -lt "$unlock_l" ] && echo yes)"
+# ... and again after the reset of jepsen/tools, which can move the old one into jepsen/.trash and
+# write its marker (review 6004928827). Mutant: that second drain removed.
+is "the jepsen step drains jepsen/.trash again right after the tools reset, before fd 8 is let go (static)" yes "$([ -n "$tools_l" ] && [ -n "$jdrain2_l" ] && [ "$jdrain_l" -ne "$jdrain2_l" ] && [ "$tools_l" -lt "$jdrain2_l" ] && [ "$jdrain2_l" -lt "$unlock_l" ] && echo yes)"
+# The exception to "root never walks a job's tree under a lock others wait on" is recorded where the rule is written.
+is "the Jepsen drain under fd 8 is recorded as a deliberate exception in cache.sh, the step and ops/ci/README.md" "1 1 1" "$(grep -c 'ONE DELIBERATE EXCEPTION' ci/cache.sh || true) $(grep -c 'A DELIBERATE EXCEPTION' "$ws" || true) $(grep -c -F '**One deliberate' ops/ci/README.md || true)"
 r=$(attack_tree jep2)
 mkdir -m 0755 "$r/jepsen"
 plant dir "$r/jepsen/20240101T000000Z-1"
@@ -2579,15 +2653,35 @@ is "with time left the tail empties the trash" "" "$(ls -A "$r/main/.trash")"
 # 6004714906): no CI_STEP_START, or time to spare, is MINUTES * 60 and silent; a step that has used
 # 40 minutes of 60 with a 300 s tail leaves 60 - 40 - 2 - 5 = about 13 minutes of a 330-minute ask,
 # with the warning; no time at all keeps 60 s. Mutant: ci_job_seconds echoes MINUTES * 60 always.
-jobs_() { env "$@" bash -c '. ci/cache.sh; ci_job_seconds "$1"' _ "${JOBMIN:-330}" 2>"$tmp/jobs.err"; }
+jobs_() { env "$@" bash -c '. ci/cache.sh; ci_job_seconds "$1" "${RES:-0}" "${JOBNAME:-demo}"' _ "${JOBMIN:-330}" 2>"$tmp/jobs.err"; }
 is "ci_job_seconds: no CI_STEP_START is the full 330 minutes, silent" "19800 yes" "$(jobs_ CI_X=1) $([ ! -s "$tmp/jobs.err" ] && echo yes)"
 is "ci_job_seconds: a step 60 s old, default 360 minutes: the full 330 minutes, silent" "19800 yes" "$(jobs_ CI_STEP_START=$((now - 60))) $([ ! -s "$tmp/jobs.err" ] && echo yes)"
 left=$(jobs_ CI_STEP_START=$((now - 2400)) CI_REPO_TIMEOUT_MINUTES=60)
-is "ci_job_seconds: 40 of 60 minutes used: 20 min - 120 s - 300 s = 780 s (give or take a few)" yes "$([ "$left" -ge 775 ] && [ "$left" -le 780 ] && echo yes)"
-is "ci_job_seconds: shortened, it says NRV-W1207 with the minutes" yes "$(grep -q "NRV-W1207: the job's limit is 1[23] minutes, not the 330 asked for" "$tmp/jobs.err" && echo yes)"
-is "ci_job_seconds: a step past the limit keeps 60 s" "60" "$(jobs_ CI_STEP_START=$((now - 4000)) CI_REPO_TIMEOUT_MINUTES=60)"
+is "ci_job_seconds: 40 of 60 minutes used: 20 min - 120 s - 300 s - 60 s kill-after = 720 s (give or take a few)" yes "$([ "$left" -ge 715 ] && [ "$left" -le 720 ] && echo yes)"
+is "ci_job_seconds: shortened, it says NRV-W1207 with the minutes" yes "$(grep -q "NRV-W1207: the job's limit is 1[12] minutes, not the 330 asked for" "$tmp/jobs.err" && echo yes)"
+# The kill-after (CI_KILL_AFTER, default 60, a whole number else 60) is in the formula (review
+# 6004928827). Mutant: the kill-after left out.
+left=$(jobs_ CI_STEP_START=$((now - 2400)) CI_REPO_TIMEOUT_MINUTES=60 CI_KILL_AFTER=600)
+is "ci_job_seconds: CI_KILL_AFTER=600 comes off the bound: 3600 - 2400 - 120 - 300 - 600 = 180 s" yes "$([ "$left" -ge 175 ] && [ "$left" -le 180 ] && echo yes)"
+left=$(jobs_ CI_STEP_START=$((now - 2400)) CI_REPO_TIMEOUT_MINUTES=60 CI_KILL_AFTER=soon)
+is "ci_job_seconds: a CI_KILL_AFTER that is not a whole number counts as the default 60 s" yes "$([ "$left" -ge 715 ] && [ "$left" -le 720 ] && echo yes)"
+# The root tests' bound (what check-scripts runs first) comes off the job's: 3600 - 300 - 120 - 300 -
+# 60 - (1200 + 60) = 1560 s of the 75 minutes asked for. Mutant: RESERVED ignored.
+left=$(RES=1260 JOBMIN=75 jobs_ CI_STEP_START=$((now - 300)) CI_REPO_TIMEOUT_MINUTES=60)
+is "ci_job_seconds: the reserved seconds (the root tests' bound and kill-after) come off the job's bound" yes "$([ "$left" -ge 1555 ] && [ "$left" -le 1560 ] && echo yes)"
+is "ci_job_seconds: ... with NRV-W1207 (26 minutes of the 75)" yes "$(grep -q "NRV-W1207: the job's limit is 2[56] minutes, not the 75 asked for" "$tmp/jobs.err" && echo yes)"
+left=$(RES=1260 JOBMIN=75 jobs_ CI_STEP_START=$((now - 300)))
+is "ci_job_seconds: the same reserve against the default 360 minutes changes nothing: 4500 s, silent" "4500 yes" "$left $([ ! -s "$tmp/jobs.err" ] && echo yes)"
+# With no time left (under 60 s) the job is not started: 0, and NRV-E1215 says so, naming the
+# Timeout, never CI_STEP_MINUTES as the way out. Mutant: the old floor (60 s kept) is back.
+is "ci_job_seconds: a step past the limit: 0, the job is not started" "0" "$(jobs_ CI_STEP_START=$((now - 4000)) CI_REPO_TIMEOUT_MINUTES=60)"
+is "ci_job_seconds: ... with NRV-E1215 naming the job and the Timeout, not CI_STEP_MINUTES as the fix" "yes no" "$(grep -q "NRV-E1215: demo was not started: .*repository's Timeout has to be raised" "$tmp/jobs.err" && echo yes) $(grep -q "CI_STEP_MINUTES raises" "$tmp/jobs.err" && echo yes || echo no)"
+is "ci_job_seconds: 20 s left (under the 60 s floor) is 0 too" "0" "$(jobs_ CI_STEP_START=$((now - 3100)) CI_REPO_TIMEOUT_MINUTES=60)"
+is "ci_job_seconds: no time left once the reserve is taken: 0" "0" "$(RES=1260 JOBMIN=75 jobs_ CI_STEP_START=$((now - 2400)) CI_REPO_TIMEOUT_MINUTES=60)"
 is "ci_job_seconds: a job that fits is left alone, silent (75 of 360, 10 min used)" "4500 yes" "$(JOBMIN=75 jobs_ CI_STEP_START=$((now - 600))) $([ ! -s "$tmp/jobs.err" ] && echo yes)"
-is "the step bounds the job with ci_job_seconds (static)" "1 0" "$(grep -c '^job_seconds=\$(ci_job_seconds "\$minutes")$' "$ws" || true) $(grep -c -F '"$((minutes * 60))"' "$ws" || true)"
+is "the step bounds the job with ci_job_seconds, with the root tests' reserve for check-scripts (static)" "1 1 0" "$(grep -c '^job_seconds=\$(ci_job_seconds "\$minutes" "\$reserved" "\$job")$' "$ws" || true) $(grep -c '^    reserved=\$((test_minutes \* 60 + kill_after))$' "$ws" || true) $(grep -c -F '"$((minutes * 60))"' "$ws" || true)"
+is "the step skips a job with no time left (NRV-E1215 said so) and fails (static)" "1" "$(grep -c -x 'if \[ "\$job_seconds" = 0 \]; then' "$ws" || true)"
+is "a job that was shortened names the Timeout, not CI_STEP_MINUTES, in its NRV-E1215 (static)" "1" "$(grep -c "export CI_TIMEOUT_KNOB=\"the repository's Timeout" "$ws" || true)"
 is "NRV-W1207 is registered in docs/ERRORS.md" 1 "$(grep -c '^| NRV-W1207 |' docs/ERRORS.md || true)"
 # The step drains the trash of the mount it writes BEFORE it measures "low" (static: the drain is
 # above the disk test), and passes its start time, and the guard is registered. Mutant: the drain moved below.

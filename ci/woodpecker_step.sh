@@ -120,7 +120,11 @@ if [ "$job" = jepsen ]; then
     # `tools` (ci_jepsen_sweep). The sweep wrote jepsen's marker, which holds the box-wide low-disk
     # prunes off (ci_trash_pending), so the trash is drained now, bounded by CI_TRASH_SECONDS, while
     # the lock is held, rather than after a Jepsen run of hours (review 6004714906); what is left is
-    # removed by the tail below.
+    # removed by the tail below. A DELIBERATE EXCEPTION to "root never walks a job's tree under a lock
+    # others wait on" (ci/cache.sh, rule 2; review 6004928827): this walks old run directories while
+    # fd 8 is held, and another Jepsen step waits on fd 8 (CI_JEPSEN_WAIT, 5400 s), but it is bounded
+    # by CI_TRASH_SECONDS (20 s), skipped if another step is already removing, and a Jepsen job is
+    # root-equivalent through the Docker socket anyway.
     ci_jepsen_sweep "$cache/jepsen"
     ci_trash_empty "$cache/jepsen"
     # The job still runs as `ci`: root would leave root's files in the cache. The socket's group
@@ -134,6 +138,9 @@ if [ "$job" = jepsen ]; then
     # tools is a direct child of the jepsen root: made, or reset if unusable, by root (this run holds
     # the jepsen lock, fd 8, exclusively, which keeps every other run out).
     ci_child_ensure "$cache/jepsen/tools" "$cache/jepsen" || exit 1
+    # A reset of tools moved the old one into jepsen/.trash (and wrote its marker): drained now, the
+    # same exception and the same bound as the sweep's.
+    ci_trash_empty "$cache/jepsen"
     docker_pin=(29.9.3 3fb5d1f13014c18cc54945bc177c58a9056a482dada031e17d12cf2e6922c973 "$cache/jepsen/tools")
     ci_as_job ci/docker_client.sh "${docker_pin[@]}" fetch
     ci/docker_client.sh "${docker_pin[@]}" install
@@ -189,14 +196,32 @@ tests_cmd=(bash ci/ci_test.sh)
 job_cmd=("${as_ci[@]}" ci/job.sh "$job" ${arg:+"$arg"})
 status=0
 # The job's bound is the step's limit, or less when the pre-job phase took long enough that
-# Woodpecker's repository timeout would cut it off (ci_job_seconds, NRV-W1207).
-job_seconds=$(ci_job_seconds "$minutes")
-# (ci_step_run_with_tests is in ci/lib.sh, with its tests: for check-scripts the tests run first,
-# bounded by CI_SCRIPTS_TEST_MINUTES, not by the job's whole limit; either failing fails the step.)
-ci_step_run_with_tests "$job" "$((test_minutes * 60))" "$job_seconds" tests_cmd job_cmd || status=$?
-# A Jepsen run holds the Jepsen lock exclusively for its whole run, so what its reset
-# of the tools moved aside is removed only now, after the lock is let go (its sweep was drained at once; nothing is held that
-# another step waits on): by ci_step_finish below, for the tail's bound.
+# Woodpecker's repository timeout would cut it off (ci_job_seconds, NRV-W1207). For check-scripts the
+# root tests run first and their whole bound (and its kill-after) is taken off what is left. With
+# no time left (0) neither runs: NRV-E1215 said so, and the step fails.
+reserved=0
+if [ "$job" = check-scripts ]; then
+    kill_after=60
+    if [[ "${CI_KILL_AFTER:-}" =~ ^[0-9]+$ ]]; then kill_after="$CI_KILL_AFTER"; fi
+    reserved=$((test_minutes * 60 + kill_after))
+fi
+job_seconds=$(ci_job_seconds "$minutes" "$reserved" "$job")
+if [ "$job_seconds" = 0 ]; then
+    status=1
+else
+    # A job shortened to fit the repository's timeout is not helped by CI_STEP_MINUTES: its
+    # NRV-E1215 names the Timeout instead.
+    if [ "$job_seconds" -lt $((minutes * 60)) ]; then
+        export CI_TIMEOUT_KNOB="the repository's Timeout, with CI_REPO_TIMEOUT_MINUTES to match (the job was shortened: NRV-W1207)"
+    fi
+    # (ci_step_run_with_tests is in ci/lib.sh, with its tests: for check-scripts the tests run first,
+    # bounded by CI_SCRIPTS_TEST_MINUTES, not by the job's whole limit; either failing fails the step.)
+    ci_step_run_with_tests "$job" "$((test_minutes * 60))" "$job_seconds" tests_cmd job_cmd || status=$?
+fi
+# A Jepsen run holds the Jepsen lock exclusively for its whole run, so what is left of what its sweep
+# and its reset of the tools moved aside (both were drained at once, a bounded 20 s each) is removed
+# only now, after the lock is let go (nothing is held that another step waits on): by ci_step_finish
+# below, for the tail's bound.
 if [ "$job" = jepsen ]; then
     flock -u 8 2>/dev/null || true
 fi

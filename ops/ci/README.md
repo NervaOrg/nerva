@@ -369,7 +369,13 @@ set:
       directory the job's normalization could not make usable), NRV-W1204, a branch cache the prune
       drops, a killed seed's partial directory and an old Jepsen run directory. **Root never walks a
       job's tree under a lock other steps wait on** (`branches.lock`, `main.lock`, a key lock held
-      exclusively, the children lock): under a lock it only decides and renames. The trash is emptied
+      exclusively, the children lock): under a lock it only decides and renames. **One deliberate
+      exception** (review 6004928827): the Jepsen step drains `jepsen/.trash` right after its sweep of
+      old run directories and right after a reset of `jepsen/tools`, while it holds the Jepsen lock that
+      other Jepsen steps wait on (`CI_JEPSEN_WAIT`, 5400 s), so that jepsen's marker does not hold the
+      box-wide prunes off for a whole run: each drain is bounded by `CI_TRASH_SECONDS` (20 s), skipped
+      if another step is already removing, and a Jepsen job is root-equivalent through the Docker
+      socket anyway. The trash is emptied
       (`rm -rf --one-file-system` of its names) after the lock is released, by **one step per mount at a
       time**: `ci_trash_empty` takes the root-only `locks/<mount>-trash.lock` with `flock -n`, and a
       step that does not get it skips the removal and goes on, so no step waits for another's removal.
@@ -384,21 +390,29 @@ set:
       cache) wait for is state in `locks/`, which every step mounts and no job can write, never a trash's
       contents: a marker `locks/<mount>-trash.pending` on any of the three mounts, written by the
       first `ci_trash_move` into that trash (later moves leave it alone, so its age is "pending
-      since") and younger than `CI_TRASH_PENDING_MINUTES` (default 60; NRV-E1208). A drain that
-      empties or finds the trash empty removes it; one that cannot leaves its age alone. A removal
+      since"; the one exception is a low-disk prune's own move, which touches it, so that a prune
+      re-arms the guard even when a slow drain has left an old marker and a non-empty trash, and the
+      next low step does not prune the caches just rebuilt) and younger than `CI_TRASH_PENDING_MINUTES` (default 60; NRV-E1208). A drain that
+      empties or finds the trash empty removes it and then looks at the trash again, writing a fresh
+      marker if a move landed meanwhile; one that cannot empty it leaves its age alone. A removal
       running with no young marker holds nothing off, and an old marker holds nothing off, so a trash
       that nobody can empty, or one a job keeps filling through a directory it holds open, delays the
-      prunes by that long in all after the first move into it and no longer, with the line NRV-W1206 (`bash ci/nerva-woodpecker.sh
+      prunes by that long per drain cycle (from the first move into an empty trash to the drain that
+      empties it; while a trash stays, a prune re-arms it, so prunes come at most once per
+      `CI_TRASH_PENDING_MINUTES`), with the line NRV-W1206 (`bash ci/nerva-woodpecker.sh
       host` empties every trash and removes the markers). The Jepsen mount is in the guard whether or
       not it shares the cache's file system (a step that does not mount it cannot tell): its trash is
-      drained right after the sweep, while the Jepsen lock is held, for `CI_TRASH_SECONDS` at most
+      drained right after the sweep and again after a reset of `jepsen/tools`, while the Jepsen lock is held, for `CI_TRASH_SECONDS` at most
       (what is left goes in the tail), so its marker does not hold the prunes for an hour per run. The post-job tail never runs past the repository's
       timeout: it is capped to the time left of `CI_REPO_TIMEOUT_MINUTES` (default 360, the Timeout
       set in step 2 above; NRV-E1208) minus 120 s from the step's start, and with none left the
       trash is left for a later step. So that the job never eats the tail's time, the job's own
       limit is bounded the same way: the smaller of its limit (330 minutes for the long searches)
-      and `CI_REPO_TIMEOUT_MINUTES` minus what the step has used, minus 120 s and the tail's
-      `CI_TRASH_TAIL_SECONDS`, with the line NRV-W1207 when that shortens it (the pre-job phase can
+      and `CI_REPO_TIMEOUT_MINUTES` minus what the step has used, minus 120 s, the kill-after grace
+      (`CI_KILL_AFTER`, 60 s) and the tail's `CI_TRASH_TAIL_SECONDS` (for `check-scripts` also the root
+      tests' whole bound, `CI_SCRIPTS_TEST_MINUTES` plus the kill-after, which run first), with the line
+      NRV-W1207 when that shortens it; with less than 60 s left the job is not started and the step
+      fails with NRV-E1215 (the repository's Timeout is the fix, not `CI_STEP_MINUTES`) (the pre-job phase can
       take about half an hour on a busy box: `CI_NORMALIZE_SECONDS` 600 and `CI_LOCK_WAIT` 300, each
       twice, `du` 60 s, `CI_TRASH_SECONDS` 20 s, the package installs; a job that is shortened ends
       with NRV-E1215 at its bound, not killed by Woodpecker). Then at most the tail's `du` (60 s) and
