@@ -6,7 +6,8 @@
 #
 #   Install (after `scp -r ops/ci root@BOX:`, from ~ on the box; needs docker, curl, jq, systemd):
 #     NERVA_AS_SERVER=https://ci.example.org bash ci/autoscaler/nerva-autoscaler.sh install
-#   Copies the scripts to /usr/local/lib/nerva-ci/, writes /etc/nerva-ci/autoscaler.conf (no secrets;
+#   Copies ops/ci/'s docker/, io_uring_probe.sh, nerva-woodpecker.sh and autoscaler/ (all the snapshot build
+#   needs) to /usr/local/lib/nerva-ci/ci/, writes /etc/nerva-ci/autoscaler.conf (no secrets;
 #   an existing line is kept unless its NERVA_AS_* variable is given), installs the systemd units and
 #   enables the nightly snapshot timer. Run it again to change a setting. It checks the two secret
 #   files (below) and that the pinned autoscaler has the flags this script passes (NRV-E1240).
@@ -74,6 +75,24 @@ help_check() { # the pinned autoscaler must know every setting `run` passes (NRV
     done
 }
 
+# install_tree: $lib/ci/ becomes a copy of the parts of ops/ci/ that the snapshot build needs (CI_TREE):
+# the build copies exactly that to the build server, where provision-image.sh finds its files beside it.
+install_tree() {
+    local src dst="$lib/ci" f
+    src="$(cd "$here/.." && pwd)"
+    for f in $CI_TREE; do
+        [ -e "$src/$f" ] || fail "NRV-E1239: $src/$f is missing: install from a whole copy of ops/ci/ (scp -r ops/ci root@BOX:)"
+    done
+    [ "$src" != "$(cd "$lib" && pwd)/ci" ] || return 0 # already the installed copy
+    rm -rf "$dst.new"
+    mkdir -p "$dst.new"
+    for f in $CI_TREE; do cp -r "$src/$f" "$dst.new/$f"; done
+    chmod -R u=rwX,go=rX "$dst.new"
+    chmod 0755 "$dst.new"/*.sh "$dst.new"/autoscaler/*.sh
+    rm -rf "$dst"
+    mv "$dst.new" "$dst"
+}
+
 install_all() {
     local conf="$etc/autoscaler.conf" k v f
     [ "$(id -u)" = "${NERVA_CI_ROOT_UID:-0}" ] || fail "NRV-E1239: run as root"
@@ -96,10 +115,7 @@ install_all() {
         mv "$conf.new" "$conf"
     done
     conf_load
-    for f in lib.sh nerva-autoscaler.sh nerva-autoscaler-image.sh provision-image.sh; do
-        install -m 0755 "$here/$f" "$lib/$f"
-    done
-    install -m 0644 "$here/cloud-init.tmpl.yaml" "$lib/cloud-init.tmpl.yaml"
+    install_tree
     for f in nerva-autoscaler.service nerva-autoscaler-image.service nerva-autoscaler-image.timer; do
         install -m 0644 "$here/$f" "$units/$f"
     done
@@ -121,7 +137,7 @@ run() {
         --memory 512m --pids-limit 256 \
         -v "$etc/hcloud.token:/run/secrets/hcloud.token:ro" \
         -v "$etc/woodpecker.token:/run/secrets/woodpecker.token:ro" \
-        -v "$lib/cloud-init.tmpl.yaml:/etc/cloud-init.tmpl.yaml:ro" \
+        -v "$lib/ci/autoscaler/cloud-init.tmpl.yaml:/etc/cloud-init.tmpl.yaml:ro" \
         -e WOODPECKER_SERVER="$AS_SERVER" -e WOODPECKER_GRPC_ADDR="$AS_GRPC" -e WOODPECKER_GRPC_SECURE=true \
         -e WOODPECKER_TOKEN_FILE=/run/secrets/woodpecker.token \
         -e WOODPECKER_HETZNERCLOUD_API_TOKEN_FILE=/run/secrets/hcloud.token \

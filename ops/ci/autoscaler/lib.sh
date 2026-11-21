@@ -12,6 +12,7 @@ ZIG_URL=https://ziglang.org/download/0.14.1/zig-x86_64-linux-0.14.1.tar.xz
 ZIG_SHA256=24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c
 POOL_LABEL=nerva-ci-pool # the Hetzner label on every server and snapshot this setup makes
 CAP_MAX=16               # no setting can raise the server cap past this
+CI_TREE="docker io_uring_probe.sh nerva-woodpecker.sh autoscaler" # what of ops/ci/ the snapshot build needs, installed as $lib/ci/
 
 etc="${NERVA_CI_ETC:-/etc/nerva-ci}"
 api_url="${NERVA_HCLOUD_API:-https://api.hetzner.cloud/v1}"

@@ -5,7 +5,7 @@ Requires=docker.service
 Wants=network-online.target
 
 [Service]
-ExecStart=/usr/local/lib/nerva-ci/nerva-autoscaler.sh run
+ExecStart=/usr/local/lib/nerva-ci/ci/autoscaler/nerva-autoscaler.sh run
 Restart=always
 RestartSec=30
 

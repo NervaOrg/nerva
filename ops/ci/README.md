@@ -544,7 +544,7 @@ when this was written.
    (`NERVA_AS_SERVER_TYPE=ccx43` for bigger servers; `NERVA_AS_MAX` is the hard cap, 1 to 16;
    `NERVA_AS_IDLE` defaults to 10m). Run it again to change one setting.
 6. Build the first snapshot (needs a finished pipeline on main, whose cache is the seed; about 15 minutes):
-   `/usr/local/lib/nerva-ci/nerva-autoscaler-image.sh build`. The timer then rebuilds it nightly and keeps two.
+   `/usr/local/lib/nerva-ci/ci/autoscaler/nerva-autoscaler-image.sh build`. The timer then rebuilds it nightly and keeps two.
 7. `systemctl enable --now nerva-autoscaler.service`. `nerva-autoscaler.sh status` lists the servers.
 8. Watch the first branch pipeline: a server appears in the console within a minute and goes about 10
    minutes after its last workflow. If `journalctl -u nerva-autoscaler` shows an unknown flag, the pin and

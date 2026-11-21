@@ -4,7 +4,7 @@
 # nightly, then restarts the autoscaler so that new servers use the new snapshot.
 #
 #   build   Creates a temporary server (the configured type and location, Ubuntu 24.04) with a throwaway
-#           SSH key, copies ops/ci/ and a copy of the box's main cache (the read-only warm-cache seed) to
+#           SSH key, copies ops/ci/'s docker/, io_uring_probe.sh, nerva-woodpecker.sh and autoscaler/ and a copy of the box's main cache (the read-only warm-cache seed) to
 #           it, runs provision-image.sh there, powers it off, snapshots it (label nerva-ci-pool=snapshot)
 #           and writes the snapshot's id to /etc/nerva-ci/autoscaler.image. The server and the key are
 #           deleted on any exit. A failure is NRV-E1242 and leaves the previous snapshot in use.
@@ -14,7 +14,8 @@
 # The Hetzner token is read from /etc/nerva-ci/hcloud.token (root, 0600) and passed to curl on stdin
 # (lib.sh `hcloud`): never in argv, the environment or a log. Needs curl, jq, ssh, ssh-keygen and rsync.
 # Where it looks, for ci/autoscaler_test.sh: NERVA_CI_ETC, NERVA_HCLOUD_API, NERVA_CI_CACHE_ROOT
-# (/var/cache/nerva-ci), NERVA_AS_KEEP (2: how many snapshots prune keeps, at least 1).
+# (/var/cache/nerva-ci), NERVA_AS_KEEP (2: how many snapshots prune keeps, at least 1) and NERVA_AS_POLL
+# (10: seconds between polls).
 # shellcheck disable=SC2154,SC2034 # etc, tool and the pins come from lib.sh (not followed: no -x)
 set -euo pipefail
 
@@ -54,13 +55,13 @@ wait_for() { # wait_for DESCRIPTION JQ_EXPR PATH: polls (at most 60 x 10 s) unti
     local i
     for i in $(seq 1 60); do
         if hcloud GET "$3" | jq -e "$2" > /dev/null; then return 0; fi
-        sleep 10
+        sleep "${NERVA_AS_POLL:-10}"
     done
     fail "NRV-E1242: the image was not built: gave up waiting for $1 (10 minutes)"
 }
 
 build() {
-    local tmp key_id="" srv_id="" ip stamp seed img i
+    local tmp key_id="" srv_id="" ip stamp seed img i tree
     local -a ssh_opts
     [ "$(id -u)" = "${NERVA_CI_ROOT_UID:-0}" ] || fail "NRV-E1242: the image was not built: run as root"
     conf_load
@@ -85,9 +86,11 @@ build() {
     for i in $(seq 1 60); do
         if ssh "${ssh_opts[@]}" "root@$ip" true 2> /dev/null; then break; fi
         [ "$i" -lt 60 ] || fail "NRV-E1242: the image was not built: the build server did not accept SSH in 10 minutes"
-        sleep 10
+        sleep "${NERVA_AS_POLL:-10}"
     done
-    rsync -a -e "ssh ${ssh_opts[*]}" "$here/../" "root@$ip:/root/ci/" || fail "NRV-E1242: the image was not built: could not copy ops/ci to the build server"
+    tree="$(cd "$here/.." && pwd)"
+    # shellcheck disable=SC2046 # CI_TREE is a list of names without spaces
+    rsync -a -e "ssh ${ssh_opts[*]}" $(for i in $CI_TREE; do printf '%s ' "$tree/$i"; done) "root@$ip:/root/ci/" || fail "NRV-E1242: the image was not built: could not copy ops/ci to the build server"
     ssh "${ssh_opts[@]}" "root@$ip" 'install -d -m 0755 /var/cache/nerva-ci/main'
     rsync -a -e "ssh ${ssh_opts[*]}" "$seed/" "root@$ip:/var/cache/nerva-ci/main/" || fail "NRV-E1242: the image was not built: could not copy the warm-cache seed to the build server"
     ssh "${ssh_opts[@]}" "root@$ip" 'NERVA_AS_ON_BUILD_SERVER=yes bash /root/ci/autoscaler/provision-image.sh' || fail "NRV-E1242: the image was not built: provisioning failed on the build server (output above)"

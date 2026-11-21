@@ -60,7 +60,28 @@ done
 p=${url#*/v1}; p=${p%%\?*}
 f="$STUB_API/${method}_$(echo "$p" | tr / _)"
 echo "$method $p" >> "$STUB_LOG/curl.calls"
-if [ -f "$f" ]; then cat "$f"; else printf '{}\n200'; fi
+# $f.N answers the Nth call of that path, if there is one (a server that is running, then off).
+c=$(( $(cat "$STUB_LOG/cnt_$(basename "$f")" 2>/dev/null || echo 0) + 1 ))
+echo "$c" > "$STUB_LOG/cnt_$(basename "$f")"
+if [ -f "$f.$c" ]; then cat "$f.$c"; elif [ -f "$f" ]; then cat "$f"; else printf '{}\n200'; fi
+EOF
+# ssh-keygen makes the key pair named by -f; ssh fails the provisioning when STUB_SSH_FAIL is set; rsync and ssh log.
+cat > "$stubs/ssh-keygen" <<'EOF'
+#!/usr/bin/env bash
+while [ $# -gt 0 ]; do case "$1" in -f) k=$2; shift ;; esac; shift; done
+echo private > "$k"
+echo "ssh-ed25519 AAAA stub" > "$k.pub"
+EOF
+cat > "$stubs/ssh" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$STUB_LOG/ssh.args"
+if [ -n "${STUB_SSH_FAIL:-}" ] && [[ "$*" == *provision-image* ]]; then exit 1; fi
+exit 0
+EOF
+cat > "$stubs/rsync" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$STUB_LOG/rsync.args"
+exit 0
 EOF
 chmod +x "$stubs"/*
 export STUB_LOG="$tmp/log" STUB_API="$tmp/api" STUB_HELP="$tmp/help.txt"
@@ -68,7 +89,7 @@ mkdir -p "$STUB_LOG" "$STUB_API"
 for f in max-agents agent-idle-timeout workflows-per-agent cloudinit-template hetznercloud-server-type hetznercloud-image hetznercloud-labels pool-id agent-labels agent-image server-token hetznercloud-api-token; do echo "--$f x" >> "$STUB_HELP"; done
 
 uid=$(id -u)
-export NERVA_CI_ROOT_UID=$uid NERVA_AS_NO_SYSTEMD=1 PATH="$stubs:$PATH"
+export NERVA_CI_ROOT_UID=$uid NERVA_AS_NO_SYSTEMD=1 NERVA_AS_POLL=0 PATH="$stubs:$PATH"
 etc="$tmp/etc"
 export NERVA_CI_ETC="$etc" NERVA_AS_LIB="$tmp/lib" NERVA_AS_UNITS="$tmp/units" NERVA_HCLOUD_API=https://hcloud.test/v1
 mkdir -p "$etc"
@@ -117,10 +138,13 @@ has "conf derives the gRPC address" "$etc/autoscaler.conf" '^AS_GRPC=ci.example.
 has "conf has the default cap" "$etc/autoscaler.conf" '^AS_MAX=4$'
 has "conf has the dedicated type" "$etc/autoscaler.conf" '^AS_SERVER_TYPE=ccx33$'
 hasnt "conf holds no secret" "$etc/autoscaler.conf" "SECRET"
-for f in nerva-autoscaler.sh nerva-autoscaler-image.sh provision-image.sh lib.sh cloud-init.tmpl.yaml; do
+for f in autoscaler/nerva-autoscaler.sh autoscaler/nerva-autoscaler-image.sh autoscaler/provision-image.sh autoscaler/lib.sh autoscaler/cloud-init.tmpl.yaml \
+    docker/seccomp-io_uring.json io_uring_probe.sh nerva-woodpecker.sh; do
     n=$((n + 1))
-    [ -f "$tmp/lib/$f" ] || bad "install did not copy $f"
+    [ -f "$tmp/lib/ci/$f" ] || bad "install did not copy ci/$f"
 done
+n=$((n + 1))
+[ -x "$tmp/lib/ci/autoscaler/nerva-autoscaler.sh" ] || bad "the installed nerva-autoscaler.sh is not executable"
 for f in nerva-autoscaler.service nerva-autoscaler-image.service nerva-autoscaler-image.timer; do
     n=$((n + 1))
     [ -f "$tmp/units/$f" ] || bad "install did not write $f"
@@ -183,6 +207,52 @@ refuses "a keep count of 0" NRV-E1238 env NERVA_AS_KEEP=0 bash "$img" prune
 rm -f "$etc/hcloud.token"
 refuses "build without the token file" NRV-E1237 env NERVA_CI_CACHE_ROOT="$tmp/noseed" bash "$img" build
 
+# --- build, from the INSTALLED copy, against stubs: what it copies is what provision-image.sh needs ----
+secret hcloud.token "$token"
+mkdir -p "$tmp/cache/main/tools"
+echo seed > "$tmp/cache/main/tools/x"
+inst_img="$tmp/lib/ci/autoscaler/nerva-autoscaler-image.sh"
+api_for_build() {
+    rm -f "$STUB_API"/* "$STUB_LOG"/cnt_* "$STUB_LOG/rsync.args" "$STUB_LOG/ssh.args"
+    : > "$STUB_LOG/curl.calls"
+    printf '{"servers":[]}\n200' > "$STUB_API/GET__servers"
+    printf '{"ssh_keys":[]}\n200' > "$STUB_API/GET__ssh_keys"
+    printf '{"ssh_key":{"id":7}}\n201' > "$STUB_API/POST__ssh_keys"
+    printf '{"server":{"id":8}}\n201' > "$STUB_API/POST__servers"
+    printf '{"server":{"status":"running","public_net":{"ipv4":{"ip":"1.2.3.4"}}}}\n200' > "$STUB_API/GET__servers_8.1"
+    cp "$STUB_API/GET__servers_8.1" "$STUB_API/GET__servers_8.2"
+    printf '{"server":{"status":"off","public_net":{"ipv4":{"ip":"1.2.3.4"}}}}\n200' > "$STUB_API/GET__servers_8"
+    printf '{"image":{"id":55}}\n201' > "$STUB_API/POST__servers_8_actions_create_image"
+    printf '{"image":{"status":"available"}}\n200' > "$STUB_API/GET__images_55"
+}
+build_inst() { NERVA_CI_CACHE_ROOT="$tmp/cache" bash "$inst_img" build; }
+api_for_build
+rm -f "$etc/autoscaler.image"
+ok "build from the installed copy" build_inst
+n=$((n + 1))
+[ "$(cat "$etc/autoscaler.image")" = 55 ] || bad "build did not write the snapshot id"
+has "build ran provision-image.sh where rsync put it" "$STUB_LOG/ssh.args" 'bash /root/ci/autoscaler/provision-image.sh'
+has "build deleted its server" "$STUB_LOG/curl.calls" '^DELETE /servers/8$'
+has "build deleted its key" "$STUB_LOG/curl.calls" '^DELETE /ssh_keys/7$'
+# What rsync copied to /root/ci/ is, with nothing else, what provision-image.sh opens (relative to its own place).
+rm -rf "$tmp/remote"
+mkdir -p "$tmp/remote/ci"
+n=$((n + 1))
+sources=$(grep -- 'root@1.2.3.4:/root/ci/$' "$STUB_LOG/rsync.args" | head -n 1)
+[ -n "$sources" ] || bad "build did not rsync the tree to /root/ci/"
+for src in $sources; do
+    case "$src" in "$tmp"/lib/ci/*) cp -r "$src" "$tmp/remote/ci/" ;; esac
+done
+n=$((n + 1))
+{ [ ! -e "$tmp/remote/ci/lib" ] && [ -f "$tmp/remote/ci/autoscaler/provision-image.sh" ]; } || bad "build did not copy autoscaler/provision-image.sh to /root/ci/autoscaler/"
+refs=$(grep -o '\$here/[^" ]*' "$as/provision-image.sh" | sort -u)
+n=$((n + 1))
+[ -n "$refs" ] || bad "no here paths found in provision-image.sh"
+for r in $refs; do
+    n=$((n + 1))
+    [ -e "$tmp/remote/ci/autoscaler/${r#\$here/}" ] || bad "provision-image.sh opens $r, which the build does not copy to the build server"
+done
+
 # --- Pins agree with the rest of the repository ---------------------------------------------------
 pin() { sed -n "s/^$1=//p" "$as/lib.sh"; }
 n=$((n + 1))
@@ -197,7 +267,8 @@ for f in .woodpecker/*.yaml; do
 done
 agent_tag=$(pin AGENT_IMAGE | sed -n 's/.*:\(v[0-9.]*\)@.*/\1/p')
 has "the agent image is the bootstrap's Woodpecker version" ops/ci/woodpecker-bootstrap.sh "^woodpecker_version=$agent_tag\$"
-has "the unit runs the installed script" "$as/nerva-autoscaler.service" 'ExecStart=/usr/local/lib/nerva-ci/nerva-autoscaler.sh run'
+has "the unit runs the installed script" "$as/nerva-autoscaler.service" 'ExecStart=/usr/local/lib/nerva-ci/ci/autoscaler/nerva-autoscaler.sh run'
+has "the image unit runs the installed script" "$as/nerva-autoscaler-image.service" 'ExecStart=/usr/local/lib/nerva-ci/ci/autoscaler/nerva-autoscaler-image.sh build'
 
 # --- Workflows: every one has a tier, a cloud one never runs for main, none is privileged ----------
 for f in .woodpecker/*.yaml; do
