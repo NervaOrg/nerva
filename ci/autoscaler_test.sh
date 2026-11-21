@@ -265,6 +265,24 @@ for r in $refs; do
     [ -e "$tmp/remote/ci/autoscaler/${r#\$here/}" ] || bad "provision-image.sh opens $r, which the build does not copy to the build server"
 done
 
+# --- NRV-E1239: not root, a tool missing --------------------------------------------------------------
+bash_bin=$(command -v bash)
+lim() { # lim OMIT: a directory of the stubs and the tools the scripts use, without OMIT, for a PATH of its own
+    local d="$tmp/lim-$1" t
+    mkdir -p "$d"
+    for t in dirname id stat ls cat tr grep sed mkdir chmod install mv cp rm head cut date mktemp seq sleep basename readlink jq curl docker ssh ssh-keygen rsync; do
+        [ "$t" = "$1" ] || ln -sf "$(command -v "$t")" "$d/$t"
+    done
+    echo "$d"
+}
+refuses "install as another user" NRV-E1239 env NERVA_CI_ROOT_UID=99999 bash "$as/nerva-autoscaler.sh" install
+for t in jq docker curl; do
+    refuses "install without $t" NRV-E1239 env PATH="$(lim "$t")" "$bash_bin" "$as/nerva-autoscaler.sh" install
+done
+for t in ssh rsync ssh-keygen; do
+    refuses "build without $t" NRV-E1239 env PATH="$(lim "$t")" NERVA_CI_CACHE_ROOT="$tmp/cache" "$bash_bin" "$inst_img" build
+done
+
 # --- Pins agree with the rest of the repository ---------------------------------------------------
 pin() { sed -n "s/^$1=//p" "$as/lib.sh"; }
 n=$((n + 1))
