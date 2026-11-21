@@ -631,10 +631,8 @@ fn scenario_cluster() !void {
     try testing.expect(op_put > 1); // Client registration commits first.
     try testing.expectEqual(null, try daemon_b.row_as_of(1, 1, op_put - 1));
 
-    // Latency: a reply ends the client's wait at once, not at the end of its 10 ms tick. Before
-    // N51 every lookup waited out the tick, so even the fastest took at least one. The fastest is
-    // asserted, not the median: on a loaded CI host scheduling delay pushes the median past a tick
-    // while the client is correct (NervaOrg/nerva#11), but some lookup still returns early.
+    // Latency: a reply ends the client's wait at once, not at the end of its 10 ms tick, so the
+    // median lookup is well under one tick (it was always at least one, N51).
     {
         var durations_ns: [50]u64 = undefined;
         for (&durations_ns) |*duration_ns| {
@@ -643,13 +641,9 @@ fn scenario_cluster() !void {
             duration_ns.* = timer.read();
         }
         std.mem.sortUnstable(u64, &durations_ns, {}, std.sort.asc(u64));
-        const fastest_ns = durations_ns[0];
         const median_ns = durations_ns[durations_ns.len / 2];
-        std.debug.print("integration: lookup fastest {} us, median {} us\n", .{
-            fastest_ns / std.time.ns_per_us,
-            median_ns / std.time.ns_per_us,
-        });
-        try testing.expect(fastest_ns < constants.tick_ms * std.time.ns_per_ms);
+        std.debug.print("integration: lookup median {} us\n", .{median_ns / std.time.ns_per_us});
+        try testing.expect(median_ns < constants.tick_ms * std.time.ns_per_ms);
     }
 
     // Observability: the replicas send request timings and gauges over statsd, and
