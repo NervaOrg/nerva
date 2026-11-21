@@ -97,6 +97,9 @@ host() {
             ! command -v setfacl >/dev/null || setfacl -b -k -- "$t" 2>/dev/null || true
             find "$t" -mindepth 1 -maxdepth 1 -exec rm -rf --one-file-system -- {} +
         fi
+        # The trash is empty (or gone): its marker, which holds the steps' low-disk prunes off while
+        # it is young (ci/cache.sh, ci_trash_pending; NRV-W1206), goes too.
+        rm -f -- "$root/locks/$n-trash.pending"
     done
     # A size record's temporary file (ci/cache.sh, ci_branch_measure) that a killed step left: a
     # live step's is a minute old at most, so only a day-old one is removed.

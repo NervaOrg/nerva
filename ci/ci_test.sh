@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Table test for the CI scripts' own refusals and cache rules (NRV-E1201 to E1232, NRV-B1201,
-# NRV-W1201 to W1204, docs/ERRORS.md; decision O4). Needs flock and jq. Takes about 4 to 5 minutes as root (about 3.5 as another user);
+# NRV-W1201 to W1206, docs/ERRORS.md; decision O4). Needs flock and jq. Takes about 4 to 5 minutes as root (about 3.5 as another user);
 # touches only a scratch directory. Not covered, as they need a Woodpecker step or a daemon:
 # NRV-E1203 (the Docker socket is not mounted), NRV-E1209 and E1210 (Jepsen), the io_uring check on
 # a real refusing daemon, woodpecker-bootstrap.sh's NRV-E1213 (its preflight wants root on Ubuntu
@@ -649,10 +649,13 @@ if grep -n 'flock -s 9' ci/woodpecker_step.sh; then echo "FAIL woodpecker_step.s
 # step measures and empties again after its job, in its own tail.
 ws=ci/woodpecker_step.sh
 unlock8=$(grep -n '^    flock -u 8 2>/dev/null || true$' "$ws" | cut -d: -f1)
-empty_j=$(grep -n '^    ci_trash_empty "\$cache/jepsen"$' "$ws" | cut -d: -f1)
-is "jepsen's lock (fd 8) is let go before its trash is emptied (static)" yes "$([ -n "$unlock8" ] && [ -n "$empty_j" ] && [ "$unlock8" -lt "$empty_j" ] && echo yes)"
+empty_j=$(grep -n '^ci_step_finish "\$role" "\$cache" "\${CI_BRANCH_DIR:-}" "\$job"$' "$ws" | cut -d: -f1)
+is "jepsen's lock (fd 8) is let go before its trash is emptied, by the tail (static)" yes "$([ -n "$unlock8" ] && [ -n "$empty_j" ] && [ "$unlock8" -lt "$empty_j" ] && echo yes)"
+lock8_l=$(grep -n 'flock -x -w "\${CI_JEPSEN_WAIT:-5400}" 8' "$ws" | cut -d: -f1)
+pre_j=$(grep -n '^    ci_trash_empty "\$cache/jepsen" #' "$ws" | cut -d: -f1)
+is "jepsen's old trash is emptied before the step takes the Jepsen lock others wait on (static)" yes "$([ -n "$lock8_l" ] && [ -n "$pre_j" ] && [ "$pre_j" -lt "$lock8_l" ] && echo yes)"
 run_l=$(grep -n '^ci_step_run_with_tests ' "$ws" | cut -d: -f1)
-finish_l=$(grep -n '^ci_step_finish "\$role" "\$cache" "\${CI_BRANCH_DIR:-}"$' "$ws" | cut -d: -f1)
+finish_l=$(grep -n '^ci_step_finish "\$role" "\$cache" "\${CI_BRANCH_DIR:-}" "\$job"$' "$ws" | cut -d: -f1)
 is "the step measures and empties its trash after the job, in its tail (static)" yes "$([ -n "$run_l" ] && [ -n "$finish_l" ] && [ "$run_l" -lt "$finish_l" ] && echo yes)"
 is "the old run directories are swept by ci_jepsen_sweep, with no age test of its own (static)" "1 0" "$(grep -c '^    ci_jepsen_sweep "\$cache/jepsen"$' "$ws" || true) $(grep -c -e '-mtime' "$ws" || true)"
 is "the jepsen lock file is made by ci_lock_file" 1 "$(grep -c 'ci_lock_file "$cache/locks/jepsen.lock"' ci/woodpecker_step.sh || true)"
@@ -944,7 +947,7 @@ if grep -n 'install -d .*\(cache/main\|base\|JEPSEN_OUT\|cache/jepsen\)\|chown .
     fail=1
 fi
 if grep -n -E '(^|[ (;&|])(chown|install -d|mkdir|chmod|mktemp|mv|touch|cp|ln) ' ci/cache.sh | grep -v '^[0-9]*: *#' |
-    grep -v -E 'ci_error|ci_warning|ci_as_job|command -v|chown -h "|chmod 0755 -- "\$d"|chmod 600|mkdir -m 0755 -- "\$p"|mktemp -d "\$b/\$key.partial|mv -T "\$partial" "\$dir"|mktemp -d "\$t/t\.|mkdir -m 0700 -- "\$t"|mv -T "\$\{nocopy\[@\]\}" -- "\$p" "\$box/x"|mv --help|mktemp "\$f\.XXXXXX"|mv -f -- "\$new" "\$f"|-exec chmod u\+r'; then
+    grep -v -E 'ci_error|ci_warning|ci_as_job|command -v|chown -h "|chmod 0755 -- "\$d"|chmod 600|mkdir -m 0755 -- "\$p"|mktemp -d "\$b/\$key.partial|mv -T "\$partial" "\$dir"|mktemp -d "\$t/t\.|mkdir -m 0700 -- "\$t"|mv -T "\$\{nocopy\[@\]\}" -- "\$p" "\$box/x"|mv --help|mktemp "\$f\.XXXXXX"|mv -f -- "\$new" "\$f"|touch -- "\$f"|-exec chmod u\+r'; then
     echo "FAIL ci/cache.sh makes, chowns, chmods or moves something as root outside the operations listed at its top" >&2
     fail=1
 fi
@@ -2355,40 +2358,197 @@ ci_as touch "$r/main/zig/f"
 out=$(PATH="$fakedf_dir:$PATH" IT=1000000 IF=500000 CI_PRUNE_WAIT=1 bash -c '. ci/cache.sh; ci_main_lock_open "$1" && ci_main_prune "$1" 0' _ "$r" 2>&1)
 is "inodes plentiful: not pruned" "yes yes" "$(grep -q "space is free again" <<<"$out" && echo yes) $([ -e "$r/main/zig/f" ] && echo yes)"
 
-# (e2) A trash that is still draining makes the box look low (its blocks and inodes count as
+# (e2) A trash that is still being emptied makes the box look low (its blocks and inodes count as
 # used): the low-disk prunes do not run then, or every step would move fresh caches into the trash
-# (review 6004317640). The rm that empties the trash is a stub that fails, so the trash stays; df
-# says the box is low. Two main prepares: main/zig survives both; two branch prepares with
-# CI_BRANCH_PRUNE_ALL=1: an idle branch's cache survives both.
+# (review 6004317640). What says so is state in locks/, which every step mounts and no job writes
+# (review 6004471230): a removal running now (the trash lock is held), or a marker
+# locks/<mount>-trash.pending that ci_trash_move wrote less than CI_TRASH_PENDING_MINUTES (60) ago,
+# for main, branches and jepsen. The trashes' contents are not looked at (a branch step cannot
+# empty main/.trash; a main step does not mount branches/). The rm that empties a trash is a stub
+# that fails, so the trash stays; df says the box is low. Each case has its mutant (worklog/O4.md).
 mkdir -p "$tmp/stubs/norm"
 chmod 755 "$tmp/stubs/norm"
 printf '#!/bin/sh\nexit 1\n' >"$tmp/stubs/norm/rm"
 chmod 755 "$tmp/stubs/norm/rm"
+prep_low_main() { # prep_low_main ROOT: a main prepare on a box that df says is low; prints its output and RC0
+    PATH="$tmp/stubs/norm:$fakedf_dir:$PATH" IT=1000000 IF=5 bash -c '. ci/cache.sh; CI_PRUNE_WAIT=1 ci_main_prepare "$1" "$2" yes 0 2>&1 && echo RC0' _ "$1" "$jobuser" || true
+}
+prep_all_branch() { # prep_all_branch ROOT: a branch prepare with CI_BRANCH_PRUNE_ALL=1; prints its output and RC0
+    PATH="$tmp/stubs/norm:$PATH" CI_BRANCH_PRUNE_ALL=1 bash -c '. ci/cache.sh; CI_JOB_USER=$1 CI_LOCK_WAIT=2 ci_branch_prepare "$2" feature/atk 2>&1 && echo RC0' _ "$jobuser" "$1" || true
+}
+pending_age() { # pending_age FILE MINUTES: sets the marker's mtime that many minutes in the past
+    touch -d "$2 minutes ago" "$1"
+}
+
+# A prune that moved something into main/.trash left a marker, and a main prepare on a low box keeps
+# main/zig (twice), prints NRV-W1206 and goes on. Mutant: the `elif ci_trash_hold_off` line removed.
 r=$(attack_tree draining)
 ci_as touch "$r/main/zig/f"
-(. ci/cache.sh; ci_trash_ready "$r/main") && mkdir "$r/main/.trash/left-over"
+(. ci/cache.sh; CI_JOB_USER=$jobuser ci_trash_move "$r/main/zig-local") && mkdir "$r/main/zig-local"
+chown "$jobuser" "$r/main/zig-local" 2>/dev/null || true
+is "ci_trash_move wrote the mount's marker, in locks/, root's" "yes 600" "$([ -f "$r/locks/main-trash.pending" ] && echo yes) $(stat -c %a "$r/locks/main-trash.pending")"
 for n in 1 2; do
-    out=$(PATH="$tmp/stubs/norm:$fakedf_dir:$PATH" IT=1000000 IF=5 bash -c '. ci/cache.sh; CI_PRUNE_WAIT=1 ci_main_prepare "$1" "$2" yes 0 2>&1 && echo RC0' _ "$r" "$jobuser" || true)
-    is "a draining trash, box low: main prepare $n does not prune main/zig" "yes yes yes" "$([ -e "$r/main/zig/f" ] && echo yes) $(grep -q "a trash is being emptied" <<<"$out" && echo yes) $(grep -q RC0 <<<"$out" && echo yes)"
+    out=$(prep_low_main "$r")
+    is "a fresh marker, box low: main prepare $n does not prune main/zig, says NRV-W1206, goes on" "yes yes yes" "$([ -e "$r/main/zig/f" ] && echo yes) $(grep -q "NRV-W1206: not pruning main's Zig caches: a trash is being emptied" <<<"$out" && echo yes) $(grep -q RC0 <<<"$out" && echo yes)"
 done
+# The same for a branch's prune of every idle cache (CI_BRANCH_PRUNE_ALL=1). Mutant: the branch `if` made false.
 r=$(attack_tree draining-b)
-mkdir -m 0700 "$r/branches/.trash"
-mkdir -m 0700 "$r/branches/.trash/left-over"
 mk_branch "$r/branches/b-idle-00000003"
+plant dir "$r/branches/b-gone-00000009"
+(. ci/cache.sh; CI_JOB_USER=$jobuser ci_trash_move "$r/branches/b-gone-00000009")
 for n in 1 2; do
-    out=$(PATH="$tmp/stubs/norm:$PATH" CI_BRANCH_PRUNE_ALL=1 bash -c '. ci/cache.sh; CI_JOB_USER=$1 CI_LOCK_WAIT=2 ci_branch_prepare "$2" feature/atk 2>&1 && echo RC0' _ "$jobuser" "$r" || true)
-    is "a draining trash, prune-all: branch prepare $n keeps the idle branch's cache" "yes yes" "$([ -d "$r/branches/b-idle-00000003" ] && echo yes) $(grep -q RC0 <<<"$out" && echo yes)"
+    out=$(prep_all_branch "$r")
+    is "a fresh marker, prune-all: branch prepare $n keeps the idle branch's cache, says NRV-W1206" "yes yes yes" "$([ -d "$r/branches/b-idle-00000003" ] && echo yes) $(grep -q "NRV-W1206: not pruning every idle branch cache" <<<"$out" && echo yes) $(grep -q RC0 <<<"$out" && echo yes)"
 done
 r=$(attack_tree draining-c)
-mkdir -m 0700 "$r/branches/.trash"
 mk_branch "$r/branches/b-idle-00000003"
-out=$(PATH="$tmp/stubs/norm:$PATH" CI_BRANCH_PRUNE_ALL=1 bash -c '. ci/cache.sh; CI_JOB_USER=$1 CI_LOCK_WAIT=2 ci_branch_prepare "$2" feature/atk 2>&1 && echo RC0' _ "$jobuser" "$r" || true)
-is "no trash, prune-all: the idle branch's cache is dropped (the low-disk backstop works)" "no" "$([ -d "$r/branches/b-idle-00000003" ] && echo yes || echo no)"
-# The tail's bound is its own knob (NRV-E1208 like the others: see (f)); the default is 300.
-is "ci_step_finish empties for CI_TRASH_TAIL_SECONDS (default 300), not the short bound" "2" "$(grep -c 'ci_trash_empty "$cache/\(branches\|main\)" "${CI_TRASH_TAIL_SECONDS:-300}"' ci/cache.sh)"
+out=$(prep_all_branch "$r")
+is "no trash and no marker, prune-all: the idle branch's cache is dropped (the low-disk backstop works)" "no" "$([ -d "$r/branches/b-idle-00000003" ] && echo yes || echo no)"
 
-# (f) The two new knobs are validated as the others are (NRV-E1208): a whole number, 1 or more.
-for knob in CI_BRANCH_DU_SECONDS CI_TRASH_SECONDS CI_TRASH_TAIL_SECONDS CI_MIN_FREE_INODES; do
+# (e2-1) The MUST of review 6004471230: a leftover in main/.trash, which a branch's step sees
+# read-only and can never empty, no marker (or an old one) and no removal running: the branch's
+# prepare with CI_BRANCH_PRUNE_ALL=1 DOES drop the idle caches. With a real read-only bind mount
+# of main/ where the box allows one, as in a branch's pipeline. Mutant: the guard is "any trash is
+# not empty" (what 39c5c37 had), or the marker's age is not looked at.
+ro_main=no
+for case_ in "no marker" "an old marker"; do
+    r=$(attack_tree "ro-main-${case_// /-}")
+    mkdir -m 0700 "$r/main/.trash"
+    mkdir "$r/main/.trash/left-over"
+    ro_main=no
+    if [ "$(id -u)" = 0 ] && mount --bind "$r/main" "$r/main" 2>/dev/null; then
+        ro_mounts+=("$r/main")
+        if mount -o remount,bind,ro "$r/main" 2>/dev/null && ! test -w "$r/main"; then ro_main=yes; fi
+    fi
+    mk_branch "$r/branches/b-idle-00000003"
+    if [ "$case_" = "an old marker" ]; then : >"$r/locks/main-trash.pending"; pending_age "$r/locks/main-trash.pending" 180; fi
+    out=$(prep_all_branch "$r")
+    is "main/.trash holds a leftover (main/ read-only: $ro_main), $case_: prune-all drops the idle branch cache, no W1206" "no no yes" "$([ -d "$r/branches/b-idle-00000003" ] && echo yes || echo no) $(grep -q NRV-W1206 <<<"$out" && echo yes || echo no) $(grep -q RC0 <<<"$out" && echo yes)"
+    if [ "$ro_main" = yes ]; then umount "$r/main"; fi
+done
+[ "$ro_main" = yes ] || echo "note: no read-only bind mount here: main/.trash is a plain directory in the leftover tests (the guard does not read it either way)" >&2
+
+# (e2-2) The SHOULD: a main step does not mount branches/, so main's guard cannot see branches/.trash.
+# A layout with no branches/ directory and a fresh branches-trash.pending marker: a main prepare on
+# a low box keeps main/zig and prints NRV-W1206. Mutant: the guard looks at main's own mount only.
+r=$(attack_tree main-only)
+rmdir "$r/branches"
+ci_as touch "$r/main/zig/f"
+: >"$r/locks/branches-trash.pending"
+out=$(prep_low_main "$r")
+is "main-only layout, a fresh branches marker: main prepare keeps main/zig, says NRV-W1206" "yes yes yes" "$([ -e "$r/main/zig/f" ] && echo yes) $(grep -q "NRV-W1206" <<<"$out" && echo yes) $(grep -q RC0 <<<"$out" && echo yes)"
+# and the jepsen marker the same, though the step does not mount it. Mutant: jepsen left out of the guard.
+rm -f "$r/locks/branches-trash.pending"
+: >"$r/locks/jepsen-trash.pending"
+out=$(prep_low_main "$r")
+is "a fresh jepsen marker holds main's prune off too" "yes yes" "$([ -e "$r/main/zig/f" ] && echo yes) $(grep -q "NRV-W1206" <<<"$out" && echo yes)"
+
+# (e2-3) A removal running on another mount: locks/branches-trash.lock held by a background flock
+# the test starts. The prune is held off, with no wait (under 3 s: CI_PRUNE_WAIT=1 is the longest
+# thing a prepare waits for), and, the holder gone, the prune runs. Mutant: clause (a) removed.
+r=$(attack_tree held)
+ci_as touch "$r/main/zig/f"
+: >"$r/locks/branches-trash.lock"
+chmod 600 "$r/locks/branches-trash.lock"
+flock -o -x "$r/locks/branches-trash.lock" sleep 30 &
+trash_holder=$!
+for _ in $(seq 50); do (exec 3<"$r/locks/branches-trash.lock"; flock -n 3) || break; sleep 0.1; done
+t0=$(date +%s.%N)
+out=$(prep_low_main "$r")
+t1=$(date +%s.%N)
+is "a removal running on branches/.trash holds main's prune off, naming it, and no wait (under 3 s)" "yes yes yes yes" "$([ -e "$r/main/zig/f" ] && echo yes) $(grep -q "NRV-W1206.*a removal of branches/.trash is running" <<<"$out" && echo yes) $(grep -q RC0 <<<"$out" && echo yes) $(awk -v a="$t0" -v b="$t1" 'BEGIN { print (b - a < 3) ? "yes" : "no" }')"
+pkill -P "$trash_holder" 2>/dev/null || true
+kill "$trash_holder" 2>/dev/null || true
+wait "$trash_holder" 2>/dev/null || true
+out=$(prep_low_main "$r")
+is "the holder gone, the same prepare prunes main/zig (control: the lock alone held it)" "no" "$([ -e "$r/main/zig/f" ] && echo yes || echo no)"
+
+# (e2-4) A marker older than CI_TRASH_PENDING_MINUTES holds nothing off (default 60; the knob moves
+# it): 30 minutes old holds, 90 does not; under CI_TRASH_PENDING_MINUTES=10 the 30-minute one does
+# not, under 45 the 30-minute one does. Mutant: the age is not tested (-mmin removed).
+for spec in "30 - yes" "90 - no" "30 10 no" "30 45 yes" "50 - yes" "70 - no"; do
+    set -- $spec
+    r=$(attack_tree age-$1-$2)
+    ci_as touch "$r/main/zig/f"
+    : >"$r/locks/main-trash.pending"
+    pending_age "$r/locks/main-trash.pending" "$1"
+    knob=()
+    [ "$2" = - ] || knob=(CI_TRASH_PENDING_MINUTES="$2")
+    held=no
+    env "${knob[@]}" bash -c '. ci/cache.sh; ci_trash_pending "$1" >/dev/null' _ "$r" && held=yes
+    is "a marker $1 minutes old, CI_TRASH_PENDING_MINUTES=$2: holds off? $3" "$3" "$held"
+done
+
+# (e2-5) The marker's life. ci_trash_move writes it; a drain that finds the trash empty (or empties
+# it) removes it; a drain that cannot empty it leaves it, with the age it had (nothing refreshes it,
+# so a trash nobody can empty, or a job keeps filling, holds the prunes for the knob's time after
+# the last move and no longer). Mutants: no unmark on an empty trash; no unmark after a removal; a
+# touch on a failed drain.
+r=$(attack_tree life)
+: >"$r/locks/main-trash.pending"
+(. ci/cache.sh; ci_trash_empty "$r/main")
+is "a marker and no trash: the drain removes the marker" no "$([ -e "$r/locks/main-trash.pending" ] && echo yes || echo no)"
+(. ci/cache.sh; ci_trash_ready "$r/main")
+: >"$r/locks/main-trash.pending"
+(. ci/cache.sh; ci_trash_empty "$r/main")
+is "a marker and an empty trash: the drain removes the marker" no "$([ -e "$r/locks/main-trash.pending" ] && echo yes || echo no)"
+ci_as touch "$r/main/zig/f"
+(. ci/cache.sh; CI_JOB_USER=$jobuser ci_trash_move "$r/main/zig")
+pending_age "$r/locks/main-trash.pending" 20
+before=$(stat -c %Y "$r/locks/main-trash.pending")
+(PATH="$tmp/stubs/norm:$PATH"; . ci/cache.sh; ci_trash_empty "$r/main") 2>/dev/null
+is "a drain that cannot empty the trash leaves the marker, its mtime unchanged" "yes $before" "$([ -e "$r/locks/main-trash.pending" ] && echo yes) $(stat -c %Y "$r/locks/main-trash.pending" 2>/dev/null)"
+(. ci/cache.sh; ci_trash_empty "$r/main")
+is "a drain that empties the trash removes the marker and the tree" "no yes" "$([ -e "$r/locks/main-trash.pending" ] && echo yes || echo no) $([ -z "$(ls -A "$r/main/.trash")" ] && echo yes)"
+# a marker that is a link is never followed: ci_trash_mark replaces it
+r=$(attack_tree marklink)
+ln -s "$sf" "$r/locks/main-trash.pending"
+ci_as touch "$r/main/zig/f"
+(. ci/cache.sh; CI_JOB_USER=$jobuser ci_trash_move "$r/main/zig")
+is "a link at the marker's name is replaced, never followed" "yes $want_state" "$([ -f "$r/locks/main-trash.pending" ] && [ ! -L "$r/locks/main-trash.pending" ] && echo yes) $(sentinel_state)"
+
+# (e2-6) Jepsen's trash: the step that swept it empties it in its tail, with the tail bound
+# (ci_step_finish with the job), and no other step does. Mutant: `jepsen` not added to the tail's mounts.
+r=$(attack_tree jep)
+mkdir -m 0755 "$r/jepsen"
+plant dir "$r/jepsen/20240101T000000Z-1"
+(. ci/cache.sh; CI_JOB_USER=$jobuser ci_trash_move "$r/jepsen/20240101T000000Z-1")
+is "the sweep's move into jepsen/.trash wrote jepsen's marker" yes "$([ -e "$r/locks/jepsen-trash.pending" ] && echo yes)"
+(. ci/cache.sh; ci_step_finish branch "$r" "")
+is "a branch tail of another job leaves jepsen's trash alone" "yes" "$([ -n "$(ls -A "$r/jepsen/.trash")" ] && echo yes)"
+(. ci/cache.sh; ci_step_finish branch "$r" "" jepsen)
+is "the jepsen step's tail empties jepsen's trash and its marker" "yes no" "$([ -z "$(ls -A "$r/jepsen/.trash")" ] && echo yes) $([ -e "$r/locks/jepsen-trash.pending" ] && echo yes || echo no)"
+
+# (e2-7) The tail against Woodpecker's timeout: ci_tail_seconds is CI_TRASH_TAIL_SECONDS, capped to
+# the time left before CI_REPO_TIMEOUT_MINUTES (default 360) minus 120 s from CI_STEP_START; no start
+# time, no cap. With no time left the tail does not empty and says so. Mutant: no cap.
+now=$(date +%s)
+tails() { env "$@" bash -c '. ci/cache.sh; ci_tail_seconds'; }
+is "ci_tail_seconds: no CI_STEP_START, no cap" 300 "$(tails CI_TRASH_TAIL_SECONDS=300)"
+is "ci_tail_seconds: a step that began a minute ago, 360 minutes: the whole 300" 300 "$(tails CI_STEP_START=$((now - 60)))"
+left=$(tails CI_STEP_START=$((now - 21600 + 200)))
+is "ci_tail_seconds: 200 s before the limit leaves 200 - 120 = 80 s (give or take a second)" yes "$([ "$left" -ge 78 ] && [ "$left" -le 80 ] && echo yes)"
+left=$(tails CI_STEP_START=$((now - 21600 + 600)) CI_TRASH_TAIL_SECONDS=60)
+is "ci_tail_seconds: a tail of 60 s with plenty of time is 60" 60 "$left"
+left=$(tails CI_STEP_START=$((now - 540)) CI_REPO_TIMEOUT_MINUTES=10)
+is "ci_tail_seconds: past the limit minus the margin is 0 or less" yes "$([ "$left" -le 0 ] && echo yes)"
+r=$(attack_tree tail-cap)
+ci_as touch "$r/main/zig/f"
+(. ci/cache.sh; CI_JOB_USER=$jobuser ci_trash_move "$r/main/zig")
+out=$( (. ci/cache.sh; CI_STEP_START=$((now - 540)) CI_REPO_TIMEOUT_MINUTES=10 ci_step_finish main "$r" "") 2>&1)
+is "no time left before the repository's timeout: the tail leaves the trash and says why" "yes yes" "$([ -n "$(ls -A "$r/main/.trash")" ] && echo yes) $(grep -q "close to the repository's timeout" <<<"$out" && echo yes)"
+(. ci/cache.sh; CI_STEP_START=$((now - 60)) CI_REPO_TIMEOUT_MINUTES=10 ci_step_finish main "$r" "")
+is "with time left the tail empties the trash" "" "$(ls -A "$r/main/.trash")"
+# The step drains the trash of the mount it writes BEFORE it measures "low" (static: the drain is
+# above the disk test), and passes its start time, and the guard is registered. Mutant: the drain moved below.
+drain_l=$(grep -n '^if \[ "\$role" = main \]; then ci_trash_empty "\$cache/main"; else ci_trash_empty "\$cache/branches"; fi$' "$ws" | cut -d: -f1)
+low_l=$(grep -n '^if ci_disk_low "\$cache_fs" "\$free_min_gib"; then low=yes; fi$' "$ws" | cut -d: -f1)
+is "the step empties its mount's trash before it measures low (static)" yes "$([ -n "$drain_l" ] && [ -n "$low_l" ] && [ "$drain_l" -lt "$low_l" ] && echo yes)"
+is "the step records when it began, for the tail's cap (static)" 1 "$(grep -c '^CI_STEP_START=\$(date +%s)$' "$ws" || true)"
+is "NRV-W1206 is registered in docs/ERRORS.md" 1 "$(grep -c '^| NRV-W1206 |' docs/ERRORS.md || true)"
+
+# (f) The knobs are validated as the others are (NRV-E1208): a whole number, 1 or more.
+for knob in CI_BRANCH_DU_SECONDS CI_TRASH_SECONDS CI_TRASH_TAIL_SECONDS CI_TRASH_PENDING_MINUTES CI_REPO_TIMEOUT_MINUTES CI_MIN_FREE_INODES; do
     for bad in 0 abc '1;touch x' -5 1.5 ' 3' 9999999; do
         refuses NRV-E1208 "$knob='$bad'" env "$knob=$bad" bash -c '. ci/cache.sh; ci_knobs_check'
     done

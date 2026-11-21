@@ -376,9 +376,28 @@ set:
       The step that does get it is held for the removal, at most `CI_TRASH_SECONDS` (default 20) before
       its job, and again after it for `CI_TRASH_TAIL_SECONDS` (default 300: nothing waits on the tail;
       NRV-E1208 if it is not a whole number, like the other knobs) (NRV-W1205 if some is left: the next
-      one goes on, a bounded time at a time). While a mount's trash has anything in it, the low-disk
-      prunes (main's `zig` and `zig-local`, and the prune of every idle branch cache) do not run: its
-      blocks and inodes still count as used, and the space is already coming back. It is not detached: Woodpecker removes a step's container, and every process in it, when
+      one goes on, a bounded time at a time). A step empties the trash of the mount it writes (main's
+      in a push to main, `branches/`'s in any other pipeline; the Jepsen step also `jepsen/`'s) **before
+      it measures whether the disk is low**, and again in its tail. A branch's step has `main/`
+      read-only and a main step has no `branches/`, so neither can empty or even see the other's trash:
+      what the low-disk prunes (main's `zig` and `zig-local`, and the prune of every idle branch
+      cache) wait for is state in `locks/`, which every step mounts and no job can write, never a trash's
+      contents: a removal running now on any of the three mounts (`flock -n` on
+      `locks/<mount>-trash.lock`, let go at once), or a marker `locks/<mount>-trash.pending` that
+      `ci_trash_move` touched less than `CI_TRASH_PENDING_MINUTES` (default 60; NRV-E1208) ago and no
+      drain has found empty since (a drain that empties or finds the trash empty removes it; one that
+      cannot leaves its age alone). An old marker holds nothing off, so a trash that nobody can empty,
+      or one a job keeps filling through a directory it holds open, delays the prunes by that long
+      after the last move into it and no longer, with the line NRV-W1206 (`bash ci/nerva-woodpecker.sh
+      host` empties every trash and removes the markers). The Jepsen mount is in the guard whether or
+      not it shares the cache's file system (a step that does not mount it cannot tell): its trash is
+      emptied at the end of the step that swept it. The post-job tail never runs past the repository's
+      timeout: it is capped to the time left of `CI_REPO_TIMEOUT_MINUTES` (default 360, the Timeout
+      set in step 2 above; NRV-E1208) minus 120 s from the step's start, and with none left the
+      trash is left for a later step. The worst case in one step: the job's 330 minutes, a pre-job
+      phase that can take about half an hour on a busy box (`CI_NORMALIZE_SECONDS` 600 and
+      `CI_LOCK_WAIT` 300, each twice, `du` 60 s, `CI_TRASH_SECONDS` 20 s, the package installs), and
+      then at most the tail's `du` (60 s) and drain, which the cap shortens or skips. It is not detached: Woodpecker removes a step's container, and every process in it, when
       the step ends. A branch's size is measured after the locks, by its own step, before the job and
       again after it (`locks/<key>.size`, `du` bounded by `CI_BRANCH_DU_SECONDS`; a timeout counts as
       over every bound), so the prune reads records and walks nothing. The bound is per branch, for what

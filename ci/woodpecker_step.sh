@@ -18,13 +18,18 @@
 #     "Low" is blocks (CI_FREE_MIN_GIB) or inodes (CI_MIN_FREE_INODES, default 100000: a job's empty files
 #     cost none). Nothing here walks a job's tree under a lock others wait on: a drop is a rename into the
 #     mount root's root-only .trash (ci/cache.sh, the design rule) and the trash is emptied after the lock
-#     is released, by one step at a time, a bounded time (CI_TRASH_SECONDS), before the job and again
-#     after it; a branch's size is a record its own step writes after its locks, before the job and
+#     is released, by one step at a time, a bounded time (CI_TRASH_SECONDS), before the job (and
+#     BEFORE "low" is measured: a trash the last step left still holds the blocks and inodes that
+#     made the disk look low) and again after it, for the tail (CI_TRASH_TAIL_SECONDS, never past the
+#     repository's timeout: CI_REPO_TIMEOUT_MINUTES); a branch's size is a record its own step writes after its locks, before the job and
 #     after it (CI_BRANCH_DU_SECONDS).
 #   - Each job has a timeout (75 minutes; 330 for the long searches; CI_STEP_MINUTES replaces it),
 #     see the `case` below; one that runs past it fails NRV-E1215.
 set -euo pipefail
 . ci/lib.sh
+# When this step began (epoch seconds): the post-job tail never runs past the repository's timeout
+# (ci_tail_seconds in ci/cache.sh).
+CI_STEP_START=$(date +%s)
 
 job="${1:?usage: ci/woodpecker_step.sh <job> [arg]}"
 arg="${2:-}"
@@ -82,6 +87,14 @@ CI_JOB_USER="$user" # ci_as_job: what root would make in a cache the job writes,
 id "$user" >/dev/null 2>&1 || useradd --create-home --uid 1001 --user-group "$user"
 chown -R "$user:$user" "$PWD"
 ci_cache_check "$role" "$cache" || exit 1
+ci_knobs_check || exit 2
+# What an earlier step left in the trash of the mount this one writes is removed BEFORE the disk is
+# measured: its blocks and inodes are what made the disk look low, and a step that measures first
+# prunes caches that were fine (ci_trash_empty: one removal per mount at a time, none waits for
+# another's, CI_TRASH_SECONDS at most). main's trash is the main role's to empty (a branch has it
+# read-only), branches' the branch role's; the low-disk prunes' guard does not need the other:
+# it reads the markers and locks in locks/ (ci_trash_pending). Not under the Jepsen lock below.
+if [ "$role" = main ]; then ci_trash_empty "$cache/main"; else ci_trash_empty "$cache/branches"; fi
 
 # One Jepsen run at a time on a machine: run.sh's containers, network and subnet have fixed names.
 # Taken before the cache lock, so a queued run does not hold up a prune, and bounded. Each run's
@@ -93,6 +106,7 @@ if [ "$job" = jepsen ]; then
     # The mount's root is root's, mode 0755, no ACL (rule 1 of ci/cache.sh): made so if a job's
     # own doing or an earlier layout left it otherwise (NRV-W1203).
     ci_mount_root "$cache/jepsen" || exit 1
+    ci_trash_empty "$cache/jepsen" # a leftover of an earlier run's sweep; before this run takes the lock others wait on
     ci_lock_file "$cache/locks/jepsen.lock" || exit 1
     { exec 8<"$cache/locks/jepsen.lock"; } 2>/dev/null || { ci_lock_open_failed "$cache/locks/jepsen.lock" '<'; exit 1; }
     echo "jepsen: waiting for any other Jepsen run on this machine"
@@ -127,7 +141,6 @@ fi
 # container's own directory, so it would measure the container's filesystem, not the box's cache.
 cache_fs="$cache/main"
 low=no
-ci_knobs_check || exit 2
 # Low on blocks (CI_FREE_MIN_GIB) or on inodes (CI_MIN_FREE_INODES, default 100000): a job's empty
 # files cost no blocks, and the branch's size bound counts blocks only.
 if ci_disk_low "$cache_fs" "$free_min_gib"; then low=yes; fi
@@ -172,14 +185,15 @@ status=0
 # (ci_step_run_with_tests is in ci/lib.sh, with its tests: for check-scripts the tests run first,
 # bounded by CI_SCRIPTS_TEST_MINUTES, not by the job's whole limit; either failing fails the step.)
 ci_step_run_with_tests "$job" "$((test_minutes * 60))" "$((minutes * 60))" tests_cmd job_cmd || status=$?
-# A Jepsen run holds the Jepsen lock exclusively for its whole run, so what its reset of the tools
-# moved aside is removed only now, after the lock is let go (nothing is held that another step waits on).
+# A Jepsen run holds the Jepsen lock exclusively for its whole run, so what its sweep and its reset
+# of the tools moved aside is removed only now, after the lock is let go (nothing is held that
+# another step waits on): by ci_step_finish below, for the tail's bound.
 if [ "$job" = jepsen ]; then
     flock -u 8 2>/dev/null || true
-    ci_trash_empty "$cache/jepsen"
 fi
 # After the job, still as root: a branch's size is measured again (the job is what grows it; fd 6
 # is held, nothing a step waits on is) and the trash a prune or reset filled is emptied a bounded
-# time (ci_trash_empty: one removal per mount, no step waits for another's).
-ci_step_finish "$role" "$cache" "${CI_BRANCH_DIR:-}"
+# time (ci_trash_empty: one removal per mount, no step waits for another's), Jepsen's own too in
+# the Jepsen step, and never past the repository's timeout (ci_tail_seconds).
+ci_step_finish "$role" "$cache" "${CI_BRANCH_DIR:-}" "$job"
 exit "$status"
