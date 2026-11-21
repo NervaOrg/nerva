@@ -200,24 +200,12 @@ status=0
 # root tests run first and their whole bound (and its kill-after) is taken off what is left. With
 # no time left (0) neither runs: NRV-E1215 said so, and the step fails.
 reserved=0
-if [ "$job" = check-scripts ]; then
-    kill_after=60
-    if [[ "${CI_KILL_AFTER:-}" =~ ^[0-9]+$ ]]; then kill_after="$CI_KILL_AFTER"; fi
-    reserved=$((test_minutes * 60 + kill_after))
-fi
-job_seconds=$(ci_job_seconds "$minutes" "$reserved" "$job")
-if [ "$job_seconds" = 0 ]; then
-    status=1
-else
-    # A job shortened to fit the repository's timeout is not helped by CI_STEP_MINUTES: its
-    # NRV-E1215 names the Timeout instead.
-    if [ "$job_seconds" -lt $((minutes * 60)) ]; then
-        export CI_TIMEOUT_KNOB="the repository's Timeout, with CI_REPO_TIMEOUT_MINUTES to match (the job was shortened: NRV-W1207)"
-    fi
-    # (ci_step_run_with_tests is in ci/lib.sh, with its tests: for check-scripts the tests run first,
-    # bounded by CI_SCRIPTS_TEST_MINUTES, not by the job's whole limit; either failing fails the step.)
-    ci_step_run_with_tests "$job" "$((test_minutes * 60))" "$job_seconds" tests_cmd job_cmd || status=$?
-fi
+if [ "$job" = check-scripts ]; then reserved=$((test_minutes * 60 + ${CI_KILL_AFTER:-60})); fi
+# (ci_step_job and ci_step_run_with_tests are in ci/cache.sh and ci/lib.sh, with their tests: for
+# check-scripts the root tests run first, bounded by CI_SCRIPTS_TEST_MINUTES, not by the job's whole
+# limit; either failing fails the step. A job with no time left is not started, and a shortened one
+# names the repository's Timeout in its NRV-E1215.) The tail below runs whatever the status.
+ci_step_job "$job" "$minutes" "$reserved" "$((test_minutes * 60))" tests_cmd job_cmd || status=$?
 # A Jepsen run holds the Jepsen lock exclusively for its whole run, so what is left of what its sweep
 # and its reset of the tools moved aside (both were drained at once, a bounded 20 s each) is removed
 # only now, after the lock is let go (nothing is held that another step waits on): by ci_step_finish

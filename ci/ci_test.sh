@@ -638,8 +638,8 @@ as_ci_lines=$(grep -c '"${as_ci\[@\]}"' ci/woodpecker_step.sh || true)
 closing_lines=$(grep -c '"${as_ci\[@\]}".* 6>&- 7>&- 8>&- 9<&-' ci/woodpecker_step.sh || true)
 is "woodpecker_step.sh runs two commands as ci" 2 "$as_ci_lines"
 is "install_zig closes fds 6 to 9 for the job's user (static; the job's own are tested behaviourally)" 1 "$closing_lines"
-is "the step's tail is ci_step_run_with_tests, with the root tests and the job as arrays (static)" 2 "$(grep -c '^tests_cmd=(bash ci/ci_test.sh)$\|^ *ci_step_run_with_tests .* tests_cmd job_cmd || status=\$?$' ci/woodpecker_step.sh || true)"
-is "the root tests are bounded by their own limit, not the job's (static)" 1 "$(grep -c '"$((test_minutes \* 60))" "$job_seconds"' ci/woodpecker_step.sh || true)"
+is "the step runs the root tests and the job through ci_step_job, as arrays (static)" 2 "$(grep -c '^tests_cmd=(bash ci/ci_test.sh)$\|^ci_step_job .* tests_cmd job_cmd || status=\$?$' ci/woodpecker_step.sh || true)"
+is "the root tests are bounded by their own limit, not the job's (static; ci_step_job passes it to ci_step_run_with_tests)" "1 1" "$(grep -c '"$((test_minutes \* 60))" tests_cmd job_cmd' ci/woodpecker_step.sh || true) $(grep -c 'ci_step_run_with_tests "\$1" "\$4" "\$job_seconds"' ci/cache.sh || true)"
 # Both places that take main's lock use ci_shared_lock (bounded, NRV-E1224), never a bare flock; the
 # jepsen lock file is made by ci_lock_file.
 is "main's lock is taken by ci_shared_lock in both roles" 2 "$(grep -c 'ci_shared_lock || exit 1' ci/woodpecker_step.sh || true)"
@@ -654,7 +654,7 @@ is "jepsen's lock (fd 8) is let go before its trash is emptied, by the tail (sta
 lock8_l=$(grep -n 'flock -x -w "\${CI_JEPSEN_WAIT:-5400}" 8' "$ws" | cut -d: -f1)
 pre_j=$(grep -n '^    ci_trash_empty "\$cache/jepsen" #' "$ws" | cut -d: -f1)
 is "jepsen's old trash is emptied before the step takes the Jepsen lock others wait on (static)" yes "$([ -n "$lock8_l" ] && [ -n "$pre_j" ] && [ "$pre_j" -lt "$lock8_l" ] && echo yes)"
-run_l=$(grep -n '^ *ci_step_run_with_tests ' "$ws" | cut -d: -f1)
+run_l=$(grep -n '^ci_step_job ' "$ws" | cut -d: -f1)
 finish_l=$(grep -n '^ci_step_finish "\$role" "\$cache" "\${CI_BRANCH_DIR:-}" "\$job"$' "$ws" | cut -d: -f1)
 is "the step measures and empties its trash after the job, in its tail (static)" yes "$([ -n "$run_l" ] && [ -n "$finish_l" ] && [ "$run_l" -lt "$finish_l" ] && echo yes)"
 is "the old run directories are swept by ci_jepsen_sweep, with no age test of its own (static)" "1 0" "$(grep -c '^    ci_jepsen_sweep "\$cache/jepsen"$' "$ws" || true) $(grep -c -e '-mtime' "$ws" || true)"
@@ -2570,6 +2570,37 @@ pending_age "$r/locks/main-trash.pending" 90
 ci_as touch "$r/main/zig/f"
 (. ci/cache.sh; CI_JOB_USER=$jobuser ci_trash_move "$r/main/zig")
 is "a move that is not a low-disk prune's leaves an old marker old" "yes" "$([ -z "$(find "$r/locks/main-trash.pending" -maxdepth 0 -mmin -5 2>/dev/null)" ] && echo yes)"
+# A CI_TRASH_REFRESH preset in the environment (a pipeline variable, a shell's export) is dropped when
+# cache.sh is sourced: it would make every plain move refresh the marker (review 6005098936).
+# Mutant: the `unset CI_TRASH_REFRESH` line removed.
+r=$(attack_tree preset-refresh)
+: >"$r/locks/main-trash.pending"
+pending_age "$r/locks/main-trash.pending" 90
+ci_as touch "$r/main/zig/f"
+(export CI_TRASH_REFRESH=1; . ci/cache.sh; CI_JOB_USER=$jobuser ci_trash_move "$r/main/zig")
+is "a CI_TRASH_REFRESH=1 preset in the environment does not refresh an old marker on a plain move" "yes" "$([ -z "$(find "$r/locks/main-trash.pending" -maxdepth 0 -mmin -5 2>/dev/null)" ] && echo yes)"
+# The prune-all's guard is tested under the branches' lock (fd 7), not before the wait for it (review
+# 6005098936): a stub flock writes a young marker (5 minutes old) just as the step waits for fd 7, which
+# is what a step that came first leaves. The step then neither drops the idle cache nor refreshes the
+# marker. Mutant: the test made before the lock again (a marker that appears after it is not seen).
+mkdir -p "$tmp/stubs/race"
+chmod 755 "$tmp/stubs/race"
+real_flock=$(command -v flock)
+cat >"$tmp/stubs/race/flock" <<EOS
+#!/bin/sh
+case "\$*" in
+    "-x -w "*" 7") if [ ! -e "\$RACE_MARKER" ]; then : >"\$RACE_MARKER"; chmod 600 "\$RACE_MARKER"; touch -d "5 minutes ago" "\$RACE_MARKER"; fi ;;
+esac
+exec $real_flock "\$@"
+EOS
+chmod 755 "$tmp/stubs/race/flock"
+r=$(attack_tree race-prune-all)
+mk_branch "$r/branches/b-idle-00000003"
+race_before=$(date -d "5 minutes ago" +%s)
+out=$(PATH="$tmp/stubs/race:$tmp/stubs/norm:$PATH" RACE_MARKER="$r/locks/branches-trash.pending" CI_BRANCH_PRUNE_ALL=1 bash -c '. ci/cache.sh; CI_JOB_USER=$1 CI_LOCK_WAIT=2 ci_branch_prepare "$2" feature/atk 2>&1 && echo RC0' _ "$jobuser" "$r" || true)
+race_mtime=$(stat -c %Y "$r/locks/branches-trash.pending" 2>/dev/null || echo 0)
+is "a young marker that appears while the step waits for the lock: no prune-all, NRV-W1206, the prepare goes on" "yes yes yes" "$([ -d "$r/branches/b-idle-00000003" ] && echo yes) $(grep -q "NRV-W1206: not pruning every idle branch cache" <<<"$out" && echo yes) $(grep -q RC0 <<<"$out" && echo yes)"
+is "... and the marker is not refreshed (its mtime is still 5 minutes ago, give or take)" "yes" "$([ "$race_mtime" -le $((race_before + 30)) ] && [ "$race_mtime" -ge $((race_before - 30)) ] && echo yes)"
 
 # (e2-5c) The NIT of review 6004928827, the lost-marker race: moves run under the main, key and Jepsen
 # locks, not the trash lock, so one can land after a drain's "empty" test and before its unmark. The
@@ -2663,8 +2694,13 @@ is "ci_job_seconds: shortened, it says NRV-W1207 with the minutes" yes "$(grep -
 # 6004928827). Mutant: the kill-after left out.
 left=$(jobs_ CI_STEP_START=$((now - 2400)) CI_REPO_TIMEOUT_MINUTES=60 CI_KILL_AFTER=600)
 is "ci_job_seconds: CI_KILL_AFTER=600 comes off the bound: 3600 - 2400 - 120 - 300 - 600 = 180 s" yes "$([ "$left" -ge 175 ] && [ "$left" -le 180 ] && echo yes)"
-left=$(jobs_ CI_STEP_START=$((now - 2400)) CI_REPO_TIMEOUT_MINUTES=60 CI_KILL_AFTER=soon)
-is "ci_job_seconds: a CI_KILL_AFTER that is not a whole number counts as the default 60 s" yes "$([ "$left" -ge 715 ] && [ "$left" -le 720 ] && echo yes)"
+# A CI_KILL_AFTER that is not a whole number is refused (NRV-E1208) before any arithmetic: nothing is
+# printed and the status is 1 (review 6005098936). Mutant: CI_KILL_AFTER left out of ci_knobs_check.
+for bad in soon 0 08 5m 1234567 -3; do
+    left_rc=0
+    left=$(jobs_ CI_STEP_START=$((now - 2400)) CI_REPO_TIMEOUT_MINUTES=60 CI_KILL_AFTER=$bad) || left_rc=$?
+    is "ci_job_seconds: CI_KILL_AFTER='$bad' is refused with NRV-E1208 and prints no bound" "1  yes" "$left_rc $left $(grep -q "NRV-E1208: CI_KILL_AFTER='$bad'" "$tmp/jobs.err" && echo yes)"
+done
 # The root tests' bound (what check-scripts runs first) comes off the job's: 3600 - 300 - 120 - 300 -
 # 60 - (1200 + 60) = 1560 s of the 75 minutes asked for. Mutant: RESERVED ignored.
 left=$(RES=1260 JOBMIN=75 jobs_ CI_STEP_START=$((now - 300)) CI_REPO_TIMEOUT_MINUTES=60)
@@ -2675,13 +2711,66 @@ is "ci_job_seconds: the same reserve against the default 360 minutes changes not
 # With no time left (under 60 s) the job is not started: 0, and NRV-E1215 says so, naming the
 # Timeout, never CI_STEP_MINUTES as the way out. Mutant: the old floor (60 s kept) is back.
 is "ci_job_seconds: a step past the limit: 0, the job is not started" "0" "$(jobs_ CI_STEP_START=$((now - 4000)) CI_REPO_TIMEOUT_MINUTES=60)"
-is "ci_job_seconds: ... with NRV-E1215 naming the job and the Timeout, not CI_STEP_MINUTES as the fix" "yes no" "$(grep -q "NRV-E1215: demo was not started: .*repository's Timeout has to be raised" "$tmp/jobs.err" && echo yes) $(grep -q "CI_STEP_MINUTES raises" "$tmp/jobs.err" && echo yes || echo no)"
+is "ci_job_seconds: ... with NRV-E1215 naming the job and the Timeout, not CI_STEP_MINUTES as the fix" "yes no" "$(grep -q "NRV-E1215: demo was not started: .*raise the repository's Timeout" "$tmp/jobs.err" && echo yes) $(grep -q "CI_STEP_MINUTES raises" "$tmp/jobs.err" && echo yes || echo no)"
 is "ci_job_seconds: 20 s left (under the 60 s floor) is 0 too" "0" "$(jobs_ CI_STEP_START=$((now - 3100)) CI_REPO_TIMEOUT_MINUTES=60)"
 is "ci_job_seconds: no time left once the reserve is taken: 0" "0" "$(RES=1260 JOBMIN=75 jobs_ CI_STEP_START=$((now - 2400)) CI_REPO_TIMEOUT_MINUTES=60)"
 is "ci_job_seconds: a job that fits is left alone, silent (75 of 360, 10 min used)" "4500 yes" "$(JOBMIN=75 jobs_ CI_STEP_START=$((now - 600))) $([ ! -s "$tmp/jobs.err" ] && echo yes)"
-is "the step bounds the job with ci_job_seconds, with the root tests' reserve for check-scripts (static)" "1 1 0" "$(grep -c '^job_seconds=\$(ci_job_seconds "\$minutes" "\$reserved" "\$job")$' "$ws" || true) $(grep -c '^    reserved=\$((test_minutes \* 60 + kill_after))$' "$ws" || true) $(grep -c -F '"$((minutes * 60))"' "$ws" || true)"
-is "the step skips a job with no time left (NRV-E1215 said so) and fails (static)" "1" "$(grep -c -x 'if \[ "\$job_seconds" = 0 \]; then' "$ws" || true)"
-is "a job that was shortened names the Timeout, not CI_STEP_MINUTES, in its NRV-E1215 (static)" "1" "$(grep -c "export CI_TIMEOUT_KNOB=\"the repository's Timeout" "$ws" || true)"
+is "the step bounds the job with ci_step_job, with the root tests' reserve (and the validated kill-after) for check-scripts (static)" "1 1" "$(grep -c '^ci_step_job "\$job" "\$minutes" "\$reserved" "\$((test_minutes \* 60))" tests_cmd job_cmd || status=\$?$' "$ws" || true) $(grep -c '^if \[ "\$job" = check-scripts \]; then reserved=\$((test_minutes \* 60 + \${CI_KILL_AFTER:-60})); fi$' "$ws" || true)"
+# The step's tail follows the job whatever its status: no `exit` between the ci_step_job call and ci_step_finish.
+job_l=$(grep -n '^ci_step_job ' "$ws" | cut -d: -f1)
+fin_l=$(grep -n '^ci_step_finish ' "$ws" | cut -d: -f1)
+is "no exit between the step's job and its tail (static)" "0" "$(sed -n "${job_l},${fin_l}p" "$ws" | grep -c '^[[:space:]]*exit' || true)"
+# --- BEGIN ci_step_job (behavioural; the mutation harness extracts this block)
+# ci_step_job (ci/cache.sh) is what the step calls: a bash function named timeout stands in for
+# timeout(1), logs what it was asked to run and moves $SECONDS on by the limit, as a job that ran
+# past it would (ci_run_timed then says NRV-E1215), so nothing sleeps. Cases: no time left (status 1,
+# neither the root tests nor the job started, no CI_TIMEOUT_KNOB); a shortened job (its E1215 names
+# the repository's Timeout, not CI_STEP_MINUTES); a job that fits (names CI_STEP_MINUTES, the knob
+# unset); check-scripts (the tests first, with their own bound, then the job). Mutants: the job run
+# anyway when no time is left; CI_TIMEOUT_KNOB exported unconditionally; the old E1215 wording.
+sj_run() { # sj_run JOB MINUTES RESERVED [VAR=value...]: sets sj_rc, sj_log, sj_err, sj_knob
+    local job="$1" min="$2" res="$3"
+    shift 3
+    rm -f "$tmp/sj.log" "$tmp/sj.knob"
+    sj_rc=0
+    (
+        . ci/cache.sh
+        export CI_KILL_AFTER=1 CI_TRASH_TAIL_SECONDS=300
+        for kv in "$@"; do export "${kv?}"; done
+        unset CI_TIMEOUT_KNOB
+        timeout() { # timeout --kill-after=Ns SECONDS CMD...
+            echo "$1 $2 ${3##*/}" >>"$tmp/sj.log"
+            SECONDS=$((SECONDS + $2))
+            return 124
+        }
+        # shellcheck disable=SC2034 # namerefs, read by ci_step_run_with_tests
+        tests_cmd=(ci/ci_test.sh)
+        # shellcheck disable=SC2034 # namerefs, read by ci_step_run_with_tests
+        job_cmd=(ci/job.sh "$job")
+        sj_status=0
+        ci_step_job "$job" "$min" "$res" 1200 tests_cmd job_cmd || sj_status=$?
+        echo "knob=${CI_TIMEOUT_KNOB-unset}" >"$tmp/sj.knob"
+        exit "$sj_status"
+    ) 2>"$tmp/sj.err" || sj_rc=$?
+    sj_log=$(if [ -f "$tmp/sj.log" ]; then tr '\n' '|' <"$tmp/sj.log"; fi)
+    sj_err=$(cat "$tmp/sj.err")
+    sj_knob=$(if [ -f "$tmp/sj.knob" ]; then cat "$tmp/sj.knob"; fi)
+}
+now=$(date +%s)
+sj_run check 5 0 CI_STEP_START=$((now - 4000)) CI_REPO_TIMEOUT_MINUTES=60
+is "ci_step_job: no time left: status 1, the job was not run, no CI_TIMEOUT_KNOB" "1||knob=unset" "$sj_rc|$sj_log|$sj_knob"
+is "... NRV-E1215 says it was not started and names the Timeout" "yes no" "$(grep -q "NRV-E1215: check was not started: .*raise the repository's Timeout (Woodpecker repository settings; ops/ci/README.md), with CI_REPO_TIMEOUT_MINUTES to match; CI_STEP_MINUTES does not help" <<<"$sj_err" && echo yes) $(grep -q "raises it for a run" <<<"$sj_err" && echo yes || echo no)"
+sj_run check-scripts 75 1260 CI_STEP_START=$((now - 2400)) CI_REPO_TIMEOUT_MINUTES=60
+is "ci_step_job: check-scripts with the reserve eating the rest: neither the root tests nor the job ran, status 1" "1||knob=unset" "$sj_rc|$sj_log|$sj_knob"
+sj_run check 330 0 CI_STEP_START=$((now - 2400)) CI_REPO_TIMEOUT_MINUTES=60
+is "ci_step_job: a shortened job runs once, with the shortened bound and the validated kill-after, and times out (124)" "124 yes" "$sj_rc $(grep -Eq '^--kill-after=1s 7[4-9][0-9] job.sh\|$' <<<"$sj_log" && echo yes)"
+is "... the job's NRV-E1215 names the repository's Timeout, not CI_STEP_MINUTES (the knob's text, with NRV-W1207)" "yes no" "$(grep -Eq "NRV-E1215: check ran past its [0-9]+ (seconds|minutes) and was stopped: a hung job, or a limit too short for this box; raise the repository's Timeout \(Woodpecker repository settings\), with CI_REPO_TIMEOUT_MINUTES to match; the job was shortened \(NRV-W1207\), so CI_STEP_MINUTES does not help$" <<<"$sj_err" && echo yes) $(grep -q "CI_STEP_MINUTES raises it" <<<"$sj_err" && echo yes || echo no)"
+sj_run check 5 0 CI_X=1
+is "ci_step_job: a job that fits runs with its full bound (300 s), CI_TIMEOUT_KNOB stays unset" "124 yes knob=unset" "$sj_rc $(grep -q '^--kill-after=1s 300 job.sh|$' <<<"$sj_log" && echo yes) $sj_knob"
+is "... its NRV-E1215 names CI_STEP_MINUTES" "yes no" "$(grep -q "NRV-E1215: check ran past its 5 minutes and was stopped: a hung job, or a limit too short for this box; CI_STEP_MINUTES raises it for a run$" <<<"$sj_err" && echo yes) $(grep -q "repository's Timeout" <<<"$sj_err" && echo yes || echo no)"
+sj_run check-scripts 5 1260 CI_X=1
+is "ci_step_job: check-scripts runs the root tests first, bounded by their own 1200 s, then the job" "yes yes" "$(grep -q '^--kill-after=1s 1200 ci_test.sh|--kill-after=1s 300 job.sh|$' <<<"$sj_log" && echo yes) $(grep -q "CI_SCRIPTS_TEST_MINUTES raises it for a run" <<<"$sj_err" && echo yes)"
+# --- END ci_step_job
 is "NRV-W1207 is registered in docs/ERRORS.md" 1 "$(grep -c '^| NRV-W1207 |' docs/ERRORS.md || true)"
 # The step drains the trash of the mount it writes BEFORE it measures "low" (static: the drain is
 # above the disk test), and passes its start time, and the guard is registered. Mutant: the drain moved below.
@@ -2692,8 +2781,8 @@ is "the step records when it began, for the tail's cap (static)" 1 "$(grep -c '^
 is "NRV-W1206 is registered in docs/ERRORS.md" 1 "$(grep -c '^| NRV-W1206 |' docs/ERRORS.md || true)"
 
 # (f) The knobs are validated as the others are (NRV-E1208): a whole number, 1 or more.
-for knob in CI_BRANCH_DU_SECONDS CI_TRASH_SECONDS CI_TRASH_TAIL_SECONDS CI_TRASH_PENDING_MINUTES CI_REPO_TIMEOUT_MINUTES CI_MIN_FREE_INODES; do
-    for bad in 0 abc '1;touch x' -5 1.5 ' 3' 9999999; do
+for knob in CI_BRANCH_DU_SECONDS CI_TRASH_SECONDS CI_TRASH_TAIL_SECONDS CI_TRASH_PENDING_MINUTES CI_REPO_TIMEOUT_MINUTES CI_KILL_AFTER CI_MIN_FREE_INODES; do
+    for bad in 0 abc '1;touch x' -5 1.5 ' 3' 9999999 08 5m; do
         refuses NRV-E1208 "$knob='$bad'" env "$knob=$bad" bash -c '. ci/cache.sh; ci_knobs_check'
     done
     ok "$knob=1 and 999999 are accepted" env "$knob=999999" bash -c '. ci/cache.sh; ci_knobs_check'

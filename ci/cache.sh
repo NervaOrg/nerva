@@ -112,6 +112,12 @@
 # pipeline for main, the only one that can write it.
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
+# CI_TRASH_REFRESH is internal: only a low-disk prune's own move sets it, by a prefix assignment on
+# the one call (ci_trash_mark). One preset in the environment (a pipeline variable, a shell's
+# export) would make every move refresh the guard's marker, so it is dropped when this file is
+# sourced, which every entry point does (review 6005098936).
+unset CI_TRASH_REFRESH
+
 # ci_branch_key BRANCH: a directory name for a branch that is safe to use as one and different for
 # every branch (the hash tells `a/b` from `a_b`).
 ci_branch_key() {
@@ -147,13 +153,13 @@ ci_job_not_root() {
 }
 
 # ci_knobs_check: NRV-E1208 when CI_NORMALIZE_SECONDS, CI_CHILD_LOCK_WAIT, CI_BRANCH_DU_SECONDS,
-# CI_TRASH_SECONDS, CI_TRASH_TAIL_SECONDS, CI_TRASH_PENDING_MINUTES, CI_REPO_TIMEOUT_MINUTES or
-# CI_MIN_FREE_INODES, if set, is not a whole number (1 or more, at most six digits). The seconds go
+# CI_TRASH_SECONDS, CI_TRASH_TAIL_SECONDS, CI_TRASH_PENDING_MINUTES, CI_REPO_TIMEOUT_MINUTES,
+# CI_KILL_AFTER or CI_MIN_FREE_INODES, if set, is not a whole number (1 or more, at most six digits). The seconds go
 # to timeout(1) and flock -w, where 0 means no limit or no wait, and anything else is an error from
 # a root step's tool; the minutes go to find -mmin and to arithmetic; the inode threshold is compared as a number.
 ci_knobs_check() {
     local n
-    for n in CI_NORMALIZE_SECONDS CI_CHILD_LOCK_WAIT CI_BRANCH_DU_SECONDS CI_TRASH_SECONDS CI_TRASH_TAIL_SECONDS CI_TRASH_PENDING_MINUTES CI_REPO_TIMEOUT_MINUTES CI_MIN_FREE_INODES; do
+    for n in CI_NORMALIZE_SECONDS CI_CHILD_LOCK_WAIT CI_BRANCH_DU_SECONDS CI_TRASH_SECONDS CI_TRASH_TAIL_SECONDS CI_TRASH_PENDING_MINUTES CI_REPO_TIMEOUT_MINUTES CI_KILL_AFTER CI_MIN_FREE_INODES; do
         [ -z "${!n:-}" ] || [[ "${!n}" =~ ^[1-9][0-9]{0,5}$ ]] || {
             ci_error "NRV-E1208: $n='${!n}' is not a whole number (1 or more, at most six digits; seconds, minutes for the *_MINUTES knobs, or inodes for CI_MIN_FREE_INODES)"
             return 1
@@ -822,7 +828,8 @@ ci_tail_seconds() {
 # ci_job_seconds MINUTES [RESERVED [JOB]]: the job's bound in seconds: MINUTES * 60, but never so long
 # that the job, what comes before it that is already bounded (RESERVED seconds: for check-scripts the
 # root tests' own bound plus the kill-after, ci/woodpecker_step.sh), the kill-after grace
-# (CI_KILL_AFTER, default 60, when a whole number), the 120 s margin and the tail
+# (CI_KILL_AFTER, default 60, validated by ci_knobs_check: NRV-E1208 and status 1 before any
+# arithmetic), the 120 s margin and the tail
 # (CI_TRASH_TAIL_SECONDS, default 300) pass Woodpecker's limit on the step (CI_REPO_TIMEOUT_MINUTES,
 # default 360), counted from CI_STEP_START (ci_tail_seconds). A 330-minute search after a pre-job
 # phase of half an hour would otherwise be killed by Woodpecker and reported as killed, with no tail
@@ -831,13 +838,13 @@ ci_tail_seconds() {
 # starting: NRV-E1215 says it was not started (stderr), and the bound printed is 0, which the caller
 # takes as "do not run it". No CI_STEP_START: MINUTES * 60.
 ci_job_seconds() {
-    local want=$(($1 * 60)) reserved="${2:-0}" job="${3:-the job}" kill=60 used left
-    [[ "${CI_KILL_AFTER:-}" =~ ^[0-9]+$ ]] && kill="$CI_KILL_AFTER"
+    ci_knobs_check || return 1
+    local want=$(($1 * 60)) reserved="${2:-0}" job="${3:-the job}" kill="${CI_KILL_AFTER:-60}" used left
     if [[ "${CI_STEP_START:-}" =~ ^[0-9]+$ ]]; then
         used=$(($(date +%s) - CI_STEP_START))
         left=$((${CI_REPO_TIMEOUT_MINUTES:-360} * 60 - used - 120 - ${CI_TRASH_TAIL_SECONDS:-300} - kill - reserved))
         if [ "$left" -lt 60 ]; then
-            ci_error "NRV-E1215: $job was not started: the step has used $used s of the repository's ${CI_REPO_TIMEOUT_MINUTES:-360} minutes and Woodpecker would kill it before it could end (NRV-W1207); the repository's Timeout has to be raised (ops/ci/README.md), with CI_REPO_TIMEOUT_MINUTES to match; CI_STEP_MINUTES does not help"
+            ci_error "NRV-E1215: $job was not started: the step has used $used s of the repository's ${CI_REPO_TIMEOUT_MINUTES:-360} minutes and Woodpecker would kill it before it could end (NRV-W1207); raise the repository's Timeout (Woodpecker repository settings; ops/ci/README.md), with CI_REPO_TIMEOUT_MINUTES to match; CI_STEP_MINUTES does not help"
             echo 0
             return 0
         fi
@@ -847,6 +854,22 @@ ci_job_seconds() {
         fi
     fi
     echo "$want"
+}
+
+# ci_step_job JOB MINUTES RESERVED TEST_SECONDS TESTS_ARRAY JOB_ARRAY: the step's run of a job within
+# its bound (ci_job_seconds, with RESERVED seconds taken off), as ci/woodpecker_step.sh runs it. Status 1
+# and nothing run, neither the root tests nor the job, when no time is left (NRV-E1215 said so);
+# otherwise ci_step_run_with_tests' status. A job shortened to fit the repository's timeout is not
+# helped by CI_STEP_MINUTES, so its NRV-E1215 names the Timeout instead (CI_TIMEOUT_KNOB, exported
+# only then). The step goes on to its tail (ci_step_finish) whatever this returns.
+ci_step_job() {
+    local job_seconds
+    job_seconds=$(ci_job_seconds "$2" "$3" "$1") || return 1
+    [ "$job_seconds" != 0 ] || return 1
+    if [ "$job_seconds" -lt $(($2 * 60)) ]; then
+        export CI_TIMEOUT_KNOB="raise the repository's Timeout (Woodpecker repository settings), with CI_REPO_TIMEOUT_MINUTES to match; the job was shortened (NRV-W1207), so CI_STEP_MINUTES does not help"
+    fi
+    ci_step_run_with_tests "$1" "$4" "$job_seconds" "$5" "$6"
 }
 
 # ci_step_finish ROLE CACHE BRANCH_DIR [JOB]: what a step does after its job, in its own tail, as root.
@@ -973,12 +996,7 @@ ci_branch_prepare() {
     maxdays="${CI_BRANCH_CACHE_DAYS:-7}"
     maxgib="${CI_BRANCH_CACHE_MAX_GIB:-12}"
     seedgib="${CI_BRANCH_SEED_MAX_GIB:-6}"
-    # The low-disk prune of every idle cache is not made while a trash is draining: its blocks and
-    # inodes are what made the disk look low (ci_trash_pending).
     refresh=
-    if [ "${CI_BRANCH_PRUNE_ALL:-}" = 1 ]; then
-        if ci_trash_hold_off "every idle branch cache" "$root"; then :; else maxn=0; refresh=1; fi
-    fi
     # The size of main's package cache decides whether this branch is seeded from it. It is
     # measured here, before the branches' lock: a walk of a tree under that lock would stall every
     # other branch's step (the design rule at the top). Only a branch with no directory yet needs it.
@@ -988,7 +1006,12 @@ ci_branch_prepare() {
     { exec 7>>"$locks/branches.lock"; } 2>/dev/null || { ci_lock_open_failed "$locks/branches.lock" '>>'; return 1; }
     if flock -x -w "${CI_LOCK_WAIT:-300}" 7; then
         locked=yes
+        # The low-disk prune of every idle cache is not made while a trash is draining: its blocks and
+        # inodes are what made the disk look low (ci_trash_pending). The test is made HERE, under the
+        # lock, not before the wait: steps that all tested a missing marker before it would each prune
+        # in turn, and only the first may (one prune per CI_TRASH_PENDING_MINUTES, review 6005098936).
         # The prune-all's moves re-arm the guard's marker (refresh=1: ci_trash_mark); no other move does.
+        if [ "${CI_BRANCH_PRUNE_ALL:-}" = 1 ] && ! ci_trash_hold_off "every idle branch cache" "$root"; then maxn=0; refresh=1; fi
         CI_TRASH_REFRESH="$refresh" ci_branch_prune "$b" "$locks" "$key" "$maxn" "$maxdays" "$maxgib"
         # Its own cache over the size limit (as the last step recorded it, ci_branch_measure: no
         # walk here) starts again, if no job of this branch is using it: moved aside, removed below.

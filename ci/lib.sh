@@ -14,7 +14,7 @@
 #                         runs CMD under `timeout`; NRV-E1215 if it ran past SECONDS (exit 124, or
 #                         137 when it ignored the TERM and was killed 60 s later, CI_KILL_AFTER)
 #                         and SECONDS have really passed; NRV-E1222 for a SIGKILL before that; the
-#                         message names CI_TIMEOUT_KNOB (default CI_STEP_MINUTES) as what raises it
+#                         message ends with CI_TIMEOUT_KNOB (default "CI_STEP_MINUTES raises it for a run")
 #   ci_step_run_with_tests JOB TEST_SECONDS JOB_SECONDS TESTS_ARRAY JOB_ARRAY
 #                         the tail of a Woodpecker step (ci/woodpecker_step.sh); TESTS_ARRAY and
 #                         JOB_ARRAY name arrays holding the commands. For check-scripts it runs the
@@ -51,7 +51,7 @@ ci_redact() {
 ci_run_timed() {
     local job="$1" seconds="$2" status=0 limit start="$SECONDS"
     shift 2
-    timeout --kill-after="${CI_KILL_AFTER:-60}" "$seconds" "$@" || status=$?
+    timeout --kill-after="${CI_KILL_AFTER:-60}s" "$seconds" "$@" || status=$?
     if [ "$status" = 137 ] && [ $((SECONDS - start)) -lt "$seconds" ]; then
         # SIGKILL well before the limit: not our timeout (it kills only after the limit plus the
         # grace period), so the kernel's OOM killer or someone's kill -9.
@@ -60,7 +60,7 @@ ci_run_timed() {
         [ $((SECONDS - start)) -ge "$seconds" ] || return "$status" # the command's own exit 124
         limit="$seconds seconds"
         [ $((seconds % 60)) != 0 ] || limit="$((seconds / 60)) minutes"
-        ci_error "NRV-E1215: $job ran past its $limit and was stopped: a hung job, or a limit too short for this box; ${CI_TIMEOUT_KNOB:-CI_STEP_MINUTES} raises it for a run"
+        ci_error "NRV-E1215: $job ran past its $limit and was stopped: a hung job, or a limit too short for this box; ${CI_TIMEOUT_KNOB:-CI_STEP_MINUTES raises it for a run}"
     fi
     return "$status"
 }
@@ -69,7 +69,7 @@ ci_step_run_with_tests() {
     local job="$1" test_seconds="$2" job_seconds="$3" tests_status=0 status=0
     local -n _ci_tests_ref="$4" _ci_job_ref="$5" # private names: the caller's arrays are tests_cmd and job_cmd
     if [ "$job" = check-scripts ]; then
-        CI_TIMEOUT_KNOB=CI_SCRIPTS_TEST_MINUTES ci_run_timed "$job's ci_test.sh, as root" "$test_seconds" "${_ci_tests_ref[@]}" 6>&- 7>&- 8>&- 9<&- || tests_status=$?
+        CI_TIMEOUT_KNOB="CI_SCRIPTS_TEST_MINUTES raises it for a run" ci_run_timed "$job's ci_test.sh, as root" "$test_seconds" "${_ci_tests_ref[@]}" 6>&- 7>&- 8>&- 9<&- || tests_status=$?
         export CI_SCRIPTS_TESTED=1
     else
         unset CI_SCRIPTS_TESTED

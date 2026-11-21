@@ -409,7 +409,7 @@ set:
       trash is left for a later step. So that the job never eats the tail's time, the job's own
       limit is bounded the same way: the smaller of its limit (330 minutes for the long searches)
       and `CI_REPO_TIMEOUT_MINUTES` minus what the step has used, minus 120 s, the kill-after grace
-      (`CI_KILL_AFTER`, 60 s) and the tail's `CI_TRASH_TAIL_SECONDS` (for `check-scripts` also the root
+      (`CI_KILL_AFTER`, 60 s, a whole number of 1 to 999999: NRV-E1208) and the tail's `CI_TRASH_TAIL_SECONDS` (for `check-scripts` also the root
       tests' whole bound, `CI_SCRIPTS_TEST_MINUTES` plus the kill-after, which run first), with the line
       NRV-W1207 when that shortens it; with less than 60 s left the job is not started and the step
       fails with NRV-E1215 (the repository's Timeout is the fix, not `CI_STEP_MINUTES`) (the pre-job phase can
