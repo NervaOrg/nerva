@@ -77,6 +77,9 @@ host() {
     # Made root's (and, by install, set right again if a run left it otherwise); a step refuses one
     # a job could write (NRV-E1226).
     install -d -m 0700 -o 0 -g 0 "$root/locks"
+    # What a `reset-cache` that stopped between moving a cache aside and removing it left (it is
+    # in locks/, which no job reaches): removed.
+    [ ! -d "$root/locks/trash" ] || rm -rf --one-file-system -- "$root/locks/trash"
     # What the first layout left (one shared cache for every branch) is no longer read. A plain
     # loop: on a fresh box none of them exists, which would fail an `ls` under pipefail.
     local old="" n
@@ -147,26 +150,64 @@ repo() {
     say "OK repo $name (id $id): pull requests off, approval for forks, 360 min, trusted for volumes and network only"
 }
 
-# reset_cache WHAT: empties one cache at once (the operator's answer to what a step's normalization
-# does not promise: a job's damage to the content or the type of something deep in its own cache,
-# which a branch's prune clears in 7 days and main's only when the disk is low). WHAT is `main`
-# (main's zig and zig-local; never tools, the pinned toolchain) or a branch name (that branch's
-# directory). It is the operation of the prune and of NRV-W1204: `rm -rf --one-file-system` of a
-# DIRECT child of a mount root that this user (root) owns and no one else can write, which never
-# follows a link, under the exclusive lock that keeps the pipelines out (main's lock, or the
-# branch's own; steps hold them shared while they run) and the children lock (so that no step is
-# in the middle of making the directory). The next pipeline makes the directories again.
+# has_acl PATH: whether PATH carries an ACL beyond its mode (`ls -l` marks it with a `+` after the
+# mode; nothing needs the acl package to ask, as in ci/cache.sh's ci_has_acl).
+has_acl() {
+    local m
+    m=$(ls -ldn -- "$1" 2>/dev/null) || return 1
+    [[ "${m%% *}" == *+ ]]
+}
+
+# reset_cache main|jepsen|BRANCH | --branch NAME: empties one cache at once (the operator's answer to
+# what a step's normalization does not promise: a job's damage to the content or the type of
+# something deep in its own cache, which a branch's prune clears only once the branch has been idle
+# for 7 days and main's only when the disk is low). What it empties:
+#   main            main's zig and zig-local (never tools, the pinned toolchain)
+#   jepsen          jepsen's tools (the pinned Docker client; the run directories are kept and age
+#                   out after 14 days)
+#   BRANCH          that branch's directory
+#   --branch NAME   the same, for a branch named main or jepsen: a manual pipeline on main runs in
+#                   the branch role, with the key b-main-<sum> under branches/, which `main` does
+#                   not reach
+# It is the operation of the prune and of NRV-W1204 on a DIRECT child of a mount root that this user
+# (root) owns and no one else can write, under the exclusive lock that keeps the pipelines out
+# (main's, the branch's own, or the Jepsen lock; steps hold them shared, or the Jepsen one
+# exclusively, while they run) and the children lock (no step is in the middle of making the
+# directory). Under the locks each name is only RENAMED (mv -T, a rename within one file system)
+# into locks/trash, which no job can reach; the locks are let go, and then the renamed trees are
+# removed (rm -rf --one-file-system, never following a link). The children lock is therefore held
+# for milliseconds, whatever the size of the cache (NRV-E1234's premise), and a crash between the
+# two leaves a tree in locks/trash that the next reset-cache, or `host`, removes. The next
+# pipeline makes the directories again.
 reset_cache() {
-    local what="${1:-}" root mount lock key safe sum wait names=() n
-    [ -n "$what" ] && [ $# -le 1 ] || fail "NRV-E1221: usage: bash ci/nerva-woodpecker.sh reset-cache main|BRANCH"
+    local what kind root mount lock key safe sum wait names=() n trash dest f mroot
+    case "${1:-}" in
+    --branch)
+        [ $# -eq 2 ] && [ -n "$2" ] || fail "NRV-E1221: usage: bash ci/nerva-woodpecker.sh reset-cache main|jepsen|BRANCH | --branch BRANCH"
+        what="$2"
+        kind=branch
+        ;;
+    *)
+        [ $# -eq 1 ] && [ -n "$1" ] || fail "NRV-E1221: usage: bash ci/nerva-woodpecker.sh reset-cache main|jepsen|BRANCH | --branch BRANCH"
+        what="$1"
+        case "$what" in main) kind=main ;; jepsen) kind=jepsen ;; *) kind=branch ;; esac
+        ;;
+    esac
     root="${NERVA_CI_CACHE_ROOT:-/var/cache/nerva-ci}"
     wait="${NERVA_CI_RESET_WAIT:-60}"
     [[ "$wait" =~ ^[0-9]{1,5}$ ]] || fail "NRV-E1221: NERVA_CI_RESET_WAIT='$wait' is not a whole number of seconds"
-    if [ "$what" = main ]; then
+    case "$kind" in
+    main)
         mount="$root/main"
         lock="$root/locks/main.lock"
         names=(zig zig-local)
-    else
+        ;;
+    jepsen)
+        mount="$root/jepsen"
+        lock="$root/locks/jepsen.lock"
+        names=(tools)
+        ;;
+    *)
         # The key of ci/cache.sh's ci_branch_key (a test keeps the two equal).
         safe=$(printf '%s' "$what" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-48)
         sum=$(printf '%s' "$what" | sha256sum | cut -c1-8)
@@ -174,33 +215,51 @@ reset_cache() {
         mount="$root/branches"
         lock="$root/locks/$key.lock"
         names=("$key")
-    fi
-    # Only a mount root that is this user's and that no one else can write: in it, a name is not
-    # something a job could have swapped for a link between the test and the rm.
-    if [ -L "$mount" ] || [ ! -d "$mount" ] || [ "$(stat -c %u "$mount")" != "$(id -u)" ] || [ -n "$(find "$mount" -maxdepth 0 -perm /022)" ] ||
-        [ -L "$root/locks" ] || [ ! -d "$root/locks" ] || [ "$(stat -c %u "$root/locks")" != "$(id -u)" ] || [ -n "$(find "$root/locks" -maxdepth 0 -perm /077)" ]; then
-        fail "NRV-E1235: $mount and $root/locks must be real directories owned by $(id -un), not writable by anyone else (the locks one mode 0700): run bash ci/nerva-woodpecker.sh host first"
-    fi
-    local f
-    for f in "$lock" "$root/locks/$(basename "$mount")-children.lock"; do
+        ;;
+    esac
+    mroot=$(basename "$mount")
+    # Only a mount root that is this user's and that no one else can write, with no ACL either (an
+    # ACL can give a job write access that the mode does not show: `ls -l` marks it with a `+`):
+    # in it, a name is not something a job could have swapped for a link between the test and the
+    # rename. The same for locks/, which no one else may use at all.
+    for f in "$mount" "$root/locks"; do
+        if [ -L "$f" ] || [ ! -d "$f" ] || [ "$(stat -c %u "$f")" != "$(id -u)" ] || [ -n "$(find "$f" -maxdepth 0 -perm /022)" ] ||
+            has_acl "$f"; then
+            fail "NRV-E1235: $mount and $root/locks must be real directories owned by $(id -un), not writable by anyone else and with no ACL (the locks one mode 0700; $f is not): run bash ci/nerva-woodpecker.sh host first"
+        fi
+    done
+    [ -z "$(find "$root/locks" -maxdepth 0 -perm /077)" ] ||
+        fail "NRV-E1235: $mount and $root/locks must be real directories owned by $(id -un), not writable by anyone else and with no ACL (the locks one mode 0700; $root/locks is not): run bash ci/nerva-woodpecker.sh host first"
+    for f in "$lock" "$root/locks/$mroot-children.lock"; do
         if [ -L "$f" ] || { [ -e "$f" ] && [ ! -f "$f" ]; }; then fail "NRV-E1235: $f is not a regular file: remove it"; fi
         [ -e "$f" ] || (umask 077 && set -C && : >"$f") 2>/dev/null || true
     done
+    # The trash: root's, 0700, in locks/ (which no job can open), on the mount's own file system so
+    # that moving a tree in is a rename. Whatever an earlier run left there is removed below.
+    trash="$root/locks/trash"
+    if [ -L "$trash" ] || { [ -e "$trash" ] && [ ! -d "$trash" ]; }; then fail "NRV-E1235: $trash is not a directory: remove it"; fi
+    [ -d "$trash" ] || mkdir -m 0700 -- "$trash" 2>/dev/null || fail "NRV-E1235: could not make $trash"
+    [ "$(stat -c %d "$mount")" = "$(stat -c %d "$trash")" ] ||
+        fail "NRV-E1235: $root/locks and $mount are on different file systems, so a cache could not be moved aside in one step: run this where they share one"
     (
-        exec 8>>"$lock" 4>>"$root/locks/$(basename "$mount")-children.lock" || exit 4
+        exec 8>>"$lock" 4>>"$root/locks/$mroot-children.lock" || exit 4
         flock -x -w "$wait" 8 || exit 3
         flock -x -w "$wait" 4 || exit 3
         for n in "${names[@]}"; do
             [ -e "$mount/$n" ] || [ -L "$mount/$n" ] || continue
-            rm -rf --one-file-system -- "${mount:?}/$n" || exit 5
-            { [ ! -e "$mount/$n" ] && [ ! -L "$mount/$n" ]; } || exit 5
-            echo "nerva-woodpecker: removed $mount/$n"
+            dest=$(mktemp -u "$trash/$n.XXXXXX") || exit 5
+            mv -T -- "$mount/$n" "$dest" || exit 5
+            echo "nerva-woodpecker: moved $mount/$n aside"
         done
     ) || case "$?" in
-        3) fail "NRV-E1235: $what's cache is in use: pipelines hold its lock (shared, while a step runs) and none let go in $wait s: wait for them, or stop them in Woodpecker, then run this again (NERVA_CI_RESET_WAIT raises the wait)" ;;
-        5) fail "NRV-E1235: a cache directory of $what under $mount could not be removed (a mount inside it?): look at it with ls -la and remove what is in the way" ;;
+        3) fail "NRV-E1235: $what's cache is in use: pipelines hold its lock (shared, while a step runs; the Jepsen one exclusively) and none let go in $wait s: wait for them, or stop them in Woodpecker, then run this again (NERVA_CI_RESET_WAIT raises the wait)" ;;
+        5) fail "NRV-E1235: a cache directory of $what under $mount could not be moved aside: look at it with ls -la" ;;
         *) fail "NRV-E1235: the lock files under $root/locks could not be opened" ;;
     esac
+    # The locks are let go: pipelines make fresh directories while the old ones are removed.
+    find "$trash" -mindepth 1 -maxdepth 1 -exec rm -rf --one-file-system -- {} + ||
+        fail "NRV-E1235: $what's cache was moved aside, so pipelines are unaffected, but $trash could not be emptied (a mount inside it?): look at it with ls -la and remove what is in the way"
+    for n in "${names[@]}"; do echo "nerva-woodpecker: removed $mount/$n"; done
     say "OK reset-cache $what: the next pipeline makes its cache directories again"
 }
 
@@ -208,5 +267,5 @@ case "${1:-}" in
 host) host ;;
 repo) repo "${2:-}" ;;
 reset-cache) shift; reset_cache "$@" ;;
-*) fail "NRV-E1221: usage: bash ci/nerva-woodpecker.sh host (on the box) | bash ci/nerva-woodpecker.sh reset-cache main|BRANCH (on the box) | bash ops/ci/nerva-woodpecker.sh repo OWNER/NAME (from the repository root)" ;;
+*) fail "NRV-E1221: usage: bash ci/nerva-woodpecker.sh host (on the box) | bash ci/nerva-woodpecker.sh reset-cache main|jepsen|BRANCH|--branch BRANCH (on the box) | bash ops/ci/nerva-woodpecker.sh repo OWNER/NAME (from the repository root)" ;;
 esac

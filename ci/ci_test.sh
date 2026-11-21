@@ -255,6 +255,11 @@ is "a failing job keeps its own status" 7 "$rc"
 refuses NRV-E1208 "CI_STEP_MINUTES not a number" env CI_STEP_MINUTES=soon ci/woodpecker_step.sh check
 
 # --- ci/cache.sh ---
+# As root the job's user is `nobody`, as it is `ci` in a step (a root that acts as its own job is
+# NRV-B1202); it must be able to reach the scratch directory.
+chmod 711 "$tmp"
+if [ "$(id -u)" = 0 ]; then ou=nobody; else ou=$(id -un); fi
+export CI_JOB_USER=$ou
 . ci/cache.sh
 is "branch key differs" yes "$([ "$(ci_branch_key a/b)" != "$(ci_branch_key a_b)" ] && echo yes)"
 is "branch key is a plain name" yes "$([[ "$(ci_branch_key 'feat/x y;..')" =~ ^b-[A-Za-z0-9._-]+$ ]] && echo yes)"
@@ -412,6 +417,7 @@ branch_file() {
 }
 seven=$(. ci/cache.sh; ci_branch_key feature/seven)
 : >"$c/branches/$seven"
+chown "$ou" "$c/branches/$seven" 2>/dev/null || true # the job's own file
 : >"$c/locks/$seven.lock"
 setsid flock -o -s "$c/locks/$seven.lock" sleep 20 &
 holder=$!
@@ -435,6 +441,7 @@ rm -rf "${c:?}/branches/$seven"
 # The same on the NRV-W1202 path: the branches' lock stays busy, $dir is a file whose lock is held.
 eight=$(. ci/cache.sh; ci_branch_key feature/eight)
 : >"$c/branches/$eight"
+chown "$ou" "$c/branches/$eight" 2>/dev/null || true
 : >"$c/locks/$eight.lock"
 setsid flock -o -x "$c/locks/branches.lock" sleep 20 &
 holder=$!
@@ -457,6 +464,7 @@ rm -rf "${c:?}/branches/$eight"
 # a holder right after it has run.
 rst=$(. ci/cache.sh; ci_branch_key feature/reset)
 : >"$c/branches/$rst"
+chown "$ou" "$c/branches/$rst" 2>/dev/null || true
 reset_then_hold() {
     . ci/cache.sh
     eval "orig_$(declare -f ci_child_reset)"
@@ -475,6 +483,7 @@ wait 2>/dev/null || true
 rm -rf "${c:?}/branches/$rst"
 # ci_child_reset reports success only if the name is gone: a failing rm (a stub) is rc 1, no NRV-W1204.
 mkdir -p "$tmp/badrm" "$c/branches/b-rmfail-00000001"
+chown "$ou" "$c/branches/b-rmfail-00000001" 2>/dev/null || true
 printf '#!/bin/sh\nexit 1\n' >"$tmp/badrm/rm"
 chmod +x "$tmp/badrm/rm"
 out=$(
@@ -772,6 +781,11 @@ mkdir "$tmp/hostcache/zig"
 out=$(nw FAKE_DOCKER=ok -- host 2>&1) || { echo "FAIL host run again: $out" >&2; fail=1; }
 grep -q 'old layout (zig )' <<<"$out" || { echo "FAIL host run again: the old layout is not noted in: $out" >&2; fail=1; }
 grep -q 'nerva-woodpecker: OK host' <<<"$out" || { echo "FAIL host run again: no OK line in: $out" >&2; fail=1; }
+# A trash a crashed reset-cache left in locks/ is removed by host.
+mkdir -p "$tmp/hostcache/locks/trash/zig.crashed/deep"
+: >"$tmp/hostcache/locks/trash/zig.crashed/deep/f"
+out=$(nw FAKE_DOCKER=ok -- host 2>&1) || { echo "FAIL host with a leftover trash: $out" >&2; fail=1; }
+is "host removes the trash a crashed reset-cache left" no "$([ -e "$tmp/hostcache/locks/trash" ] && echo yes || echo no)"
 is "host makes the mount roots 0755 and makes none of their directories" "755 755 755 yes" "$(stat -c %a "$tmp/hostcache/main") $(stat -c %a "$tmp/hostcache/branches") $(stat -c %a "$tmp/hostcache/jepsen") $([ -z "$(find "$tmp/hostcache/main" "$tmp/hostcache/branches" "$tmp/hostcache/jepsen" -mindepth 1)" ] && echo yes)"
 # A box that ran the earlier layout: the roots the job's, one with an ACL: run again, they are root's 0755 with no ACL.
 if [ "$(id -u)" = 0 ] && command -v setfacl >/dev/null && id nobody >/dev/null 2>&1; then
@@ -893,8 +907,6 @@ is "the jepsen lock's E1227 probes a read open" 1 "$(grep -c "ci_lock_open_faile
 
 # The step's own sequence (ci_main_prepare: lock, prune, then the directories): after a prune
 # main's directories are made again, by root, and handed to the job's user. As root the user is `nobody`.
-chmod 711 "$tmp"
-if [ "$(id -u)" = 0 ]; then ou=nobody; else ou=$(id -un); fi
 chown "$ou" "$c/main/zig" "$c/main/zig-local" "$c/main/tools" 2>/dev/null || true
 echo x >"$c/main/zig-local/entry"
 (
@@ -947,6 +959,7 @@ attack_tree() { # attack_tree NAME: a fresh cache root, as the host lays it out:
     rm -rf "$r"
     mkdir -p "$r/main/zig" "$r/main/zig-local" "$r/main/tools" "$r/branches"
     mkdir -m 0700 "$r/locks"
+    chmod 0755 "$r/main" "$r/branches" # whatever the umask: reset-cache refuses a root others can write
     chown "$jobuser" "$r/main/zig" "$r/main/zig-local" "$r/main/tools" 2>/dev/null || true
     echo "$r"
 }
@@ -1765,6 +1778,13 @@ chmod 0777 "$q/main"
 out=$(rc_run "$q" main) && { echo "FAIL reset-cache acted in a mount root others can write: $out" >&2; fail=1; }
 grep -q "NRV-E1235" <<<"$out" || { echo "FAIL reset-cache in a writable mount root is not E1235: $out" >&2; fail=1; }
 chmod 0755 "$q/main"
+# An ACL that gives a job write access, which the mode does not show (skipped where the filesystem has none).
+if setfacl -m u:nobody:rwx,m::r-x "$q/main" 2>/dev/null && [ "$(find "$q/main" -maxdepth 0 -perm /022 | wc -l)" = 0 ]; then
+    out=$(rc_run "$q" main) && { echo "FAIL reset-cache acted in a mount root with an ACL: $out" >&2; fail=1; }
+    grep -q "NRV-E1235" <<<"$out" || { echo "FAIL reset-cache in a mount root with an ACL is not E1235: $out" >&2; fail=1; }
+    is "reset-cache in a mount root with an ACL: nothing removed" yes "$([ -e "$q/main/zig/o/deep/f" ] && echo yes)"
+    setfacl -b "$q/main"
+fi
 chmod 0755 "$q/locks"
 out=$(rc_run "$q" main) && { echo "FAIL reset-cache accepted a lock directory others can use: $out" >&2; fail=1; }
 grep -q "NRV-E1235" <<<"$out" || { echo "FAIL reset-cache with an open lock directory is not E1235: $out" >&2; fail=1; }
@@ -1783,6 +1803,239 @@ for name in feature/atk a/b a_b 'x y' "$(printf 'long-%.0s' $(seq 20))"; do
     rc_run "$q" "$name" >/dev/null || { echo "FAIL reset-cache '$name'" >&2; fail=1; }
     is "reset-cache '$name' removes the directory ci_branch_key names" no "$([ -e "$q/branches/$k" ] && echo yes || echo no)"
 done
+
+# --- Review 6002726986 (the twentieth round): the locks a step holds while it walks a tree, `reset-cache`
+# against a step, what `reset-cache` can reach, and the knobs. The job's user is `nobody` as root.
+wait_for() { local i; for i in $(seq 100); do [ -e "$1" ] && return 0; sleep 0.1; done; return 1; } # wait_for FILE
+# A `find` that waits the first time the job's walk (ci_normalize) runs it (a poisoned and large tree, in
+# effect), says so in a marker, and then runs the real one.
+slow="$tmp/slow-find"
+mark="$tmp/slow-mark"
+mkdir -p "$slow" "$mark"
+chmod 755 "$slow"
+chmod 777 "$mark"
+cat >"$slow/find" <<EOS
+#!/bin/sh
+case "\$*" in *-ignore_readdir_race*) if [ ! -e "$mark/started" ]; then : >"$mark/started"; sleep "\${SLOW_FIND:-3}"; fi ;; esac
+exec $(command -v find) "\$@"
+EOS
+chmod 755 "$slow/find"
+now() { date +%s.%N; }
+slow_reset() { rm -f "$mark"/*; }
+
+# The branch's step does not hold the branches' lock (fd 7) or main's (fd 9) while the job's tree is
+# walked: another branch's step is not held up (NRV-W1202 after CI_LOCK_WAIT) and main's prune is
+# not either. The step is started holding fd 9 shared, as woodpecker_step.sh does.
+r=$(attack_tree slowwalk)
+: >"$r/locks/main.lock"
+chmod 600 "$r/locks/main.lock"
+(. ci/cache.sh; CI_JOB_USER=$jobuser CI_LOCK_WAIT=2 ci_branch_prepare "$r" feature/slow) >/dev/null 2>&1 || { echo "FAIL the first prepare of feature/slow" >&2; fail=1; }
+slow_reset
+(
+    exec 9<"$r/locks/main.lock"
+    flock -s 9
+    . ci/cache.sh
+    PATH="$slow:$PATH" CI_JOB_USER=$jobuser CI_LOCK_WAIT=2 ci_branch_prepare "$r" feature/slow >"$tmp/slow-a.out" 2>&1 && echo RC0 >>"$tmp/slow-a.out"
+) &
+slow_pid=$!
+wait_for "$mark/started" || { echo "FAIL the slow walk never started" >&2; fail=1; }
+is "a branch's walk of its tree holds neither the branches' lock nor main's" "free free" "$(flock -x -n "$r/locks/branches.lock" true && echo -n free || echo -n held; echo -n ' '; flock -x -n "$r/locks/main.lock" true && echo free || echo held)"
+t0=$(now)
+out=$( (. ci/cache.sh; CI_JOB_USER=$jobuser CI_LOCK_WAIT=1 ci_branch_prepare "$r" feature/fast 2>&1 && echo RC0) || true)
+t1=$(now)
+is "another branch's step is prepared while the first walks its tree: RC0, no warning" yes "$(grep -q RC0 <<<"$out" && ! grep -q "NRV-[EW]12" <<<"$out" && echo yes)"
+is "and quickly (under 2.5 s while the walk waits 3 s)" yes "$(awk -v a="$t0" -v b="$t1" 'BEGIN { print (b - a < 2.5) ? "yes" : "no" }')"
+wait "$slow_pid" 2>/dev/null || true
+is "the slow step itself finished (RC0, no warning)" yes "$(grep -q RC0 "$tmp/slow-a.out" && ! grep -q "NRV-[EW]12" "$tmp/slow-a.out" && echo yes)"
+# A damaged directory is still prepared once the locks are let go (the walk fixes the mode).
+r=$(attack_tree slowreset)
+mk_branch "$r/branches/$branch_key"
+ci_as touch "$r/branches/$branch_key/zig/h"
+ci_as chmod 0 "$r/branches/$branch_key/zig-local"
+out=$(prep_b "$r")
+is "a branch directory prepared after its tree was damaged: RC0 and usable" yes "$(grep -q RC0 <<<"$out" && usable "$r/branches/$branch_key/zig-local" && echo yes)"
+
+# The walk batches its chmod of files: 40 files at mode 0400 cost a few chmod processes, not 40 (a
+# fork per file made 20 000 of them take 26.7 s). A stub `chmod` counts its calls.
+mkdir -p "$tmp/count-chmod"
+chmod 755 "$tmp/count-chmod"
+printf '#!/bin/sh\necho x >>"%s/chmod.log"\nexec %s "$@"\n' "$mark" "$(command -v chmod)" >"$tmp/count-chmod/chmod"
+chmod 755 "$tmp/count-chmod/chmod"
+r=$(attack_tree batch)
+ci_as mkdir "$r/main/zig/o"
+for i in $(seq 40); do ci_as touch "$r/main/zig/o/f$i"; done
+ci_as chmod 0400 "$r/main/zig/o"/f*
+slow_reset
+(. ci/cache.sh; PATH="$tmp/count-chmod:$PATH" CI_JOB_USER=$jobuser ci_normalize "$r/main/zig") >/dev/null 2>&1
+is "normalization: 40 files at 0400 are writable now, with fewer than 10 chmod calls" "yes yes" "$(job_writes "$r/main/zig/o/f1") $(job_writes "$r/main/zig/o/f40")"
+is "normalization batches its chmod of files" yes "$([ "$(wc -l <"$mark/chmod.log")" -lt 10 ] && echo yes)"
+
+# A walk that leaves a known name wrong is judged by what it leaves (the verdict, step 4): `rm` is a
+# stub that removes nothing, so a file at a name Zig needs to be a directory stays, and the tree is
+# not usable (probe rc 11). With the step's own reset also unable to remove it, the step is refused
+# (NRV-E1228) and does not go on with a directory that would fail every build.
+mkdir -p "$tmp/rm-noop"
+chmod 755 "$tmp/rm-noop"
+printf '#!/bin/sh\nexit 0\n' >"$tmp/rm-noop/rm"
+chmod 755 "$tmp/rm-noop/rm"
+r=$(attack_tree verdict)
+ci_as touch "$r/main/zig/h"
+probe_rc=0
+(. ci/cache.sh; PATH="$tmp/rm-noop:$PATH" CI_JOB_USER=$jobuser ci_child_probe "$r/main/zig") >/dev/null 2>&1 || probe_rc=$?
+is "the verdict: a file left at zig/h after the walk is rc 11" 11 "$probe_rc"
+out=$(PATH="$tmp/rm-noop:$PATH" prep_m "$r")
+grep -q "NRV-E1228: $r/main/zig is not a directory" <<<"$out" && ! grep -q RC0 <<<"$out" || { echo "FAIL a tree whose walk left a known name wrong and could not be reset is not E1228: $out" >&2; fail=1; }
+# The same with the reset able to work: W1204, made again, the step goes on.
+if [ "$(id -u)" = 0 ]; then # as one user, the stub cannot tell root's rm from the job's
+    r=$(attack_tree verdict2)
+    ci_as touch "$r/main/zig/h"
+    printf '#!/bin/sh\ncase "$(id -u)" in 0) exec %s "$@" ;; *) exit 0 ;; esac\n' "$(command -v rm)" >"$tmp/rm-noop/rm"
+    out=$(PATH="$tmp/rm-noop:$PATH" prep_m "$r")
+    is "the verdict: the job's rm does nothing, root's reset removes it and says so (W1204), the step goes on" "yes yes" "$(grep -q "NRV-W1204: $r/main/zig" <<<"$out" && echo yes) $(grep -q RC0 <<<"$out" && echo yes)"
+fi
+
+# `reset-cache` against a main step. The step holds main's lock shared from before its first probe,
+# so a reset waits for it (never meets a directory that is half prepared) and a step that starts
+# while the reset holds the lock waits for the reset: neither is NRV-E1228.
+r=$(attack_tree race2)
+slow_reset
+(
+    . ci/cache.sh
+    PATH="$slow:$PATH" CI_PRUNE_WAIT=1 ci_main_prepare "$r" "$jobuser" no 0 >"$tmp/race-m.out" 2>&1 && echo RC0 >>"$tmp/race-m.out"
+    now >"$tmp/race-m.end"
+) &
+race_pid=$!
+wait_for "$mark/started" || { echo "FAIL the main step's slow walk never started" >&2; fail=1; }
+is "a main step holds main's lock shared while it probes: an exclusive try fails" busy "$(flock -x -n "$r/locks/main.lock" true && echo free || echo busy)"
+out=$(rc_run "$r" main NERVA_CI_RESET_WAIT=20) || { echo "FAIL reset-cache racing a main step: $out" >&2; fail=1; }
+now >"$tmp/race-r.end"
+wait "$race_pid" 2>/dev/null || true
+is "reset-cache racing a main step: the step is prepared (RC0), neither is E1228" yes "$(grep -q RC0 "$tmp/race-m.out" && ! grep -q "NRV-E" "$tmp/race-m.out" && ! grep -q NRV-E <<<"$out" && echo yes)"
+is "reset-cache waited for the step (it ended after it)" yes "$(awk -v a="$(cat "$tmp/race-m.end")" -v b="$(cat "$tmp/race-r.end")" 'BEGIN { print (b >= a) ? "yes" : "no" }')"
+# And the other way round: the reset holds the lock, a step that starts waits for it.
+r=$(attack_tree race3)
+: >"$r/locks/main.lock"
+chmod 600 "$r/locks/main.lock"
+flock -x "$r/locks/main.lock" sleep 2 &
+holder=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do flock -x -n "$r/locks/main.lock" true 2>/dev/null || break; sleep 0.2; done
+t0=$(now)
+out=$(prep_m "$r")
+t1=$(now)
+wait "$holder" 2>/dev/null || true
+is "a main step started while the lock is held exclusively waits for it and is prepared" "yes yes" "$(grep -q RC0 <<<"$out" && ! grep -q "NRV-E" <<<"$out" && echo yes) $(awk -v a="$t0" -v b="$t1" 'BEGIN { print (b - a >= 1) ? "yes" : "no" }')"
+
+# `reset-cache` holds the locks only for the renames: the children lock and the cache's own lock
+# are free while the moved-aside trees are removed (an `rm` stub that waits shows it), and the
+# trash is empty at the end. A tree left in locks/trash by a run that crashed is removed by the
+# next one, and `host` removes it.
+q=$(rc_tree trash)
+mkdir -p "$q/locks/trash/zig.crashed/deep"
+: >"$q/locks/trash/zig.crashed/deep/f"
+mkdir -p "$tmp/slow-rm"
+chmod 755 "$tmp/slow-rm"
+printf '#!/bin/sh\n: >"%s/rm-started"\nsleep 2\nexec %s "$@"\n' "$mark" "$(command -v rm)" >"$tmp/slow-rm/rm"
+chmod 755 "$tmp/slow-rm/rm"
+slow_reset
+(rc_run "$q" main PATH="$tmp/slow-rm:$PATH" >"$tmp/rc-trash.out" 2>&1 || true) &
+rc_pid=$!
+wait_for "$mark/rm-started" || { echo "FAIL the trash was never emptied" >&2; fail=1; }
+is "reset-cache: the cache is gone and both locks are free while the trash is being emptied" "no free free" "$([ -e "$q/main/zig" ] && echo -n yes || echo -n no; echo -n ' '; flock -x -n "$q/locks/main.lock" true && echo -n free || echo -n held; echo -n ' '; flock -x -n "$q/locks/main-children.lock" true && echo free || echo held)"
+wait "$rc_pid" 2>/dev/null || true
+grep -q "OK reset-cache main" "$tmp/rc-trash.out" || { echo "FAIL reset-cache with a slow rm: $(cat "$tmp/rc-trash.out")" >&2; fail=1; }
+is "reset-cache: the trash is empty afterwards, a crashed run's tree included" "" "$(ls -A "$q/locks/trash")"
+mkdir -p "$q/locks/trash/zig.crashed2"
+: >"$q/locks/trash/zig.crashed2/f"
+out=$(rc_run "$q" main) || { echo "FAIL reset-cache after a crashed run: $out" >&2; fail=1; }
+is "reset-cache again removes what a crashed run left" "" "$(ls -A "$q/locks/trash")"
+rm -rf "$q/locks/trash"
+ln -s "$sd" "$q/locks/trash"
+out=$(rc_run "$q" main) && { echo "FAIL reset-cache followed a link as locks/trash: $out" >&2; fail=1; }
+grep -q "NRV-E1235: .*trash is not a directory" <<<"$out" || { echo "FAIL a link as locks/trash is not E1235: $out" >&2; fail=1; }
+is "a link as locks/trash: the target is left alone" "$want_state" "$(sentinel_state)"
+
+# What `reset-cache` reaches: a manual pipeline on main runs in the branch role (key b-main-<sum>),
+# which `main` does not reach and `--branch main` does; jepsen's tools; a branch with `--branch`.
+q=$(rc_tree manual)
+mk=$(. ci/cache.sh; ci_branch_key main)
+mkdir -p "$q/branches/$mk/zig" "$q/jepsen/tools" "$q/jepsen/20260101T000000Z-1"
+chmod 0755 "$q/jepsen"
+: >"$q/branches/$mk/zig/f"
+: >"$q/jepsen/tools/docker"
+: >"$q/jepsen/20260101T000000Z-1/store"
+out=$(rc_run "$q" main) || { echo "FAIL reset-cache main: $out" >&2; fail=1; }
+is "reset-cache main does not reach a manual pipeline's cache (key $mk)" yes "$([ -e "$q/branches/$mk/zig/f" ] && echo yes)"
+out=$(env NERVA_CI_CACHE_ROOT="$q" bash ops/ci/nerva-woodpecker.sh reset-cache --branch main 2>&1) || { echo "FAIL reset-cache --branch main: $out" >&2; fail=1; }
+is "reset-cache --branch main removes it, and only it" "no yes yes" "$([ -e "$q/branches/$mk" ] && echo yes || echo no) $([ -e "$q/branches/$branch_key/zig/f" ] && echo yes) $([ -e "$q/main/tools/archive" ] && echo yes)"
+out=$(rc_run "$q" jepsen) || { echo "FAIL reset-cache jepsen: $out" >&2; fail=1; }
+is "reset-cache jepsen removes the tools and keeps the runs' stores" "no yes" "$([ -e "$q/jepsen/tools" ] && echo yes || echo no) $([ -e "$q/jepsen/20260101T000000Z-1/store" ] && echo yes)"
+kj=$(. ci/cache.sh; ci_branch_key jepsen)
+mkdir -p "$q/branches/$kj/zig"
+out=$(env NERVA_CI_CACHE_ROOT="$q" bash ops/ci/nerva-woodpecker.sh reset-cache --branch jepsen 2>&1) || { echo "FAIL reset-cache --branch jepsen: $out" >&2; fail=1; }
+is "reset-cache --branch jepsen is the branch named jepsen, not the jepsen cache" "no" "$([ -e "$q/branches/$kj" ] && echo yes || echo no)"
+refuses NRV-E1221 "reset-cache --branch without a name" env NERVA_CI_CACHE_ROOT="$q" bash ops/ci/nerva-woodpecker.sh reset-cache --branch
+refuses NRV-E1221 "reset-cache --branch with two names" env NERVA_CI_CACHE_ROOT="$q" bash ops/ci/nerva-woodpecker.sh reset-cache --branch a b
+# The jepsen lock is held for a whole run: a reset waits, then says so.
+: >"$q/locks/jepsen.lock"
+chmod 600 "$q/locks/jepsen.lock"
+mkdir -p "$q/jepsen/tools"
+flock -x "$q/locks/jepsen.lock" sleep 10 &
+holder=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do flock -x -n "$q/locks/jepsen.lock" true 2>/dev/null || break; sleep 0.2; done
+out=$(rc_run "$q" jepsen NERVA_CI_RESET_WAIT=1) && { echo "FAIL reset-cache jepsen went on during a Jepsen run: $out" >&2; fail=1; }
+grep -q "NRV-E1235: jepsen's cache is in use" <<<"$out" || { echo "FAIL reset-cache jepsen during a run is not E1235: $out" >&2; fail=1; }
+kill "$holder" 2>/dev/null || true
+wait "$holder" 2>/dev/null || true
+is "reset-cache jepsen during a run: nothing removed" yes "$([ -e "$q/jepsen/tools" ] && echo yes)"
+
+# An ACL on the mount root or on locks/ (the mode does not show it: it can give a job write access)
+# is refused like a writable mode (NRV-E1235), as the step refuses it (NRV-E1229).
+if command -v setfacl >/dev/null && [ "$(id -u)" = 0 ]; then
+    q=$(rc_tree acl)
+    if setfacl -m "u:$jobuser:rwx" "$q/main" 2>/dev/null && has_acl "$q/main"; then
+        out=$(rc_run "$q" main) && { echo "FAIL reset-cache acted in a mount root with an ACL: $out" >&2; fail=1; }
+        grep -q "NRV-E1235: .*with no ACL" <<<"$out" || { echo "FAIL reset-cache in a mount root with an ACL is not E1235: $out" >&2; fail=1; }
+        setfacl -b "$q/main"
+        setfacl -m "u:$jobuser:x" "$q/locks"
+        out=$(rc_run "$q" main) && { echo "FAIL reset-cache acted with an ACL on locks/: $out" >&2; fail=1; }
+        grep -q "NRV-E1235" <<<"$out" || { echo "FAIL reset-cache with an ACL on locks/ is not E1235: $out" >&2; fail=1; }
+        setfacl -b "$q/locks"
+        is "reset-cache with an ACL on a mount root or on locks/: nothing removed" yes "$([ -e "$q/main/zig/o/deep/f" ] && echo yes)"
+        out=$(rc_run "$q" main) || { echo "FAIL reset-cache after the ACLs were removed: $out" >&2; fail=1; }
+    else
+        echo "note: this file system takes no ACLs: the reset-cache ACL test was skipped" >&2
+    fi
+else
+    skip_note "the reset-cache ACL test (needs root and setfacl)"
+fi
+
+# NRV-B1202: ci_normalize and ci_job_dir act on a job's own tree as the job's user, never as root:
+# a root step whose job user is unset or root refuses (a bug in the caller), and touches nothing.
+if [ "$(id -u)" = 0 ]; then
+    r=$(attack_tree b1202)
+    ci_as touch "$r/main/zig/h"
+    for who in unset root; do
+        if [ "$who" = unset ]; then envv=(env -u CI_JOB_USER); else envv=(env CI_JOB_USER=root); fi
+        refuses NRV-B1202 "ci_normalize as root with the job user $who" "${envv[@]}" bash -c '. ci/cache.sh; ci_normalize "$1"' _ "$r/main/zig"
+        refuses NRV-B1202 "ci_job_dir as root with the job user $who" "${envv[@]}" bash -c '. ci/cache.sh; ci_job_dir "$1"' _ "$r/main/zig/sub"
+    done
+    is "ci_normalize and ci_job_dir refused as root touched nothing" "yes no" "$([ -e "$r/main/zig/h" ] && echo yes) $([ -e "$r/main/zig/sub" ] && echo yes || echo no)"
+    ok "ci_normalize with the job user set" env CI_JOB_USER="$jobuser" bash -c '. ci/cache.sh; ci_normalize "$1"' _ "$r/main/zig"
+else
+    skip_note "NRV-B1202 (root with an unset job user)"
+fi
+
+# NRV-E1208 for the two knobs a root step passes to timeout(1) and flock -w: a whole number of
+# seconds, 1 or more. A zero would be no limit (timeout) or no wait (flock), and an expression an
+# error from a tool run as root.
+r=$(attack_tree knobs)
+for bad in 0 abc '1;touch x' -5 1.5 ' 3' 9999999; do
+    refuses NRV-E1208 "CI_NORMALIZE_SECONDS='$bad'" env CI_NORMALIZE_SECONDS="$bad" CI_JOB_USER="$jobuser" bash -c '. ci/cache.sh; ci_normalize "$1"' _ "$r/main/zig"
+    refuses NRV-E1208 "CI_CHILD_LOCK_WAIT='$bad'" env CI_CHILD_LOCK_WAIT="$bad" CI_JOB_USER="$jobuser" bash -c '. ci/cache.sh; ci_child_make "$1"' _ "$r/main/zig-new"
+done
+is "a refused knob made nothing" no "$([ -e "$r/main/zig-new" ] && echo yes || echo no)"
+ok "CI_NORMALIZE_SECONDS=5 is accepted" env CI_NORMALIZE_SECONDS=5 CI_JOB_USER="$jobuser" bash -c '. ci/cache.sh; ci_normalize "$1"' _ "$r/main/zig"
+ok "CI_CHILD_LOCK_WAIT=5 is accepted" env CI_CHILD_LOCK_WAIT=5 CI_JOB_USER="$jobuser" bash -c '. ci/cache.sh; ci_child_make "$1"' _ "$r/main/zig-new"
 
 # Lock files a prune makes are the step's own, 0600 (they used to be 0644 by root's umask, and a
 # job that could list a 0755 lock directory could take them), and a lock directory with any group

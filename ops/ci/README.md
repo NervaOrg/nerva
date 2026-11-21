@@ -379,8 +379,10 @@ set:
    result is judged by what the walk leaves, not by `find`'s exit status, which is 1 when another
    job removes an entry during the walk. **Accepted limit:** damage to the content below those names
    (a corrupt cache file, a file where Zig expects a cache subdirectory) is the job's own: it fails the
-   builds that read it, never a root operation, and clears with the branch's 7-day prune, or at once with
-   `bash ci/nerva-woodpecker.sh reset-cache main|BRANCH` on the host (takes the same locks; NRV-E1235 if the cache root is not safe or pipelines hold a lock for `NERVA_CI_RESET_WAIT` seconds, default 60). The making of a
+   builds that read it, never a root operation. A branch's prune removes only a branch idle for 7 days, so a
+   cache builds keep using is cleared only at once, with `bash ci/nerva-woodpecker.sh reset-cache main|jepsen|BRANCH|--branch BRANCH`
+   on the host: main's cache has no prune, a manual pipeline uses `b-main-<sum>` (`--branch main`), and `jepsen/` has none either. It takes the same locks, moves the
+   children into `locks/trash` and empties the trash after releasing them, so a step is never held for the removal (host and the next reset remove a leftover trash; NRV-E1235 if the cache root is not safe, has an ACL, or pipelines hold a lock for `NERVA_CI_RESET_WAIT` seconds, default 60). A reset racing a main step never gives that step NRV-E1228. The making of a
    child by root runs under `<root>-children.lock`, so concurrent steps never refuse each other; a step
    waits `CI_CHILD_LOCK_WAIT` (30 s) for it, then NRV-E1234. A direct child that the job owns and cannot use,
    whatever its type, is reset by root (3); one another user owns is NRV-E1228 and never touched,

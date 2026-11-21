@@ -46,11 +46,16 @@
 # before the next job runs. What they do not (the accepted limit, decision O4, nineteenth
 # review): content damage below those names is the job's own, such as a corrupt cache file or a
 # file a job leaves where a Zig cache subdirectory (zig-local/o/<hash>) is expected. It makes the
-# builds that read it fail, never a root operation, and clears when the cache is removed: for a
-# branch, by the 7-day prune; for any cache, at once, by `nerva-woodpecker.sh reset-cache
-# main|<branch>` on the host (it takes the same locks). Concurrent steps never refuse each
-# other: root's make of a child runs under <root>-children.lock (root-only, in locks/) and a
-# step that finds a root-owned directory waits on it for the owner change (NRV-E1234 on timeout).
+# builds that read it fail, never a root operation, and clears when the cache is removed. The
+# 7-day prune removes only an IDLE branch cache (every step of a branch touches its directory, so
+# a branch that keeps running keeps it); main's and jepsen's caches are never pruned by age
+# (main's only when the disk is low). At once, on the host, `nerva-woodpecker.sh reset-cache`
+# removes main's (`main`), a branch's (`BRANCH`, or `--branch NAME`, which reaches a manual
+# pipeline on main: it runs in the branch role, key b-main-<sum>) or jepsen's tools (`jepsen`),
+# under the same locks. Concurrent steps never refuse each other: root's make of a child runs
+# under <root>-children.lock (root-only, in locks/) and a step that finds a root-owned
+# directory waits on it for the owner change (NRV-E1234 on timeout). A main step holds main's
+# lock shared from before its first probe (ci_main_prepare), so a reset never falls in the middle.
 #
 # What root does inside a mount root, in all: mkdir, chown (-h), mktemp -d, mv -T of a partial
 # directory, rm -rf --one-file-system and rm -f of a name that is a DIRECT child, and, on a mount
@@ -90,6 +95,30 @@ ci_cache_writable() {
 # ci_job_uid: the job's user's uid ($CI_JOB_USER, default: this user).
 ci_job_uid() {
     id -u "${CI_JOB_USER:-$(id -un)}"
+}
+
+# ci_job_not_root WHO: NRV-B1202 when this process is root and the job's user is root too (no
+# $CI_JOB_USER, or root): what ci_normalize and ci_job_dir do "as the job" would then be done as
+# root, through paths the job controls (a link it planted, a chmod or an rm -rf that follows it).
+# Every caller that runs as root sets CI_JOB_USER (ci/woodpecker_step.sh does).
+ci_job_not_root() {
+    if [ "$(id -u)" = 0 ] && [ "$(ci_job_uid)" = 0 ]; then
+        ci_error "NRV-B1202: $1 would run as root: it acts on a job's own tree and must run as the job's user, but this step is root and CI_JOB_USER is ${CI_JOB_USER:-unset} (a bug in the script that called it: set CI_JOB_USER)"
+        return 1
+    fi
+}
+
+# ci_knobs_check: NRV-E1208 when CI_NORMALIZE_SECONDS or CI_CHILD_LOCK_WAIT, if set, is not a whole
+# number of seconds (1 or more). They go to timeout(1) and flock -w, where 0 means no limit or no
+# wait, and anything else is an error from a root step's tool.
+ci_knobs_check() {
+    local n
+    for n in CI_NORMALIZE_SECONDS CI_CHILD_LOCK_WAIT; do
+        [ -z "${!n:-}" ] || [[ "${!n}" =~ ^[1-9][0-9]{0,5}$ ]] || {
+            ci_error "NRV-E1208: $n='${!n}' is not a whole number of seconds (1 or more)"
+            return 1
+        }
+    done
 }
 
 # ci_job_usable DIR: whether the job's user can use DIR as a directory it makes things in: writable
@@ -182,8 +211,11 @@ ci_known_dirs() {
 # ci_normalize DIR: rule 3. As the job's user, over DIR, a directory of its own (never a link; the
 # caller tests that), in four steps:
 #  1. the modes: every directory gets u+rwx (find acts on a directory before it enters it, so a
-#     chmod 0000 one is opened up and then searched), a file without u+rw gets it (a read-only
-#     manifest breaks Zig's next write), a FIFO or socket is removed. find runs with
+#     chmod 0000 one is opened up and then searched: that chmod is `-exec ... \;`, one per
+#     directory, as `-exec ... +` would run it only after find had failed to enter the directory),
+#     a file without u+rw gets it (a read-only manifest breaks Zig's next write), a FIFO or socket
+#     is removed; files and FIFOs go to chmod and rm in batches (`+`: 20 000 files at mode 0400
+#     took 26.7 s with a fork each). find runs with
 #     -ignore_readdir_race, and its exit status is never the verdict: other jobs of the same key
 #     churn the tree while this walks it (Zig makes tmp/<x> and renames it into o/ all the time),
 #     and GNU find exits 1 when an entry vanishes mid-walk (the option covers an entry that goes
@@ -197,12 +229,18 @@ ci_known_dirs() {
 #     per call; "not supported" on a file system without ACLs is no failure).
 #  4. the verdict: every known name is a directory (no link) or not there.
 # What it does NOT promise: the content and the type of anything deeper (a file where Zig expects
-# a directory below o/ or z/, a corrupt manifest): that is the job's own damage, cleared by the
-# branch's prune in 7 days or at once by `nerva-woodpecker.sh reset-cache`. Bounded by
-# CI_NORMALIZE_SECONDS (default 600): a tree it cannot get through in that time counts as failed,
-# and is reset by the caller. NRV-E1233 without setfacl.
+# a directory below o/ or z/, a corrupt manifest): that is the job's own damage. It clears when
+# the cache is removed: by the branch's prune once the branch has been idle for 7 days (every
+# step of a branch touches its directory, so a branch that keeps running is never pruned), or at
+# once by `nerva-woodpecker.sh reset-cache` (main, a branch, a manual pipeline on main with
+# `--branch main`, or jepsen). Bounded by CI_NORMALIZE_SECONDS (default 600, a whole number of
+# seconds, NRV-E1208 otherwise): a tree it cannot get through in that time counts as failed, and
+# is reset by the caller. NRV-E1233 without setfacl. Never run as root with the job's user unset
+# or root (NRV-B1202).
 ci_normalize() {
     local d="$1" known=()
+    ci_job_not_root ci_normalize || return 1
+    ci_knobs_check || return 1
     command -v setfacl >/dev/null || {
         ci_error "NRV-E1233: setfacl is not installed, so the ACLs of $d cannot be removed (the acl package: ci/woodpecker_step.sh installs it)"
         return 1
@@ -212,8 +250,8 @@ ci_normalize() {
         d=$1
         shift
         err=$(find "$d" -ignore_readdir_race -xdev \( -type d ! -perm -u=rwx -exec chmod u+rwx -- {} \; \) -o \
-            \( -type f ! -perm -u=rw -exec chmod u+rw -- {} \; \) -o \
-            \( \( -type p -o -type s \) -exec rm -f -- {} \; \) 2>&1 >/dev/null) || true
+            \( -type f ! -perm -u=rw -exec chmod u+rw -- {} + \) -o \
+            \( \( -type p -o -type s \) -exec rm -f -- {} + \) 2>&1 >/dev/null) || true
         printf "%s\n" "$err" | grep -v -e "No such file or directory" -e "^$" >&2 || true
         for p in "$@"; do
             q=$d/$p
@@ -238,6 +276,7 @@ ci_normalize() {
 ci_children_locked() {
     local p="$1" f
     shift
+    ci_knobs_check || return 1
     f="$(dirname -- "$(dirname -- "$p")")/locks/$(basename -- "$(dirname -- "$p")")-children.lock"
     (
         ci_lock_file "$f" || exit 1
@@ -461,6 +500,7 @@ ci_as_job() {
 # directory the job cannot remove or make (another user's: root makes none of these) is NRV-E1228.
 ci_job_dir() {
     local p was
+    ci_job_not_root ci_job_dir || return 1
     for p in "$@"; do
         if [ -e "$p" ] || [ -L "$p" ]; then
             if [ -L "$p" ] || [ ! -d "$p" ] || ! ci_job_usable "$p"; then
@@ -585,6 +625,16 @@ ci_branch_prepare() {
     # first (a second descriptor's exclusive lock would wait for it), and taken again after. If
     # another job of the branch holds it, nothing is removed and NRV-E1228 (or E1214) says so below.
     rc=0
+    if [ -d "$dir" ] && [ ! -L "$dir" ] && [ "$(stat -c %u -- "$dir" 2>/dev/null)" = "$(ci_job_uid)" ]; then
+        # The job's own directory is there, so nothing is seeded: the probe (the job's walk of the
+        # tree, bounded by CI_NORMALIZE_SECONDS, minutes for a poisoned one) needs neither the
+        # branches' lock (fd 7) nor main's (fd 9, the caller's), and holding them across it would
+        # stall every other branch's step (NRV-W1202) and main's prune. Our own shared lock (fd 6)
+        # keeps every prune off this directory. A directory that then must be reset starts empty:
+        # the seed needs main's lock, which is not held any more (the branch refills it).
+        [ "$locked" != yes ] || { flock -u 7; locked=no; }
+        flock -u 9 2>/dev/null || true
+    fi
     ci_child_probe "$dir" || rc=$?
     if [ "$rc" = 11 ]; then
         flock -u 6
@@ -681,17 +731,24 @@ ci_main_prune() {
 # the lock file (ours, 0600) and its fd 9, the prune (when LOW is yes), and only then main's
 # directories (zig, zig-local, tools), direct children of main/, which is root's (rule 1): made and
 # chowned to USER by root, or reset by root if USER's and unusable (ci_child_ensure). The prune
-# removes main/zig and main/zig-local, so the directories come after it. The caller takes its
-# shared lock (flock -s 9) after this returns.
+# removes main/zig and main/zig-local, so the directories come after it. Main's lock is held
+# SHARED from before the first probe to the return (the caller takes it again, which is no
+# change): `reset-cache main` takes it exclusively and removes zig and zig-local, so a probe, a
+# normalization or a make that ran without it could meet a directory that vanished (NRV-E1228).
+# Exclusive only for a reset below (the lock is converted, which loses the shared one if that
+# fails, so every probe takes the shared one again first), and for the prune above.
 ci_main_prepare() {
     local root="$1" CI_JOB_USER="$2" low="$3" min="$4" p
     ci_main_lock_open "$root" || return 1 # root's, in the lock directory a job cannot write
     [ "$low" = no ] || { echo "Below $min GiB free"; ci_main_prune "$root" "$min"; }
     # Rule 2 for main's direct children: one the job owns and cannot use, of any type, is removed
-    # under main's exclusive lock (what the prune takes; held already if it ran; waits as the prune
-    # does) and made again by root with a chown (NRV-W1204); one that is missing is made; another
-    # user's is refused (NRV-E1228). The job's tree below them is normalized by ci_child_probe.
+    # under main's exclusive lock (what the prune takes; waits as the prune does) and made again by
+    # root with a chown (NRV-W1204); one that is missing is made; another user's is refused
+    # (NRV-E1228). The job's tree below them is normalized by ci_child_probe. Lock order: main's
+    # lock, then the children lock (ci_child_probe, ci_child_make), as `reset-cache` takes them.
     for p in zig zig-local tools; do
+        ci_shared_lock || return 1
         ci_child_ensure "$root/main/$p" "$root/main" flock -x -w "${CI_PRUNE_WAIT:-5}" 9 || return 1
     done
+    ci_shared_lock
 }
