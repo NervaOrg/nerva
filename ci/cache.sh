@@ -46,7 +46,10 @@
 #     (ci_step_finish), so a big tree goes down a bounded time at a time (NRV-W1205 while some is
 #     left). It is not detached: a Woodpecker step's container, and every process in it, is removed
 #     when the step ends (worklog/O4.md, twenty-second review). A
-#     branch's size is measured by its own step after the locks, before and after its job
+#     branch's size is measured by its own step after the locks, before and after its job (the bound
+#     is per branch, for what the branch's own steps wrote by the time they finished: a process a
+#     job left behind, or a job writing into another branch's cache, is not seen until the next
+#     measure, and the low-disk prune of every idle cache is the backstop)
 #     (ci_branch_measure, a record in locks/<key>.size, written whole to a mktemp file and renamed; a
 #     du that outlasts CI_BRANCH_DU_SECONDS counts as over every bound), so the prune reads records
 #     and walks nothing. Accepted: the seed's cp -a of main/zig/p runs under the
@@ -135,12 +138,12 @@ ci_job_not_root() {
 }
 
 # ci_knobs_check: NRV-E1208 when CI_NORMALIZE_SECONDS, CI_CHILD_LOCK_WAIT, CI_BRANCH_DU_SECONDS,
-# CI_TRASH_SECONDS or CI_MIN_FREE_INODES, if set, is not a whole number (1 or more, at most six digits). The seconds go
+# CI_TRASH_SECONDS, CI_TRASH_TAIL_SECONDS or CI_MIN_FREE_INODES, if set, is not a whole number (1 or more, at most six digits). The seconds go
 # to timeout(1) and flock -w, where 0 means no limit or no wait, and anything else is an error from
 # a root step's tool; the inode threshold is compared as a number.
 ci_knobs_check() {
     local n
-    for n in CI_NORMALIZE_SECONDS CI_CHILD_LOCK_WAIT CI_BRANCH_DU_SECONDS CI_TRASH_SECONDS CI_MIN_FREE_INODES; do
+    for n in CI_NORMALIZE_SECONDS CI_CHILD_LOCK_WAIT CI_BRANCH_DU_SECONDS CI_TRASH_SECONDS CI_TRASH_TAIL_SECONDS CI_MIN_FREE_INODES; do
         [ -z "${!n:-}" ] || [[ "${!n}" =~ ^[1-9][0-9]{0,5}$ ]] || {
             ci_error "NRV-E1208: $n='${!n}' is not a whole number (1 or more, at most six digits; seconds, or inodes for CI_MIN_FREE_INODES)"
             return 1
@@ -336,7 +339,7 @@ ci_trash_move() {
     return 1
 }
 
-# ci_trash_empty MOUNT: removes whatever is in MOUNT/.trash (ci_trash_move's; a crashed step's
+# ci_trash_empty MOUNT [SECONDS]: removes whatever is in MOUNT/.trash (ci_trash_move's; a crashed step's
 # included): rm -rf --one-file-system of each direct child, never following a link (GNU rm walks
 # fd-relative; the trash is root's 0700, so no job can swap a name in it). Called with no lock held
 # that another step waits on. AT MOST ONE REMOVAL OF A MOUNT'S TRASH RUNS AT A TIME, AND NO OTHER
@@ -353,9 +356,11 @@ ci_trash_move() {
 # `..`, not its cwd), so the removal is tried twice inside the bound; if the trash is still not
 # empty, NRV-W1205 and a later step removes what is left. The lock is held by the descriptor the
 # removal inherits, so it is let go when the removal ends or is cut off (timeout signals the whole
-# group), never before.
+# group), never before. SECONDS replaces CI_TRASH_SECONDS for this call: the post-job tail
+# (ci_step_finish) passes CI_TRASH_TAIL_SECONDS (default 300), as nothing waits on it (review
+# 6004317640).
 ci_trash_empty() {
-    local t="$1/.trash" lk
+    local t="$1/.trash" lk secs="${2:-${CI_TRASH_SECONDS:-20}}"
     [ -d "$t" ] && [ ! -L "$t" ] && [ "$(stat -c %u -- "$t")" = "$(id -u)" ] || return 0
     ci_knobs_check || return 0
     [ -n "$(find "$t" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ] || return 0
@@ -365,15 +370,30 @@ ci_trash_empty() {
         { exec 3>>"$lk"; } 2>/dev/null || exit 0
         flock -n 3 || exit 0 # another step is removing: skip it, never wait
         rc=0
-        timeout "${CI_TRASH_SECONDS:-20}" sh -c '
+        timeout "$secs" sh -c '
             for n in 1 2; do
                 find "$1" -mindepth 1 -maxdepth 1 -exec rm -rf --one-file-system -- {} + 2>/dev/null || true
                 [ -n "$(find "$1" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ] || exit 0
             done
             exit 1
         ' _ "$t" || rc=$?
-        [ "$rc" = 0 ] || ci_warning "NRV-W1205: $t was not emptied in ${CI_TRASH_SECONDS:-20} s (a big tree, a job still writing in a tree moved there, or a mount inside it): what is left is out of the jobs' reach by path, and a later step removes it, a bounded time at a time"
+        [ "$rc" = 0 ] || ci_warning "NRV-W1205: $t was not emptied in $secs s (a big tree, a job still writing in a tree moved there, or a mount inside it): what is left is out of the jobs' reach by path, and a later step removes it, a bounded time at a time"
     )
+}
+
+# ci_trash_pending ROOT: whether the trash of main/ or of branches/ under the cache root ROOT has
+# anything in it (a step's prune or reset moved it there, and a removal is going down a bounded
+# time at a time). The blocks and inodes of those names still count as used, so a disk-low test
+# taken now sees space that is already coming back as short: every step would then prune fresh
+# caches into the trash, main's `zig` and `zig-local` and, through CI_BRANCH_PRUNE_ALL, every idle
+# branch (review 6004317640). The low-disk prunes (ci_main_prune, ci_branch_prepare) do not prune
+# while this is true. A trash that never empties (NRV-W1205 again and again) is what to look at.
+ci_trash_pending() {
+    local m
+    for m in main branches; do
+        [ ! -d "$1/$m/.trash" ] || [ -L "$1/$m/.trash" ] || [ -z "$(find "$1/$m/.trash" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ] || return 0
+    done
+    return 1
 }
 
 # ci_children_locked PATH CMD...: runs CMD (a command or one of these functions) holding the
@@ -678,7 +698,10 @@ ci_branch_size() {
 # LOCKS/KEY.size (root's, in the lock directory). Called with the branches' lock let go and only
 # the key's own (shared) held, so the walk stalls nobody, and bounded (ci_dir_gib: a timeout is
 # recorded as over every bound). It runs twice per step: before the job (ci_branch_prepare) and
-# after it (ci_step_finish), as the job is what grows the tree. The next prune, or the next step
+# after it (ci_step_finish), as the job is what grows the tree. The bound is PER BRANCH, for what
+# the branch's own steps wrote by the time they finished: the post-job measure does not see a
+# process a job left behind that writes after it, nor a job that writes into another branch's
+# cache; the low-disk prune of every idle cache (CI_BRANCH_PRUNE_ALL) is the backstop. The next prune, or the next step
 # of this branch, reads the number under the lock and drops a cache that is over the bound. The
 # record is written whole to a file of mktemp's making in LOCKS and renamed: a fixed temporary
 # name would be shared by the 16 steps of a push, which write at the same moment, and two writers
@@ -692,15 +715,17 @@ ci_branch_measure() {
 
 # ci_step_finish ROLE CACHE BRANCH_DIR: what a step does after its job, in its own tail, as root.
 # In a branch's role the size is measured again (fd 6, the key's shared lock, is held; no lock a
-# step waits on is), so the bound on a branch's cache sees what this run wrote. Then what the
-# step's prune or reset moved aside is removed, a bounded time (ci_trash_empty). Never fails.
+# step waits on is), so the bound on a branch's cache sees what this run's steps wrote by then. Then what the
+# step's prune or reset moved aside is removed, a bounded time (ci_trash_empty), CI_TRASH_TAIL_SECONDS
+# (default 300; NRV-E1208) and not the short CI_TRASH_SECONDS, because nothing waits on the tail.
+# Never fails.
 ci_step_finish() {
     local role="$1" cache="$2" dir="$3"
     if [ "$role" = branch ]; then
         if [ -n "$dir" ] && [ -d "$dir" ]; then ci_branch_measure "$cache/locks" "$(basename -- "$dir")" "$dir"; fi
-        ci_trash_empty "$cache/branches"
+        ci_trash_empty "$cache/branches" "${CI_TRASH_TAIL_SECONDS:-300}"
     else
-        ci_trash_empty "$cache/main"
+        ci_trash_empty "$cache/main" "${CI_TRASH_TAIL_SECONDS:-300}"
     fi
     return 0
 }
@@ -800,7 +825,11 @@ ci_branch_prepare() {
     maxdays="${CI_BRANCH_CACHE_DAYS:-7}"
     maxgib="${CI_BRANCH_CACHE_MAX_GIB:-12}"
     seedgib="${CI_BRANCH_SEED_MAX_GIB:-6}"
-    [ "${CI_BRANCH_PRUNE_ALL:-}" != 1 ] || maxn=0
+    # The low-disk prune of every idle cache is not made while a trash is draining: its blocks and
+    # inodes are what made the disk look low (ci_trash_pending).
+    if [ "${CI_BRANCH_PRUNE_ALL:-}" = 1 ]; then
+        if ci_trash_pending "$root"; then echo "branch caches: a trash is being emptied, space is coming back: not pruning them all" >&2; else maxn=0; fi
+    fi
     # The size of main's package cache decides whether this branch is seeded from it. It is
     # measured here, before the branches' lock: a walk of a tree under that lock would stall every
     # other branch's step (the design rule at the top). Only a branch with no directory yet needs it.
@@ -952,6 +981,8 @@ ci_main_prune() {
     flock -x -w "$wait" 9 && got=yes
     if ! ci_disk_low "$root/main" "$min"; then
         echo "main's cache: space is free again, not pruning"
+    elif ci_trash_pending "$root"; then
+        echo "main's cache: a trash is being emptied, space is coming back, not pruning"
     elif [ "$got" = yes ]; then
         echo "emptying main's Zig caches (no other job holds them)"
         for p in zig zig-local; do # a link there is moved as the link, not followed

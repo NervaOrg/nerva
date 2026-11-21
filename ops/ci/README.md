@@ -264,8 +264,8 @@ runs `ci/woodpecker_step.sh <job>` in a pinned `ubuntu:24.04` image. That script
 base packages, skips a docs-only push (`ci/changes.sh`), and runs the job as an unprivileged
 user `ci` under a timeout (75 minutes, 330 for the long searches; `CI_STEP_MINUTES` replaces it for a
 run, and a job that passes it fails NRV-E1215). In `check-scripts` the step first runs
-`ci/ci_test.sh` as root under a bound of its own, 10 minutes (`CI_SCRIPTS_TEST_MINUTES` replaces it,
-a whole number of minutes, else NRV-E1208; it takes about a minute), so a hung test does not use
+`ci/ci_test.sh` as root under a bound of its own, 20 minutes (`CI_SCRIPTS_TEST_MINUTES` replaces it,
+a whole number of minutes, else NRV-E1208; it takes about 4 to 5 minutes as root), so a hung test does not use
 the job's whole limit; the job then runs with `CI_SCRIPTS_TESTED=1` and the step fails if either
 failed. The suite ignores the step's `CI_*` variables (a low disk sets `CI_BRANCH_PRUNE_ALL`; a
 pipeline variable may set the rest); ci.yml's are 30 to 60, but here
@@ -374,11 +374,17 @@ set:
       time**: `ci_trash_empty` takes the root-only `locks/<mount>-trash.lock` with `flock -n`, and a
       step that does not get it skips the removal and goes on, so no step waits for another's removal.
       The step that does get it is held for the removal, at most `CI_TRASH_SECONDS` (default 20) before
-      its job and again after it (NRV-W1205 if some is left: the next one goes on, a bounded time at a
-      time). It is not detached: Woodpecker removes a step's container, and every process in it, when
+      its job, and again after it for `CI_TRASH_TAIL_SECONDS` (default 300: nothing waits on the tail;
+      NRV-E1208 if it is not a whole number, like the other knobs) (NRV-W1205 if some is left: the next
+      one goes on, a bounded time at a time). While a mount's trash has anything in it, the low-disk
+      prunes (main's `zig` and `zig-local`, and the prune of every idle branch cache) do not run: its
+      blocks and inodes still count as used, and the space is already coming back. It is not detached: Woodpecker removes a step's container, and every process in it, when
       the step ends. A branch's size is measured after the locks, by its own step, before the job and
       again after it (`locks/<key>.size`, `du` bounded by `CI_BRANCH_DU_SECONDS`; a timeout counts as
-      over every bound), so the prune reads records and walks nothing. The disk-low test also watches inodes
+      over every bound), so the prune reads records and walks nothing. The bound is per branch, for what
+      the branch's own steps wrote by the time they finished: a process a job left behind that writes
+      after the measure, or a job writing into another branch's cache, is not seen until a later
+      measure, and the low-disk prune of every idle cache is the backstop. The disk-low test also watches inodes
       (`CI_MIN_FREE_INODES`, default 100000), as a job's empty files cost no blocks. "No job can reach
       the trash" is true by path; a job that already had a directory open when it was moved can still
       write in it until the trash is emptied.

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Table test for the CI scripts' own refusals and cache rules (NRV-E1201 to E1232, NRV-B1201,
-# NRV-W1201 to W1204, docs/ERRORS.md; decision O4). Needs flock and jq. Takes about a minute;
+# NRV-W1201 to W1204, docs/ERRORS.md; decision O4). Needs flock and jq. Takes about 4 to 5 minutes as root (about 3.5 as another user);
 # touches only a scratch directory. Not covered, as they need a Woodpecker step or a daemon:
 # NRV-E1203 (the Docker socket is not mounted), NRV-E1209 and E1210 (Jepsen), the io_uring check on
 # a real refusing daemon, woodpecker-bootstrap.sh's NRV-E1213 (its preflight wants root on Ubuntu
@@ -882,7 +882,8 @@ touch "$c/locks/main.lock"
     . ci/cache.sh
     exec 9<"$c/locks/main.lock"
     CI_PRUNE_WAIT=1 ci_main_prune "$c" 99999999
-)
+) >/dev/null
+(. ci/cache.sh; ci_trash_empty "$c/main") # the next prunes measure a trash that is empty (a draining one is (e2))
 is "main pruned when idle (the directories are made again by ci_main_prepare)" no "$([ -e "$c/main/zig-local" ] && echo yes || echo no)"
 mkdir -p "$c/main/zig-local"
 echo x >"$c/main/zig-local/entry"
@@ -2354,8 +2355,40 @@ ci_as touch "$r/main/zig/f"
 out=$(PATH="$fakedf_dir:$PATH" IT=1000000 IF=500000 CI_PRUNE_WAIT=1 bash -c '. ci/cache.sh; ci_main_lock_open "$1" && ci_main_prune "$1" 0' _ "$r" 2>&1)
 is "inodes plentiful: not pruned" "yes yes" "$(grep -q "space is free again" <<<"$out" && echo yes) $([ -e "$r/main/zig/f" ] && echo yes)"
 
+# (e2) A trash that is still draining makes the box look low (its blocks and inodes count as
+# used): the low-disk prunes do not run then, or every step would move fresh caches into the trash
+# (review 6004317640). The rm that empties the trash is a stub that fails, so the trash stays; df
+# says the box is low. Two main prepares: main/zig survives both; two branch prepares with
+# CI_BRANCH_PRUNE_ALL=1: an idle branch's cache survives both.
+mkdir -p "$tmp/stubs/norm"
+chmod 755 "$tmp/stubs/norm"
+printf '#!/bin/sh\nexit 1\n' >"$tmp/stubs/norm/rm"
+chmod 755 "$tmp/stubs/norm/rm"
+r=$(attack_tree draining)
+ci_as touch "$r/main/zig/f"
+(. ci/cache.sh; ci_trash_ready "$r/main") && mkdir "$r/main/.trash/left-over"
+for n in 1 2; do
+    out=$(PATH="$tmp/stubs/norm:$fakedf_dir:$PATH" IT=1000000 IF=5 bash -c '. ci/cache.sh; CI_PRUNE_WAIT=1 ci_main_prepare "$1" "$2" yes 0 2>&1 && echo RC0' _ "$r" "$jobuser" || true)
+    is "a draining trash, box low: main prepare $n does not prune main/zig" "yes yes yes" "$([ -e "$r/main/zig/f" ] && echo yes) $(grep -q "a trash is being emptied" <<<"$out" && echo yes) $(grep -q RC0 <<<"$out" && echo yes)"
+done
+r=$(attack_tree draining-b)
+mkdir -m 0700 "$r/branches/.trash"
+mkdir -m 0700 "$r/branches/.trash/left-over"
+mk_branch "$r/branches/b-idle-00000003"
+for n in 1 2; do
+    out=$(PATH="$tmp/stubs/norm:$PATH" CI_BRANCH_PRUNE_ALL=1 bash -c '. ci/cache.sh; CI_JOB_USER=$1 CI_LOCK_WAIT=2 ci_branch_prepare "$2" feature/atk 2>&1 && echo RC0' _ "$jobuser" "$r" || true)
+    is "a draining trash, prune-all: branch prepare $n keeps the idle branch's cache" "yes yes" "$([ -d "$r/branches/b-idle-00000003" ] && echo yes) $(grep -q RC0 <<<"$out" && echo yes)"
+done
+r=$(attack_tree draining-c)
+mkdir -m 0700 "$r/branches/.trash"
+mk_branch "$r/branches/b-idle-00000003"
+out=$(PATH="$tmp/stubs/norm:$PATH" CI_BRANCH_PRUNE_ALL=1 bash -c '. ci/cache.sh; CI_JOB_USER=$1 CI_LOCK_WAIT=2 ci_branch_prepare "$2" feature/atk 2>&1 && echo RC0' _ "$jobuser" "$r" || true)
+is "no trash, prune-all: the idle branch's cache is dropped (the low-disk backstop works)" "no" "$([ -d "$r/branches/b-idle-00000003" ] && echo yes || echo no)"
+# The tail's bound is its own knob (NRV-E1208 like the others: see (f)); the default is 300.
+is "ci_step_finish empties for CI_TRASH_TAIL_SECONDS (default 300), not the short bound" "2" "$(grep -c 'ci_trash_empty "$cache/\(branches\|main\)" "${CI_TRASH_TAIL_SECONDS:-300}"' ci/cache.sh)"
+
 # (f) The two new knobs are validated as the others are (NRV-E1208): a whole number, 1 or more.
-for knob in CI_BRANCH_DU_SECONDS CI_TRASH_SECONDS CI_MIN_FREE_INODES; do
+for knob in CI_BRANCH_DU_SECONDS CI_TRASH_SECONDS CI_TRASH_TAIL_SECONDS CI_MIN_FREE_INODES; do
     for bad in 0 abc '1;touch x' -5 1.5 ' 3' 9999999; do
         refuses NRV-E1208 "$knob='$bad'" env "$knob=$bad" bash -c '. ci/cache.sh; ci_knobs_check'
     done

@@ -47,9 +47,10 @@ esac
 # CI_STEP_MINUTES (a pipeline variable) replaces it for a run.
 minutes="${CI_STEP_MINUTES:-$minutes}"
 [[ "$minutes" =~ ^[1-9][0-9]*$ ]] || { ci_error "NRV-E1208: CI_STEP_MINUTES='$minutes' is not a whole number of minutes"; exit 2; }
-# The scripts' own tests (check-scripts, run as root before the job) take about 20 seconds; a hang
-# there is bounded on its own, not by the job's whole limit. CI_SCRIPTS_TEST_MINUTES replaces it.
-test_minutes="${CI_SCRIPTS_TEST_MINUTES:-10}"
+# The scripts' own tests (check-scripts, run as root before the job) take about 4 to 5 minutes as
+# root (about 3.5 as another user); a hang there is bounded on its own (20 minutes, as ci.yml's job),
+# not by the job's whole limit. CI_SCRIPTS_TEST_MINUTES replaces it.
+test_minutes="${CI_SCRIPTS_TEST_MINUTES:-20}"
 [[ "$test_minutes" =~ ^[1-9][0-9]*$ ]] || { ci_error "NRV-E1208: CI_SCRIPTS_TEST_MINUTES='$test_minutes' is not a whole number of minutes"; exit 2; }
 
 export DEBIAN_FRONTEND=noninteractive
@@ -162,7 +163,7 @@ as_ci=(setpriv --reuid "$user" --regid "$user" --init-groups
 # The checkout is this commit's and nothing untrusted has run in this step yet, as for the scripts
 # above. Without CAP_SYS_ADMIN (this container's) their mount tests print a skip note. The job then
 # skips its own run of them (CI_SCRIPTS_TESTED), and the step fails if either failed. The tests
-# have a bound of their own, 10 minutes (CI_SCRIPTS_TEST_MINUTES).
+# have a bound of their own, 20 minutes (CI_SCRIPTS_TEST_MINUTES).
 # shellcheck disable=SC2034 # a nameref array: ci_step_run_with_tests reads it by name
 tests_cmd=(bash ci/ci_test.sh)
 # shellcheck disable=SC2034 # a nameref array, as above
