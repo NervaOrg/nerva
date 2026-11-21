@@ -23,7 +23,7 @@ seed=/var/cache/nerva-ci/main
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq docker.io docker-compose-v2 jq curl xz-utils fuse3 > /dev/null
+apt-get install -y -qq docker.io docker-compose-v2 jq curl xz-utils fuse3 acl iptables > /dev/null
 
 install -d -m 0755 /etc/docker
 install -m 0644 "$here/../docker/seccomp-io_uring.json" /etc/docker/seccomp-io_uring.json
@@ -44,8 +44,9 @@ curl -fsSL -m 600 -o "$zig_tar" "$ZIG_URL" || fail "NRV-E1242: the image was not
 got=$(sha256sum "$zig_tar" | cut -d ' ' -f 1)
 [ "$got" = "$ZIG_SHA256" ] || { rm -f "$zig_tar"; fail "NRV-E1242: the image was not built: the Zig archive has sha256 $got, not the pinned $ZIG_SHA256"; }
 
-# The cache directories (main is root's, 0755; branches and locks are made by the first job).
-bash "$here/../nerva-woodpecker.sh" host || fail "NRV-E1242: the image was not built: nerva-woodpecker.sh host failed on the build server"
+# The cache directories (main is root's, 0755; branches and locks are made by the first job). The build
+# server runs no agent: --no-agent skips the check for the agent container (NRV-E1216).
+bash "$here/../nerva-woodpecker.sh" host --no-agent || fail "NRV-E1242: the image was not built: nerva-woodpecker.sh host failed on the build server"
 
 # Make the next boot a new machine: no SSH host keys or login keys, no cloud-init state, no logs.
 apt-get clean

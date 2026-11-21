@@ -5,6 +5,8 @@
 #   `host` runs on the box, as root, from ~ (after `scp -r ops/ci root@BOX:`, which puts the
 #   directory at ~/ci/ on the box), on every agent box:
 #     bash ci/nerva-woodpecker.sh host
+#   `host --no-agent` skips the check for a running woodpecker-agent container: the cloud-agent
+#   snapshot's build server has no agent (decision O6, ops/ci/autoscaler/provision-image.sh).
 #   Checks Docker (and that its daemon carries the io_uring seccomp profile, which
 #   woodpecker-bootstrap.sh installs), /dev/fuse and /dev/kvm, and creates the cache directories
 #   under /var/cache/nerva-ci (main, branches, jepsen and locks: decision O4), all root-owned, mode
@@ -28,7 +30,12 @@ fail() { echo "nerva-woodpecker: FAIL $*" >&2; exit 1; }
 say() { echo "nerva-woodpecker: $*"; }
 
 host() {
-    local probe msg root dev modules n t
+    local probe msg root dev modules n t agent=yes
+    case "${1:-}" in
+    "") ;;
+    --no-agent) agent=no ;;
+    *) fail "NRV-E1221: usage: bash ci/nerva-woodpecker.sh host [--no-agent]" ;;
+    esac
     root="${NERVA_CI_CACHE_ROOT:-/var/cache/nerva-ci}"
     dev="${NERVA_CI_DEV:-/dev}"
     modules="${NERVA_CI_MODULES_DIR:-/etc/modules-load.d}"
@@ -38,7 +45,7 @@ host() {
         fail "NRV-E1213: $probe is missing: run it from a copy of ops/ci/ that has io_uring_probe.sh beside it (scp -r ops/ci root@BOX:, then bash ci/nerva-woodpecker.sh host)"
     command -v docker >/dev/null || fail "NRV-E1216: no docker: run ci/woodpecker-bootstrap.sh on this box first"
     docker info >/dev/null 2>&1 || fail "NRV-E1216: docker is installed but not running: systemctl status docker"
-    docker ps --format '{{.Names}}' | grep -q woodpecker-agent ||
+    [ "$agent" = no ] || docker ps --format '{{.Names}}' | grep -q woodpecker-agent ||
         fail "NRV-E1216: no woodpecker-agent container: run ci/woodpecker-bootstrap.sh (or its agent mode) first"
 
     # Jepsen's LazyFS mounts FUSE inside the node containers.
@@ -291,8 +298,8 @@ reset_cache() {
 }
 
 case "${1:-}" in
-host) host ;;
+host) host "${2:-}" ;;
 repo) repo "${2:-}" ;;
 reset-cache) shift; reset_cache "$@" ;;
-*) fail "NRV-E1221: usage: bash ci/nerva-woodpecker.sh host (on the box) | bash ci/nerva-woodpecker.sh reset-cache main|jepsen|BRANCH|--branch BRANCH (on the box) | bash ops/ci/nerva-woodpecker.sh repo OWNER/NAME (from the repository root)" ;;
+*) fail "NRV-E1221: usage: bash ci/nerva-woodpecker.sh host [--no-agent] (on the box) | bash ci/nerva-woodpecker.sh reset-cache main|jepsen|BRANCH|--branch BRANCH (on the box) | bash ops/ci/nerva-woodpecker.sh repo OWNER/NAME (from the repository root)" ;;
 esac
