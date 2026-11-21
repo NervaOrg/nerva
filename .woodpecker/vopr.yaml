@@ -13,6 +13,11 @@
 matrix:
   SEED: ['1', '2', '5', random]
 
+# Where it runs (decision O6): `tier: cloud`, a cloud agent or the box may take it (branch pushes only: vopr-main.yaml covers main).
+
+labels:
+  tier: cloud
+
 when:
   - event: push
     branch:

@@ -7,25 +7,21 @@
 # exclusive by `when:`, so a branch's pipeline never gets main's cache writable: the mount, not the
 # script, enforces it. Steps are not privileged; io_uring comes from the host Docker daemon's
 # seccomp profile (ops/ci/docker/README.md).
+# Where it runs (decision O6): this workflow is `tier: cloud`, so an on-demand Hetzner agent (ops/ci/autoscaler/)
+# or the box may take it. It never runs for a push to main: fuzz-smoke-main.yaml does, on the box, because only a push
+# to main may write the shared cache (decision O4) and the cloud agents' copy is thrown away with the server.
+
+labels:
+  tier: cloud
 
 when:
   - event: push
     branch:
-      exclude: ['jepsen/**']
+      exclude: [main, 'jepsen/**']
   - event: manual
     evaluate: 'NERVA_RUN == ""'
 
 steps:
-  - name: fuzzers (smoke) (main)
-    image: docker.io/library/ubuntu:24.04@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8
-    commands:
-      - ci/woodpecker_step.sh fuzz-smoke
-    when:
-      - event: push
-        branch: main
-    volumes:
-      - /var/cache/nerva-ci/main:/cache/main
-      - /var/cache/nerva-ci/locks:/cache/locks
   - name: fuzzers (smoke)
     image: docker.io/library/ubuntu:24.04@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8
     commands:

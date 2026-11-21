@@ -99,6 +99,9 @@ fi
 valid CI_AGENT_NAME '[A-Za-z0-9._-]+'
 valid CI_MAX_WORKFLOWS '[1-9][0-9]*'
 valid CI_KVM 'yes|no'
+# Extra agent labels (decision O6): on the CI box `CI_EXTRA_LABELS=tier=*` in ci.env lets it take workflows
+# of every tier. Optional; key=value pairs, comma separated.
+valid CI_EXTRA_LABELS '([A-Za-z0-9_-]+=[A-Za-z0-9_.*-]+(,[A-Za-z0-9_-]+=[A-Za-z0-9_.*-]+)*)?'
 if [ "$CI_KVM" = yes ] && [ ! -c /dev/kvm ]; then
     fail "CI_KVM=yes but /dev/kvm is missing (a cloud VM has none; use a dedicated server, or \
 turn on SVM/VT-x in the BIOS)"
@@ -269,6 +272,7 @@ fi
 # --- Compose files -------------------------------------------------------------------------------
 install -d -m 0755 "$opt"
 labels=kvm=false; [ "$CI_KVM" = no ] || labels=kvm=true
+[ -z "${CI_EXTRA_LABELS:-}" ] || labels="$labels,$CI_EXTRA_LABELS"
 new=$(mktemp); tmpfiles+=("$new")
 agent_yaml() { # agent_yaml SERVER [GRPC_SECURE]
     cat <<EOF

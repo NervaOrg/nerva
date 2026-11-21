@@ -8,6 +8,12 @@
 # enforces it. Steps are not privileged; io_uring comes from the host Docker daemon's
 # seccomp profile (ops/ci/docker/README.md).
 
+# Where it runs (decision O6): `tier: box`, only the CI box takes it (main, cron and manual runs, Jepsen and the long searches stay where
+# the caches and the Docker socket are).
+
+labels:
+  tier: box
+
 when:
   - event: manual
     evaluate: 'NERVA_RUN == "fuzz"'

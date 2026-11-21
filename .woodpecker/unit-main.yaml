@@ -1,0 +1,31 @@
+# Woodpecker, on the project's own machine (ops/ci/README.md, "Nerva on Woodpecker"). Pushes to any
+# branch of NervaOrg/nerva but jepsen/**, and manual runs without NERVA_RUN: never a pull request,
+# so never a fork's code (P147e; the repository's "Allow pull requests" is off as well). The
+# commands are ci/job.sh's, the same as ci.yml's job of the same name.
+# Caches (decision O4): a step for a push to main mounts main's cache writable and no branch's; any
+# other step mounts main's read-only and its own branches' directory writable. The two steps are
+# exclusive by `when:`, so a branch's pipeline never gets main's cache writable: the mount, not the
+# script, enforces it. Steps are not privileged; io_uring comes from the host Docker daemon's
+# seccomp profile (ops/ci/docker/README.md).
+# Where it runs (decision O6): this workflow is `tier: box`: only the CI box takes it, because a push to main
+# writes the shared cache (decision O4), and a cloud agent's copy of it is thrown away with the server.
+# unit.yaml runs every other event on the cloud agents; keep the two in step (ci/autoscaler_test.sh).
+
+labels:
+  tier: box
+
+when:
+  - event: push
+    branch: main
+
+steps:
+  - name: unit (main)
+    image: docker.io/library/ubuntu:24.04@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8
+    commands:
+      - ci/woodpecker_step.sh unit
+    when:
+      - event: push
+        branch: main
+    volumes:
+      - /var/cache/nerva-ci/main:/cache/main
+      - /var/cache/nerva-ci/locks:/cache/locks
