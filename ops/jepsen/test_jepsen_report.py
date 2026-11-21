@@ -1140,21 +1140,21 @@ class Nightly(unittest.TestCase):
 
     def test_the_lock_is_held_by_the_night_and_not_by_its_children(self):
         # The lock is held while run.sh runs, and run.sh (a child) has no fd 9, so an orphan
-        # cannot keep it.
+        # cannot keep it. flock locks belong to the open file description, so a fresh open of the
+        # lock file cannot take it while the night holds it (no inode numbers: overlayfs has none
+        # that match /proc/locks).
         probe = Path(self.tmp.name, "probe")
-        run = ("#!/bin/sh\nino=$(stat -c %i " + str(self.home) + "/nightly.lock)\n"
-               "holder=$(awk -v ino=$ino '$2==\"FLOCK\" {split($6,a,\":\"); if (a[3]==ino) print $5}'"
-               " /proc/locks)\n"
+        lock = self.home / "nightly.lock"
+        run = ("#!/bin/sh\n"
+               f"if flock -n {lock} true; then lock=free; else lock=held; fi\n"
                "fd=no; [ -e /proc/$$/fd/9 ] && fd=yes\n"
-               f"echo \"$holder $fd\" > {probe}\nexit 0\n")
+               f"echo \"$lock $fd\" > {probe}\nexit 0\n")
         Path(self.remote, "tests/jepsen/run.sh").write_text(run)
         self.git(self.remote, "add", "-A")
         self.commit(self.remote, "probe")
         done = self.night("--dry-run")
         self.assertEqual(done.returncode, 0, done.stderr)
-        holder, fd = probe.read_text().split()
-        self.assertTrue(holder.isdigit(), probe.read_text())
-        self.assertEqual(fd, "no")
+        self.assertEqual(probe.read_text().split(), ["held", "no"], probe.read_text())
 
     def test_a_second_night_cannot_start_while_the_lock_is_held(self):
         self.holding()
