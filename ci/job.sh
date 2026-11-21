@@ -87,8 +87,11 @@ check_scripts() {
 # The test classes of .github/scripts/test_package_repos.py in three shards of about 36 tests each
 # (decision O6). Each class is in exactly one shard: ci/autoscaler_test.sh reads this table and the
 # file's classes, and fails (NRV-E1244) on a class in none or in two, or a name that is not a class.
+# shellcheck disable=SC2034 # the three are read through ${!var} in check_packages
 package_shards_1="Ready Happy"
+# shellcheck disable=SC2034
 package_shards_2="Slice2b Parsing Roles"
+# shellcheck disable=SC2034
 package_shards_3="Bucket Publish"
 
 check_packages() {

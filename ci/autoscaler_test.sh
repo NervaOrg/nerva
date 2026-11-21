@@ -109,7 +109,7 @@ tool=autoscaler_test
     . "$as/lib.sh"
     exit 0
 ) || bad "lib.sh does not source"
-sf() { ( tool=test; export tool; . "$as/lib.sh"; secret_file "$@" ); }
+sf() { ( tool="test"; export tool; . "$as/lib.sh"; secret_file "$@" ); }
 refuses "missing token file" NRV-E1237 sf "$etc/hcloud.token" "the Hetzner API token"
 printf 'x\n' > "$etc/hcloud.token"
 chmod 0644 "$etc/hcloud.token"
@@ -296,7 +296,6 @@ done
 
 # --- The exit trap and the sweep (the stubs fail the build after its server exists) --------------------
 now=$(date -u +%Y-%m-%dT%H:%M:%S+00:00)
-old_server=91
 api_for_build
 printf '{"servers":[{"id":91,"created":"2020-01-01T00:00:00+00:00"},{"id":92,"created":"%s"}]}\n200' "$now" > "$STUB_API/GET__servers"
 printf '{"ssh_keys":[{"id":93,"created":"2020-01-01T00:00:00Z"},{"id":94,"created":"%s"}]}\n200' "$now" > "$STUB_API/GET__ssh_keys"
@@ -407,9 +406,16 @@ shard_table() { # prints "class shard" for each class named in the table
         for c in $(sed -n "s/^package_shards_$s=\"\(.*\)\"/\1/p" "${1:-ci/job.sh}"); do echo "$c $s"; done
     done
 }
-shards_ok() { # shards_ok TABLE_FILE: NRV-E1244 unless the table partitions the file's classes
+shards_ok() { # shards_ok TABLE_FILE [TEST_FILE]: NRV-E1244 unless the table partitions the test file's classes
     local classes table c count
-    classes=$(sed -n 's/^class \([A-Za-z0-9_]*\)(Base):.*/\1/p' .github/scripts/test_package_repos.py | sort)
+    # Every class with a test* method, whatever its bases (a mixin, unittest.TestCase itself, another class).
+    classes=$(python3 -I -c '
+import ast, sys
+for node in ast.parse(open(sys.argv[1]).read()).body:
+    if isinstance(node, ast.ClassDef) and any(isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef)) and f.name.startswith("test") for f in node.body):
+        print(node.name)
+' "${2:-.github/scripts/test_package_repos.py}" | sort)
+    [ -n "$classes" ] || { echo "NRV-E1244: no test classes found"; return 1; }
     table=$(shard_table "$1")
     for c in $classes; do
         count=$(awk -v c="$c" '$1 == c' <<< "$table" | wc -l)
@@ -420,6 +426,10 @@ shards_ok() { # shards_ok TABLE_FILE: NRV-E1244 unless the table partitions the 
     done
 }
 ok "the shards partition the package test classes" shards_ok ci/job.sh
+# A class that is not spelled `class X(Base):` is found too: a copy of the file with one such class added.
+cp .github/scripts/test_package_repos.py "$tmp/pkg_tests.py"
+printf '\nclass Extra(unittest.TestCase, object):\n    def test_x(self):\n        pass\n' >> "$tmp/pkg_tests.py"
+refuses "a class with other bases that is in no shard" NRV-E1244 shards_ok ci/job.sh "$tmp/pkg_tests.py"
 sed 's/^package_shards_3="Bucket Publish"/package_shards_3="Bucket"/' ci/job.sh > "$tmp/job_missing.sh"
 refuses "a class in no shard" NRV-E1244 shards_ok "$tmp/job_missing.sh"
 sed 's/^package_shards_3="Bucket Publish"/package_shards_3="Bucket Publish Happy"/' ci/job.sh > "$tmp/job_twice.sh"
