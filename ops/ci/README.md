@@ -502,6 +502,63 @@ the tree, with `/cache` present):
 CI_PIPELINE_EVENT=manual ci/woodpecker_step.sh check-code
 ```
 
+## Cloud agents: on-demand Hetzner servers (decision O6)
+
+Branch pipelines queued behind one box: `check-packages` alone took about 42 minutes on the loaded
+box. Workflows labelled `tier: cloud` can instead run on a dedicated-vCPU Hetzner server that exists
+only while work waits. The official `woodpecker-ci/autoscaler` (pinned by digest in
+`ops/ci/autoscaler/lib.sh`) creates it from a nightly snapshot and deletes it after it has been idle.
+The box stays the only place that runs `main`, cron, manual-with-`NERVA_RUN` and Jepsen workflows and
+the only one that writes the shared cache (`tier: box`; decision O6).
+
+**Routing.** Every `.woodpecker/*.yaml` has `labels: tier: cloud|box`. An agent takes a workflow only if it
+has all the workflow's labels. Cloud agents report `tier=cloud,kvm=false`; the box reports `tier=*`
+(`CI_EXTRA_LABELS=tier=*` in `/etc/woodpecker/ci.env`), so it takes both. A branch push or a manual run
+without `NERVA_RUN` runs `F.yaml` (cloud); a push to main runs `F-main.yaml` (box). `check-packages` is
+three cloud workflows, `check-packages-1`, `-2` and `-3` (by test class: `package_shards_N` in
+`ci/job.sh`), and `check-packages-main` (box, all of it).
+
+**Costs.** Hetzner bills by the hour per server while it exists. The cap (default 4) bounds the spend at
+`cap x hourly price x 24` a day even if everything goes wrong, and the idle timeout (10 minutes) ends an
+idle server. The snapshot costs its size per month (two are kept). Read the prices of CCX33 (8 dedicated
+vCPUs, 32 GB) and CCX43 (16, 64 GB) in the Hetzner console before choosing: they were not read from Hetzner
+when this was written.
+
+**One-time steps (the owner's; none has been run):**
+
+1. In the Hetzner Cloud console create a project that holds only CI. Under Security, API tokens, create a
+   token with Read & Write. Note the box's location (`fsn1`, `nbg1`, ...): the servers use it.
+2. In Woodpecker (your avatar, Personal access token) copy an admin's token. On the box:
+   ```bash
+   install -d -m 0755 /etc/nerva-ci
+   (umask 077; read -rs -p 'Hetzner token: ' t; printf '%s\n' "$t" > /etc/nerva-ci/hcloud.token; echo)
+   (umask 077; read -rs -p 'Woodpecker token: ' t; printf '%s\n' "$t" > /etc/nerva-ci/woodpecker.token; echo)
+   ```
+   Neither goes on a command line or into a file of the repository.
+3. Let the box take every tier: set `CI_EXTRA_LABELS=tier=*` in `/etc/woodpecker/ci.env` and rerun
+   `bash ci/woodpecker-bootstrap.sh` when no pipeline runs. **Do this before merging the change that
+   labels the workflows**, or no agent takes them.
+4. The cloud agents connect to the server's gRPC port (9000, over TLS through the same Caddy as remote
+   agents: section 4), so it must be reachable from the internet.
+5. Install: `NERVA_AS_SERVER=https://ci.botpike.com NERVA_AS_LOCATION=fsn1 NERVA_AS_MAX=4 bash ci/autoscaler/nerva-autoscaler.sh install`
+   (`NERVA_AS_SERVER_TYPE=ccx43` for bigger servers; `NERVA_AS_MAX` is the hard cap, 1 to 16;
+   `NERVA_AS_IDLE` defaults to 10m). Run it again to change one setting.
+6. Build the first snapshot (needs a finished pipeline on main, whose cache is the seed; about 15 minutes):
+   `/usr/local/lib/nerva-ci/nerva-autoscaler-image.sh build`. The timer then rebuilds it nightly and keeps two.
+7. `systemctl enable --now nerva-autoscaler.service`. `nerva-autoscaler.sh status` lists the servers.
+8. Watch the first branch pipeline: a server appears in the console within a minute and goes about 10
+   minutes after its last workflow. If `journalctl -u nerva-autoscaler` shows an unknown flag, the pin and
+   `run` disagree (NRV-E1240).
+
+To stop all spending: `systemctl disable --now nerva-autoscaler.service nerva-autoscaler-image.timer`, then
+delete any server labelled `nerva-ci-pool` and the snapshots in the console. The box (`tier=*`) takes the
+cloud workflows too, so nothing else changes.
+
+Secrets: the two token files are root's, mode 0600, and reach the autoscaler container as read-only
+mounted files (its `*_FILE` settings), never as variables, arguments or log lines; the snapshot script
+gives the Hetzner token to `curl` on standard input. The autoscaler registers one agent per server through
+the Woodpecker token and gives each server its own agent token in its user data.
+
 ## What was and was not tested
 
 - Both scripts pass `bash -n` and `shellcheck`.
@@ -516,6 +573,11 @@ CI_PIPELINE_EVENT=manual ci/woodpecker_step.sh check-code
   - Forgejo's SSH server, mirrors and dumps.
 
   The first run on a new box is the test. A `FAIL` line says what to fix.
+- Cloud agents (decision O6): `ci/autoscaler_test.sh` (in `check-scripts`) runs the scripts against stub
+  `docker` and `curl`: settings, secret files, the container's arguments, the cap warning, snapshot pruning,
+  the pins against `zig/download.sh` and the bootstrap, the tier labels and the package shards.
+  **Not run:** a real Hetzner project, the autoscaler itself, a snapshot build, a pipeline on the new
+  labels, the autoscaler 2.1.0's flags (NRV-E1240 checks them at install), and the timings.
 - Nerva's workflows, after decision O4 (no step privileged; main and branch caches):
   - **Run (in a scratch directory, by `ci/ci_test.sh`, in `check-scripts`):** every refusal of
     the `ci/` scripts but E1203, E1209 and E1210 (E1201 with a stand-in for the kernel's refusal; E1202 for a writable main cache in a branch's role and a
