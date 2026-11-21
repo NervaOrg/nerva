@@ -382,22 +382,27 @@ set:
       read-only and a main step has no `branches/`, so neither can empty or even see the other's trash:
       what the low-disk prunes (main's `zig` and `zig-local`, and the prune of every idle branch
       cache) wait for is state in `locks/`, which every step mounts and no job can write, never a trash's
-      contents: a removal running now on any of the three mounts (`flock -n` on
-      `locks/<mount>-trash.lock`, let go at once), or a marker `locks/<mount>-trash.pending` that
-      `ci_trash_move` touched less than `CI_TRASH_PENDING_MINUTES` (default 60; NRV-E1208) ago and no
-      drain has found empty since (a drain that empties or finds the trash empty removes it; one that
-      cannot leaves its age alone). An old marker holds nothing off, so a trash that nobody can empty,
-      or one a job keeps filling through a directory it holds open, delays the prunes by that long
-      after the last move into it and no longer, with the line NRV-W1206 (`bash ci/nerva-woodpecker.sh
+      contents: a marker `locks/<mount>-trash.pending` on any of the three mounts, written by the
+      first `ci_trash_move` into that trash (later moves leave it alone, so its age is "pending
+      since") and younger than `CI_TRASH_PENDING_MINUTES` (default 60; NRV-E1208). A drain that
+      empties or finds the trash empty removes it; one that cannot leaves its age alone. A removal
+      running with no young marker holds nothing off, and an old marker holds nothing off, so a trash
+      that nobody can empty, or one a job keeps filling through a directory it holds open, delays the
+      prunes by that long in all after the first move into it and no longer, with the line NRV-W1206 (`bash ci/nerva-woodpecker.sh
       host` empties every trash and removes the markers). The Jepsen mount is in the guard whether or
       not it shares the cache's file system (a step that does not mount it cannot tell): its trash is
-      emptied at the end of the step that swept it. The post-job tail never runs past the repository's
+      drained right after the sweep, while the Jepsen lock is held, for `CI_TRASH_SECONDS` at most
+      (what is left goes in the tail), so its marker does not hold the prunes for an hour per run. The post-job tail never runs past the repository's
       timeout: it is capped to the time left of `CI_REPO_TIMEOUT_MINUTES` (default 360, the Timeout
       set in step 2 above; NRV-E1208) minus 120 s from the step's start, and with none left the
-      trash is left for a later step. The worst case in one step: the job's 330 minutes, a pre-job
-      phase that can take about half an hour on a busy box (`CI_NORMALIZE_SECONDS` 600 and
-      `CI_LOCK_WAIT` 300, each twice, `du` 60 s, `CI_TRASH_SECONDS` 20 s, the package installs), and
-      then at most the tail's `du` (60 s) and drain, which the cap shortens or skips. It is not detached: Woodpecker removes a step's container, and every process in it, when
+      trash is left for a later step. So that the job never eats the tail's time, the job's own
+      limit is bounded the same way: the smaller of its limit (330 minutes for the long searches)
+      and `CI_REPO_TIMEOUT_MINUTES` minus what the step has used, minus 120 s and the tail's
+      `CI_TRASH_TAIL_SECONDS`, with the line NRV-W1207 when that shortens it (the pre-job phase can
+      take about half an hour on a busy box: `CI_NORMALIZE_SECONDS` 600 and `CI_LOCK_WAIT` 300, each
+      twice, `du` 60 s, `CI_TRASH_SECONDS` 20 s, the package installs; a job that is shortened ends
+      with NRV-E1215 at its bound, not killed by Woodpecker). Then at most the tail's `du` (60 s) and
+      drain, which the cap shortens or skips. It is not detached: Woodpecker removes a step's container, and every process in it, when
       the step ends. A branch's size is measured after the locks, by its own step, before the job and
       again after it (`locks/<key>.size`, `du` bounded by `CI_BRANCH_DU_SECONDS`; a timeout counts as
       over every bound), so the prune reads records and walks nothing. The bound is per branch, for what

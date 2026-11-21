@@ -29,6 +29,7 @@ set -euo pipefail
 . ci/lib.sh
 # When this step began (epoch seconds): the post-job tail never runs past the repository's timeout
 # (ci_tail_seconds in ci/cache.sh).
+# shellcheck disable=SC2034 # read by ci/cache.sh (ci_tail_seconds, ci_job_seconds)
 CI_STEP_START=$(date +%s)
 
 job="${1:?usage: ci/woodpecker_step.sh <job> [arg]}"
@@ -83,6 +84,7 @@ ci/io_uring_check.sh
 case "$job" in check | check-scripts | check-packages) ci/install_repo_tools.sh ;; esac
 
 . ci/cache.sh
+# shellcheck disable=SC2034 # read by ci/cache.sh (ci_as_job)
 CI_JOB_USER="$user" # ci_as_job: what root would make in a cache the job writes, the job's user makes
 id "$user" >/dev/null 2>&1 || useradd --create-home --uid 1001 --user-group "$user"
 chown -R "$user:$user" "$PWD"
@@ -114,9 +116,13 @@ if [ "$job" = jepsen ]; then
         ci_error "NRV-E1209: another Jepsen run held this machine for ${CI_JEPSEN_WAIT:-5400} s: start this one again when it ends"
         exit 1
     }
-    # Run directories older than 14 days are only moved aside here (ci_trash_move: a rename), and
-    # removed after the lock is let go below. Never `tools` (ci_jepsen_sweep).
+    # Run directories older than 14 days are moved aside here (ci_trash_move: a rename). Never
+    # `tools` (ci_jepsen_sweep). The sweep wrote jepsen's marker, which holds the box-wide low-disk
+    # prunes off (ci_trash_pending), so the trash is drained now, bounded by CI_TRASH_SECONDS, while
+    # the lock is held, rather than after a Jepsen run of hours (review 6004714906); what is left is
+    # removed by the tail below.
     ci_jepsen_sweep "$cache/jepsen"
+    ci_trash_empty "$cache/jepsen"
     # The job still runs as `ci`: root would leave root's files in the cache. The socket's group
     # lets it reach Docker, which is root on the host in all but name (decision O4).
     gid=$(stat -c %g "$sock")
@@ -182,11 +188,14 @@ tests_cmd=(bash ci/ci_test.sh)
 # shellcheck disable=SC2034 # a nameref array, as above
 job_cmd=("${as_ci[@]}" ci/job.sh "$job" ${arg:+"$arg"})
 status=0
+# The job's bound is the step's limit, or less when the pre-job phase took long enough that
+# Woodpecker's repository timeout would cut it off (ci_job_seconds, NRV-W1207).
+job_seconds=$(ci_job_seconds "$minutes")
 # (ci_step_run_with_tests is in ci/lib.sh, with its tests: for check-scripts the tests run first,
 # bounded by CI_SCRIPTS_TEST_MINUTES, not by the job's whole limit; either failing fails the step.)
-ci_step_run_with_tests "$job" "$((test_minutes * 60))" "$((minutes * 60))" tests_cmd job_cmd || status=$?
-# A Jepsen run holds the Jepsen lock exclusively for its whole run, so what its sweep and its reset
-# of the tools moved aside is removed only now, after the lock is let go (nothing is held that
+ci_step_run_with_tests "$job" "$((test_minutes * 60))" "$job_seconds" tests_cmd job_cmd || status=$?
+# A Jepsen run holds the Jepsen lock exclusively for its whole run, so what its reset
+# of the tools moved aside is removed only now, after the lock is let go (its sweep was drained at once; nothing is held that
 # another step waits on): by ci_step_finish below, for the tail's bound.
 if [ "$job" = jepsen ]; then
     flock -u 8 2>/dev/null || true
