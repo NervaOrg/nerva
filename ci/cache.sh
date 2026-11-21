@@ -154,12 +154,12 @@ ci_job_not_root() {
 
 # ci_knobs_check: NRV-E1208 when CI_NORMALIZE_SECONDS, CI_CHILD_LOCK_WAIT, CI_BRANCH_DU_SECONDS,
 # CI_TRASH_SECONDS, CI_TRASH_TAIL_SECONDS, CI_TRASH_PENDING_MINUTES, CI_REPO_TIMEOUT_MINUTES,
-# CI_KILL_AFTER or CI_MIN_FREE_INODES, if set, is not a whole number (1 or more, at most six digits). The seconds go
+# CI_KILL_AFTER, CI_BOX_WAIT or CI_MIN_FREE_INODES, if set, is not a whole number (1 or more, at most six digits). The seconds go
 # to timeout(1) and flock -w, where 0 means no limit or no wait, and anything else is an error from
 # a root step's tool; the minutes go to find -mmin and to arithmetic; the inode threshold is compared as a number.
 ci_knobs_check() {
     local n
-    for n in CI_NORMALIZE_SECONDS CI_CHILD_LOCK_WAIT CI_BRANCH_DU_SECONDS CI_TRASH_SECONDS CI_TRASH_TAIL_SECONDS CI_TRASH_PENDING_MINUTES CI_REPO_TIMEOUT_MINUTES CI_KILL_AFTER CI_MIN_FREE_INODES; do
+    for n in CI_NORMALIZE_SECONDS CI_CHILD_LOCK_WAIT CI_BRANCH_DU_SECONDS CI_TRASH_SECONDS CI_TRASH_TAIL_SECONDS CI_TRASH_PENDING_MINUTES CI_REPO_TIMEOUT_MINUTES CI_KILL_AFTER CI_BOX_WAIT CI_MIN_FREE_INODES; do
         [ -z "${!n:-}" ] || [[ "${!n}" =~ ^[1-9][0-9]{0,5}$ ]] || {
             ci_error "NRV-E1208: $n='${!n}' is not a whole number (1 or more, at most six digits; seconds, minutes for the *_MINUTES knobs, or inodes for CI_MIN_FREE_INODES)"
             return 1
@@ -716,6 +716,51 @@ ci_main_lock_open() {
     local f="$1/locks/main.lock"
     ci_lock_file "$f" || return 1
     { exec 9<"$f"; } 2>/dev/null || { ci_lock_open_failed "$f" '<'; return 1; }
+}
+
+# ci_box_lock MODE LOCKS: the host-wide reader/writer lock (decision O12). Every job step holds
+# LOCKS/box.lock (fd 10) SHARED for its whole run, so jobs run side by side; the integration job
+# holds it EXCLUSIVE, so its timing test (src/integration_tests.zig, one tick) runs with no other
+# job on the host (NervaOrg/nerva#11). flock is not fair: shared holders arriving one after another
+# would starve the exclusive waiter for ever. So every step first takes LOCKS/turnstile.lock (fd 11)
+# exclusively: a shared step lets it go as soon as it holds box.lock, the exclusive step HOLDS it
+# (also for the whole run) while it waits for box.lock, so no new job gets in behind it. The order
+# is always turnstile then box, so no cycle. Both waits are bounded by CI_BOX_WAIT (default 5400 s,
+# as CI_JEPSEN_WAIT): NRV-E1245, never a run without the lock. The wait is part of the step's time
+# (ci_job_seconds counts from CI_STEP_START, NRV-W1207). The step closes fds 10 and 11 for its
+# children, as 6 to 9. MODE is shared or exclusive.
+ci_box_lock() {
+    local mode="$1" locks="$2" wait="${CI_BOX_WAIT:-5400}" f
+    case "$mode" in
+    shared | exclusive) ;;
+    *)
+        ci_error "NRV-B1203: ci_box_lock: mode '$mode' is neither shared nor exclusive (a bug in the script that called it)"
+        return 1
+        ;;
+    esac
+    ci_knobs_check || return 1
+    for f in turnstile box; do ci_lock_file "$locks/$f.lock" || return 1; done
+    # The opens are tested in a group and made bare: bash saves the stderr a group redirects in the
+    # first free descriptor from 10 up, so an `exec 10<` INSIDE such a group is closed again when it ends.
+    for f in turnstile box; do
+        { : <"$locks/$f.lock"; } 2>/dev/null || { ci_lock_open_failed "$locks/$f.lock" '<'; return 1; }
+    done
+    exec 11<"$locks/turnstile.lock" 10<"$locks/box.lock"
+    ci_box_lock_wait "$mode" "$wait" 11 -x "$locks/turnstile.lock" || return 1
+    if [ "$mode" = shared ]; then
+        ci_box_lock_wait "$mode" "$wait" 10 -s "$locks/box.lock" || return 1
+        flock -u 11
+    else
+        ci_box_lock_wait "$mode" "$wait" 10 -x "$locks/box.lock" || return 1
+    fi
+}
+
+# ci_box_lock_wait MODE SECONDS FD FLAG FILE: one bounded wait of ci_box_lock, NRV-E1245.
+ci_box_lock_wait() {
+    flock "$4" -w "$2" "$3" || {
+        ci_error "NRV-E1245: the box lock $5 was not free for the $1 holder within $2 s: the integration job runs alone on this machine (decision O12), so a long job, or a process on the host (lslocks shows its pid), holds it; start this one again when it ends, or raise CI_BOX_WAIT"
+        return 1
+    }
 }
 
 # ci_as_job CMD...: runs CMD as the job's user, $CI_JOB_USER (default: this user). Root becomes it

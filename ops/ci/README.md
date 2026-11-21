@@ -465,6 +465,16 @@ set:
    shared, which never blocks another shared holder). `lslocks` on the host shows the pid. A lock
    file that cannot be opened at all is NRV-E1227, with the reason, not a wait.
 
+   **The box lock** (decision O12). The `integration` job asserts a median lookup under one 10 ms
+   tick of wall time, which a box running other jobs cannot promise (#11: 6.6 to 17.4 ms under
+   load, 2.1 ms alone). So every step holds `locks/box.lock` shared for its whole run, and the
+   `integration` job holds it exclusive: it runs with no other job on the host. flock is not fair, so
+   a step first takes `locks/turnstile.lock` exclusively (and lets it go once it holds `box.lock`); the
+   integration job keeps the turnstile while it waits for the running jobs to end and while it runs, so
+   nothing new starts behind it. The Jepsen job holds the lock shared like the rest. Both waits are
+   bounded by `CI_BOX_WAIT` (5400 s) and fail NRV-E1245; the wait counts in the step's time like any
+   pre-job work (NRV-W1207). A 330-minute search running when integration starts makes it wait.
+
    **When the disk fills** (a job fails with "No space left", or NRV-W1202 keeps appearing), with
    no pipeline running: `rm -rf /var/cache/nerva-ci/branches/*` empties every branch cache, and
    `rm -rf /var/cache/nerva-ci/main/zig /var/cache/nerva-ci/main/zig-local` main's Zig caches. The

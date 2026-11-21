@@ -23,6 +23,9 @@
 #     made the disk look low) and again after it, for the tail (CI_TRASH_TAIL_SECONDS, never past the
 #     repository's timeout: CI_REPO_TIMEOUT_MINUTES); a branch's size is a record its own step writes after its locks, before the job and
 #     after it (CI_BRANCH_DU_SECONDS).
+#   - Every job holds a shared lock on locks/box.lock for its run, the integration job an exclusive
+#     one, behind a turnstile (locks/turnstile.lock) so shared jobs cannot starve it: it runs with no
+#     other job on the host (decision O12, ci_box_lock; CI_BOX_WAIT, NRV-E1245).
 #   - Each job has a timeout (75 minutes; 330 for the long searches; CI_STEP_MINUTES replaces it),
 #     see the `case` below; one that runs past it fails NRV-E1215.
 set -euo pipefail
@@ -59,6 +62,21 @@ minutes="${CI_STEP_MINUTES:-$minutes}"
 test_minutes="${CI_SCRIPTS_TEST_MINUTES:-20}"
 [[ "$test_minutes" =~ ^[1-9][0-9]*$ ]] || { ci_error "NRV-E1208: CI_SCRIPTS_TEST_MINUTES='$test_minutes' is not a whole number of minutes"; exit 2; }
 
+# The box lock (decision O12, ci_box_lock in ci/cache.sh): every job holds locks/box.lock SHARED for
+# its whole run, the integration job EXCLUSIVE, so its timing test runs with no other job on the host
+# (NervaOrg/nerva#11). Taken before anything heavy (apt-get is what a pipeline's 16 workflows all do
+# at once), and so counted in the step's time (CI_STEP_START, NRV-W1207). Jepsen holds it shared like
+# the rest (its load is the very thing integration must not run beside, so it is not exempt). It
+# takes this lock before its own (below): a Jepsen run queued behind another holds box.lock shared
+# while it waits, so integration waits for it too (bounded by CI_BOX_WAIT); no cycle, as nothing
+# holding the Jepsen lock waits for this one. The integration binary is built under the exclusive lock: ci/job.sh runs
+# `zig build test:integration` in one command, and a build beforehand would need a change there.
+. ci/cache.sh
+ci_knobs_check || exit 2
+ci_locks_check "$cache" || exit 1
+if [ "$job" = integration ]; then box_mode=exclusive; else box_mode=shared; fi
+ci_box_lock "$box_mode" "$cache/locks" || exit 1
+
 export DEBIAN_FRONTEND=noninteractive
 apt-get -o Acquire::Retries=5 update -qq
 # What GitHub's ubuntu-24.04 runner has and the scripts use (unzip: .github/scripts/mac_zip_check.sh;
@@ -83,13 +101,11 @@ ci/io_uring_check.sh
 
 case "$job" in check | check-scripts | check-packages) ci/install_repo_tools.sh ;; esac
 
-. ci/cache.sh
 # shellcheck disable=SC2034 # read by ci/cache.sh (ci_as_job)
 CI_JOB_USER="$user" # ci_as_job: what root would make in a cache the job writes, the job's user makes
 id "$user" >/dev/null 2>&1 || useradd --create-home --uid 1001 --user-group "$user"
 chown -R "$user:$user" "$PWD"
 ci_cache_check "$role" "$cache" || exit 1
-ci_knobs_check || exit 2
 # What an earlier step left in the trash of the mount this one writes is removed BEFORE the disk is
 # measured: its blocks and inodes are what made the disk look low, and a step that measures first
 # prunes caches that were fine (ci_trash_empty: one removal per mount at a time, none waits for
@@ -180,10 +196,10 @@ as_ci=(setpriv --reuid "$user" --regid "$user" --init-groups
     ZIG_GLOBAL_CACHE_DIR="$base/zig" ZIG_LOCAL_CACHE_DIR="$base/zig-local"
     CI_TOOLCHAIN_DIR="$cache/main/tools" CI_TOOLCHAIN_WRITE="$toolchain_write")
 
-# The step's locks (fds 6 to 9) stay with the step: bash's `exec N<file` is not close-on-exec, so a
+# The step's locks (fds 6 to 11) stay with the step: bash's `exec N<file` is not close-on-exec, so a
 # job would inherit them and could `flock -x` one for good. Both commands close them for the child
 # only; the step's own descriptors, and so its locks, stay open until it exits.
-"${as_ci[@]}" ci/install_zig.sh 6>&- 7>&- 8>&- 9<&-
+"${as_ci[@]}" ci/install_zig.sh 6>&- 7>&- 8>&- 9<&- 10<&- 11<&-
 # The scripts' own tests run as root, here, before the job (review 6000930445): their guards on what
 # root does (the uid spies, the ownership and mount tests) are vacuous, and say so, as anyone else.
 # The checkout is this commit's and nothing untrusted has run in this step yet, as for the scripts

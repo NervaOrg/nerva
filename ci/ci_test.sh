@@ -3249,6 +3249,74 @@ grep -q "NRV-E1215: demo ran past its 1 seconds.*CI_STEP_MINUTES raises it" <<<"
 refuses NRV-E1208 "CI_SCRIPTS_TEST_MINUTES not a number" env CI_SCRIPTS_TEST_MINUTES=soon ci/woodpecker_step.sh check
 refuses NRV-E1208 "CI_SCRIPTS_TEST_MINUTES zero" env CI_SCRIPTS_TEST_MINUTES=0 ci/woodpecker_step.sh check
 
+# --- The box lock (decision O12, NRV-E1245): jobs hold locks/box.lock shared, integration exclusive,
+# behind a turnstile. Real flock on files in a scratch lock directory.
+bl="$tmp/boxlocks"
+mkdir -m 700 "$bl"
+box_hold() { # box_hold MODE MARKER SECONDS [WAIT]: a holder in the background (the sleep keeps the descriptors)
+    ( . ci/cache.sh; CI_BOX_WAIT="${4:-30}" ci_box_lock "$1" "$bl" && : >"$2" && sleep "$3" ) >/dev/null 2>&1 &
+    box_pid=$!
+}
+box_try() { # box_try MODE WAIT: the output of one ci_box_lock; the last line is its status
+    ( . ci/cache.sh; CI_BOX_WAIT="$2" ci_box_lock "$1" "$bl" && echo rc=0 || echo rc=1 ) 2>&1
+}
+box_rc() { tail -n 1 <<<"$1"; }
+# Shared holders coexist, and the turnstile is let go after each.
+box_hold shared "$tmp/s1" 4
+wait_for "$tmp/s1" || { echo "FAIL the first shared holder never held the box lock" >&2; fail=1; }
+out=$(box_try shared 2)
+is "box lock: a second shared holder gets it beside the first" "rc=0" "$(box_rc "$out")"
+is "box lock: a shared holder does not keep the turnstile" free "$(flock -x -n "$bl/turnstile.lock" true && echo free || echo held)"
+out=$(box_try exclusive 1)
+is "box lock: an exclusive holder cannot get it beside a shared one" "rc=1" "$(box_rc "$out")"
+grep -q "NRV-E1245: the box lock .*box.lock was not free for the exclusive holder within 1 s" <<<"$out" || { echo "FAIL box lock: exclusive beside shared: no NRV-E1245: $out" >&2; fail=1; }
+wait "$box_pid" || true
+# The exclusive holder excludes shared and exclusive ones, with its code, and is not run unlocked.
+rm -f "$tmp/x1"
+box_hold exclusive "$tmp/x1" 4
+wait_for "$tmp/x1" || { echo "FAIL the exclusive holder never held the box lock" >&2; fail=1; }
+out=$(box_try shared 1)
+is "box lock: a shared holder cannot get it beside the exclusive one" "rc=1" "$(box_rc "$out")"
+grep -q "NRV-E1245: .*not free for the shared holder within 1 s" <<<"$out" || { echo "FAIL box lock: shared beside exclusive: no NRV-E1245: $out" >&2; fail=1; }
+out=$(box_try exclusive 1)
+is "box lock: a second exclusive holder cannot get it" "rc=1" "$(box_rc "$out")"
+wait "$box_pid" || true
+out=$(box_try shared 2)
+is "box lock: free again when the exclusive holder ends" "rc=0" "$(box_rc "$out")"
+# The turnstile: an exclusive step waiting for a shared holder keeps new shared steps out (control:
+# without a waiter a new shared step gets in beside the holder).
+rm -f "$tmp/s1" "$tmp/x1"
+box_hold shared "$tmp/s1" 7
+s1_pid=$box_pid
+wait_for "$tmp/s1" || { echo "FAIL the shared holder never held the box lock" >&2; fail=1; }
+out=$(box_try shared 2)
+is "box lock: control: a new shared step gets in beside a shared holder" "rc=0" "$(box_rc "$out")"
+box_hold exclusive "$tmp/x1" 4
+x_pid=$box_pid
+for _ in $(seq 50); do flock -x -n "$bl/turnstile.lock" true || break; sleep 0.1; done
+is "box lock: the waiting exclusive step holds the turnstile" held "$(flock -x -n "$bl/turnstile.lock" true && echo free || echo held)"
+out=$(box_try shared 1)
+is "box lock: a waiting exclusive step keeps a new shared step out" "rc=1" "$(box_rc "$out")"
+grep -q "NRV-E1245" <<<"$out" || { echo "FAIL box lock: turnstile: no NRV-E1245: $out" >&2; fail=1; }
+wait "$s1_pid" || true
+wait_for "$tmp/x1" || { echo "FAIL box lock: the exclusive step never got the lock after the shared holder ended" >&2; fail=1; }
+out=$(box_try shared 1)
+is "box lock: the exclusive step keeps new shared steps out while it runs" "rc=1" "$(box_rc "$out")"
+wait "$x_pid" || true
+out=$(box_try shared 2)
+is "box lock: shared steps run again after the exclusive one" "rc=0" "$(box_rc "$out")"
+# Knobs and misuse.
+out=$( ( . ci/cache.sh; CI_BOX_WAIT=soon ci_box_lock shared "$bl" && echo rc=0 || echo rc=1 ) 2>&1)
+grep -q "NRV-E1208: CI_BOX_WAIT='soon'" <<<"$out" || { echo "FAIL box lock: CI_BOX_WAIT not a number: $out" >&2; fail=1; }
+out=$( ( . ci/cache.sh; ci_box_lock sideways "$bl" && echo rc=0 || echo rc=1 ) 2>&1)
+grep -q "NRV-B1203" <<<"$out" || { echo "FAIL box lock: a bad mode: $out" >&2; fail=1; }
+# The step: integration alone, everyone else shared; the descriptors are closed for children (static).
+is "the step takes the box lock exclusive for integration and shared for the rest (static)" "1 1" "$(grep -c '^if \[ "\$job" = integration \]; then box_mode=exclusive; else box_mode=shared; fi$' ci/woodpecker_step.sh || true) $(grep -c '^ci_box_lock "\$box_mode" "\$cache/locks" || exit 1$' ci/woodpecker_step.sh || true)"
+is "the step closes the box lock's fds 10 and 11 for install_zig, the job and the root tests (static)" "1 2" "$(grep -c 'ci/install_zig.sh .* 10<&- 11<&-' ci/woodpecker_step.sh || true) $(grep -c '9<&- 10<&- 11<&-' ci/lib.sh || true)"
+b=$(grep -n '^ci_box_lock ' ci/woodpecker_step.sh | cut -d: -f1)
+a=$(grep -n '^apt-get ' ci/woodpecker_step.sh | head -1 | cut -d: -f1)
+is "the box lock is taken before the first apt-get (static)" yes "$([ -n "$b" ] && [ -n "$a" ] && [ "$b" -lt "$a" ] && echo yes)"
+
 # --- The suite is hermetic (review 6001089776): the root run in a Woodpecker step has the step's
 # environment, and a step exports CI_BRANCH_PRUNE_ALL=1 when the box is low on disk. Run the whole
 # suite with every knob it exercises set to something hostile; it must still be ok. CI_TEST_NESTED
