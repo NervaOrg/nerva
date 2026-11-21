@@ -18,7 +18,9 @@
 #     "Low" is blocks (CI_FREE_MIN_GIB) or inodes (CI_MIN_FREE_INODES, default 100000: a job's empty files
 #     cost none). Nothing here walks a job's tree under a lock others wait on: a drop is a rename into the
 #     mount root's root-only .trash (ci/cache.sh, the design rule) and the trash is emptied after the lock
-#     is released; a branch's size is a record its own step writes after its locks (CI_BRANCH_DU_SECONDS).
+#     is released, by one step at a time, a bounded time (CI_TRASH_SECONDS), before the job and again
+#     after it; a branch's size is a record its own step writes after its locks, before the job and
+#     after it (CI_BRANCH_DU_SECONDS).
 #   - Each job has a timeout (75 minutes; 330 for the long searches; CI_STEP_MINUTES replaces it),
 #     see the `case` below; one that runs past it fails NRV-E1215.
 set -euo pipefail
@@ -98,9 +100,8 @@ if [ "$job" = jepsen ]; then
         exit 1
     }
     # Run directories older than 14 days are only moved aside here (ci_trash_move: a rename), and
-    # removed after the lock is let go below.
-    while IFS= read -r -d '' old; do ci_trash_move "$old" || true; done \
-        < <(find "$cache/jepsen" -mindepth 1 -maxdepth 1 -type d ! -name .trash -mtime +14 -print0)
+    # removed after the lock is let go below. Never `tools` (ci_jepsen_sweep).
+    ci_jepsen_sweep "$cache/jepsen"
     # The job still runs as `ci`: root would leave root's files in the cache. The socket's group
     # lets it reach Docker, which is root on the host in all but name (decision O4).
     gid=$(stat -c %g "$sock")
@@ -176,4 +177,8 @@ if [ "$job" = jepsen ]; then
     flock -u 8 2>/dev/null || true
     ci_trash_empty "$cache/jepsen"
 fi
+# After the job, still as root: a branch's size is measured again (the job is what grows it; fd 6
+# is held, nothing a step waits on is) and the trash a prune or reset filled is emptied a bounded
+# time (ci_trash_empty: one removal per mount, no step waits for another's).
+ci_step_finish "$role" "$cache" "${CI_BRANCH_DIR:-}"
 exit "$status"

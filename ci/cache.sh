@@ -39,11 +39,17 @@
 #     lock holds every other step past its wait (NRV-W1202, NRV-E1228, NRV-E1224). A tree to drop is
 #     renamed into MOUNT/.trash, which is root's alone (mode 0700, not a link, no ACL, the mount
 #     root's own file system, so mv can never fall back to a copy: NRV-E1236 otherwise, nothing moved),
-#     and removed by ci_trash_empty after `flock -u`, bounded by CI_NORMALIZE_SECONDS, which tolerates a
-#     job still writing in a moved tree (NRV-W1205 if it cannot empty it; the next call retries). A
-#     branch's size is measured by its own step after the locks (ci_branch_measure, a record in
-#     locks/<key>.size; a du that outlasts CI_BRANCH_DU_SECONDS counts as over every bound), so the
-#     prune reads records and walks nothing. Accepted: the seed's cp -a of main/zig/p runs under the
+#     and removed by ci_trash_empty after `flock -u`: ONE REMOVAL PER MOUNT AT A TIME, taken with
+#     flock -n on locks/<mount>-trash.lock (root-only), and no step waits for another's: a step that
+#     does not get that lock skips the empty. The holder is bounded by CI_TRASH_SECONDS (default 20,
+#     NRV-E1208), tolerates a job still writing in a moved tree, and goes on after its job
+#     (ci_step_finish), so a big tree goes down a bounded time at a time (NRV-W1205 while some is
+#     left). It is not detached: a Woodpecker step's container, and every process in it, is removed
+#     when the step ends (worklog/O4.md, twenty-second review). A
+#     branch's size is measured by its own step after the locks, before and after its job
+#     (ci_branch_measure, a record in locks/<key>.size, written whole to a mktemp file and renamed; a
+#     du that outlasts CI_BRANCH_DU_SECONDS counts as over every bound), so the prune reads records
+#     and walks nothing. Accepted: the seed's cp -a of main/zig/p runs under the
 #     branches' lock and main's shared one, and a failed cp's cleanup is the job's own rm.
 #  3. THE JOB'S OWN TREE IS NORMALIZED BY THE JOB (ci_normalize, before each use): as the job,
 #     every directory under the child gets u+rwx and loses its ACLs (access and default), a file
@@ -78,7 +84,7 @@
 #
 # What root does inside a mount root, in all: mkdir, chown (-h), mktemp -d, mv -T of a partial
 # directory, mv -T of a DIRECT child into the mount root's .trash, rm -rf --one-file-system of the
-# trash's names (never under a lock others wait on), rm -f of a name that is a DIRECT child, and, on a mount
+# trash's names (never under a lock others wait on), mktemp and mv -f of a size record in locks/, rm -f of a name that is a DIRECT child, and, on a mount
 # root itself (a mount's own root, which a job cannot swap for a link or rename: EBUSY), chown,
 # chmod 0755 and setfacl -b -k. It never acts on a deeper path, and everything below a child is made,
 # changed and removed by the job's user (ci_as_job: `mkdir`, `cp`, `touch`, `rm`, `find`, `chmod`).
@@ -128,13 +134,13 @@ ci_job_not_root() {
     fi
 }
 
-# ci_knobs_check: NRV-E1208 when CI_NORMALIZE_SECONDS, CI_CHILD_LOCK_WAIT, CI_BRANCH_DU_SECONDS or
-# CI_MIN_FREE_INODES, if set, is not a whole number (1 or more, at most six digits). The seconds go
+# ci_knobs_check: NRV-E1208 when CI_NORMALIZE_SECONDS, CI_CHILD_LOCK_WAIT, CI_BRANCH_DU_SECONDS,
+# CI_TRASH_SECONDS or CI_MIN_FREE_INODES, if set, is not a whole number (1 or more, at most six digits). The seconds go
 # to timeout(1) and flock -w, where 0 means no limit or no wait, and anything else is an error from
 # a root step's tool; the inode threshold is compared as a number.
 ci_knobs_check() {
     local n
-    for n in CI_NORMALIZE_SECONDS CI_CHILD_LOCK_WAIT CI_BRANCH_DU_SECONDS CI_MIN_FREE_INODES; do
+    for n in CI_NORMALIZE_SECONDS CI_CHILD_LOCK_WAIT CI_BRANCH_DU_SECONDS CI_TRASH_SECONDS CI_MIN_FREE_INODES; do
         [ -z "${!n:-}" ] || [[ "${!n}" =~ ^[1-9][0-9]{0,5}$ ]] || {
             ci_error "NRV-E1208: $n='${!n}' is not a whole number (1 or more, at most six digits; seconds, or inodes for CI_MIN_FREE_INODES)"
             return 1
@@ -333,18 +339,41 @@ ci_trash_move() {
 # ci_trash_empty MOUNT: removes whatever is in MOUNT/.trash (ci_trash_move's; a crashed step's
 # included): rm -rf --one-file-system of each direct child, never following a link (GNU rm walks
 # fd-relative; the trash is root's 0700, so no job can swap a name in it). Called with no lock held
-# that another step waits on, and bounded: each try ends after CI_NORMALIZE_SECONDS (default 600).
-# A job that still has a working directory in a moved tree can keep creating files in it while
-# this runs (the rename cuts off its `..`, not its cwd), so it is tried twice; if the trash is
-# still not empty, NRV-W1205 and the next step empties it (nothing waits for it).
+# that another step waits on. AT MOST ONE REMOVAL OF A MOUNT'S TRASH RUNS AT A TIME, AND NO OTHER
+# STEP WAITS FOR IT (review 6003970990): the step that gets locks/<mount>-trash.lock (root-only, in
+# the lock directory, taken with flock -n) empties, and a step that does not get it skips,
+# silently, as the holder is at the same work. The holder's bound is CI_TRASH_SECONDS (default 20;
+# a whole number, NRV-E1208), the removal's own and not the job walk's (CI_NORMALIZE_SECONDS): the
+# step that got the lock is held that long at most before its job, every other step not at all. A
+# big tree goes down a bounded time at a time: the step's tail calls this again after the job
+# (ci_step_finish). It is NOT detached (setsid, then left to run): a Woodpecker step's container,
+# and every process in it, is removed when the step ends, so a detached removal would be killed
+# with its step, and could outlive the bound by nothing but luck. A job that still has a working
+# directory in a moved tree can keep creating files in it while this runs (the rename cuts off its
+# `..`, not its cwd), so the removal is tried twice inside the bound; if the trash is still not
+# empty, NRV-W1205 and a later step removes what is left. The lock is held by the descriptor the
+# removal inherits, so it is let go when the removal ends or is cut off (timeout signals the whole
+# group), never before.
 ci_trash_empty() {
-    local t="$1/.trash" n
+    local t="$1/.trash" lk
     [ -d "$t" ] && [ ! -L "$t" ] && [ "$(stat -c %u -- "$t")" = "$(id -u)" ] || return 0
-    for n in 1 2; do
-        timeout "${CI_NORMALIZE_SECONDS:-600}" find "$t" -mindepth 1 -maxdepth 1 -exec rm -rf --one-file-system -- {} + 2>/dev/null || true
-        [ -z "$(find "$t" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ] && return 0
-    done
-    ci_warning "NRV-W1205: $t could not be emptied (a job still writing in a tree moved there, a mount inside it, or too big to remove in ${CI_NORMALIZE_SECONDS:-600} s): nothing waits for it, and the next step removes what is left"
+    ci_knobs_check || return 0
+    [ -n "$(find "$t" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ] || return 0
+    lk="$(dirname -- "$1")/locks/$(basename -- "$1")-trash.lock"
+    ci_lock_file "$lk" || return 0
+    (
+        { exec 3>>"$lk"; } 2>/dev/null || exit 0
+        flock -n 3 || exit 0 # another step is removing: skip it, never wait
+        rc=0
+        timeout "${CI_TRASH_SECONDS:-20}" sh -c '
+            for n in 1 2; do
+                find "$1" -mindepth 1 -maxdepth 1 -exec rm -rf --one-file-system -- {} + 2>/dev/null || true
+                [ -n "$(find "$1" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ] || exit 0
+            done
+            exit 1
+        ' _ "$t" || rc=$?
+        [ "$rc" = 0 ] || ci_warning "NRV-W1205: $t was not emptied in ${CI_TRASH_SECONDS:-20} s (a big tree, a job still writing in a tree moved there, or a mount inside it): what is left is out of the jobs' reach by path, and a later step removes it, a bounded time at a time"
+    )
 }
 
 # ci_children_locked PATH CMD...: runs CMD (a command or one of these functions) holding the
@@ -556,11 +585,11 @@ ci_lock_open_failed() {
 # ci_shared_lock: a shared lock on fd 9 (main's lock), waiting at most CI_MAIN_LOCK_WAIT seconds
 # (default 1800; CI_LOCK_WAIT, default 300, is the branch locks'): a holder that never lets go must
 # not hold a step up for good. Steps hold it shared, and Linux grants a shared lock beside shared
-# ones, so only an exclusive holder blocks: main's prune (ci_main_prune, a long rm -rf) or a
-# process on the host. NRV-E1224.
+# ones, so only an exclusive holder blocks: a prune or reset of main's caches (ci_main_prune: a
+# rename) or a process on the host. NRV-E1224.
 ci_shared_lock() {
     flock -s -w "${CI_MAIN_LOCK_WAIT:-1800}" 9 || {
-        ci_error "NRV-E1224: main's cache lock was held for ${CI_MAIN_LOCK_WAIT:-1800} s: main's prune (a long rm -rf of its caches), or a process on the host, holds it exclusively; lslocks on the host shows its pid; if the holder is just slow, raise CI_MAIN_LOCK_WAIT"
+        ci_error "NRV-E1224: main's cache lock was held for ${CI_MAIN_LOCK_WAIT:-1800} s: a prune or reset of main's caches (a rename), or a process on the host, holds it exclusively; lslocks on the host shows its pid; if the holder is just slow, raise CI_MAIN_LOCK_WAIT"
         return 1
     }
 }
@@ -646,13 +675,45 @@ ci_branch_size() {
 }
 
 # ci_branch_measure LOCKS KEY DIR: measures DIR, this step's own cache, and records its size in
-# LOCKS/KEY.size (root's, in the lock directory; written whole and renamed). Called with the
-# branches' lock let go and only the key's own (shared) held, so the walk stalls nobody, and
-# bounded (ci_dir_gib: a timeout is recorded as over every bound). The next prune, or the next step
-# of this branch, reads the number under the lock and drops a cache that is over the bound.
+# LOCKS/KEY.size (root's, in the lock directory). Called with the branches' lock let go and only
+# the key's own (shared) held, so the walk stalls nobody, and bounded (ci_dir_gib: a timeout is
+# recorded as over every bound). It runs twice per step: before the job (ci_branch_prepare) and
+# after it (ci_step_finish), as the job is what grows the tree. The next prune, or the next step
+# of this branch, reads the number under the lock and drops a cache that is over the bound. The
+# record is written whole to a file of mktemp's making in LOCKS and renamed: a fixed temporary
+# name would be shared by the 16 steps of a push, which write at the same moment, and two writers
+# of one file leave a mix of both numbers ("1\n9999\n", which reads as 0 and protects a cache that
+# is over every bound).
 ci_branch_measure() {
-    local f="$1/$2.size"
-    ci_dir_gib "$3" >"$f.new" 2>/dev/null && mv -f -- "$f.new" "$f" 2>/dev/null || true
+    local f="$1/$2.size" new
+    new=$(mktemp "$f.XXXXXX" 2>/dev/null) || return 0
+    if ci_dir_gib "$3" >"$new" 2>/dev/null && mv -f -- "$new" "$f" 2>/dev/null; then :; else rm -f -- "$new" 2>/dev/null || true; fi
+}
+
+# ci_step_finish ROLE CACHE BRANCH_DIR: what a step does after its job, in its own tail, as root.
+# In a branch's role the size is measured again (fd 6, the key's shared lock, is held; no lock a
+# step waits on is), so the bound on a branch's cache sees what this run wrote. Then what the
+# step's prune or reset moved aside is removed, a bounded time (ci_trash_empty). Never fails.
+ci_step_finish() {
+    local role="$1" cache="$2" dir="$3"
+    if [ "$role" = branch ]; then
+        if [ -n "$dir" ] && [ -d "$dir" ]; then ci_branch_measure "$cache/locks" "$(basename -- "$dir")" "$dir"; fi
+        ci_trash_empty "$cache/branches"
+    else
+        ci_trash_empty "$cache/main"
+    fi
+    return 0
+}
+
+# ci_jepsen_sweep MOUNT: moves each Jepsen run directory (<stamp>-<n>, 20261121T075348Z-12) of
+# MOUNT, jepsen's root, that is older than 14 days aside (ci_trash_move: a rename; the caller
+# removes the trash after letting the Jepsen lock go). Only those names: `tools`, the Docker
+# client's cache, is a direct child too, and its mtime changes only when an entry is added, so an
+# age test alone would move it every run once its archive is 14 days old.
+ci_jepsen_sweep() {
+    local old
+    while IFS= read -r -d '' old; do ci_trash_move "$old" || true; done \
+        < <(find "$1" -mindepth 1 -maxdepth 1 -type d -name '[0-9]*T[0-9]*Z-*' -mtime +14 -print0)
 }
 
 # ci_branch_prune BRANCHES LOCKS KEEP MAXN MAXDAYS MAXGIB: drops the branch caches nobody is using
@@ -714,7 +775,7 @@ ci_branch_own_lock() {
         rc=2
     fi
     flock -s -w "${CI_LOCK_WAIT:-300}" 6 || {
-        ci_error "NRV-E1225: $1's own cache lock was held for ${CI_LOCK_WAIT:-300} s: another step's prune of this branch's cache (it holds the lock exclusively while it removes it; see NRV-W1202), or a process on the host, holds it; lslocks on the host shows its pid; if the holder is just slow, raise CI_LOCK_WAIT"
+        ci_error "NRV-E1225: $1's own cache lock was held for ${CI_LOCK_WAIT:-300} s: another step's prune or reset of this branch's cache (a rename, under the lock held exclusively), or a process on the host, holds it; lslocks on the host shows its pid; if the holder is just slow, raise CI_LOCK_WAIT"
         [ "$2" != yes ] || flock -u 7
         return 1
     }

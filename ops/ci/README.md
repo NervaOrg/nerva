@@ -370,10 +370,15 @@ set:
       drops, a killed seed's partial directory and an old Jepsen run directory. **Root never walks a
       job's tree under a lock other steps wait on** (`branches.lock`, `main.lock`, a key lock held
       exclusively, the children lock): under a lock it only decides and renames. The trash is emptied
-      (`rm -rf --one-file-system` of its names, bounded by `CI_NORMALIZE_SECONDS`, NRV-W1205 if it
-      cannot) after the lock is released, and a branch's size is measured after the locks, by its own
-      step (`locks/<key>.size`, `du` bounded by `CI_BRANCH_DU_SECONDS`; a timeout counts as over every
-      bound), so the prune reads records and walks nothing. The disk-low test also watches inodes
+      (`rm -rf --one-file-system` of its names) after the lock is released, by **one step per mount at a
+      time**: `ci_trash_empty` takes the root-only `locks/<mount>-trash.lock` with `flock -n`, and a
+      step that does not get it skips the removal and goes on, so no step waits for another's removal.
+      The step that does get it is held for the removal, at most `CI_TRASH_SECONDS` (default 20) before
+      its job and again after it (NRV-W1205 if some is left: the next one goes on, a bounded time at a
+      time). It is not detached: Woodpecker removes a step's container, and every process in it, when
+      the step ends. A branch's size is measured after the locks, by its own step, before the job and
+      again after it (`locks/<key>.size`, `du` bounded by `CI_BRANCH_DU_SECONDS`; a timeout counts as
+      over every bound), so the prune reads records and walks nothing. The disk-low test also watches inodes
       (`CI_MIN_FREE_INODES`, default 100000), as a job's empty files cost no blocks. "No job can reach
       the trash" is true by path; a job that already had a directory open when it was moved can still
       write in it until the trash is emptied.
@@ -392,7 +397,7 @@ set:
    builds that read it, never a root operation. A branch's prune removes only a branch idle for 7 days, so a
    cache builds keep using is cleared only at once, with `bash ci/nerva-woodpecker.sh reset-cache main|jepsen|BRANCH|--branch BRANCH`
    on the host: main's cache has no prune, a manual pipeline uses `b-main-<sum>` (`--branch main`), and `jepsen/` has none either. It takes the same locks, moves the
-   children into `locks/trash` (the host command's own trash; steps use each mount root's `.trash`) and empties the trash after releasing them, so a step is never held for the removal (host and the next reset remove a leftover trash; NRV-E1235 if the cache root is not safe, has an ACL, or pipelines hold a lock for `NERVA_CI_RESET_WAIT` seconds, default 60). A reset racing a main step never gives that step NRV-E1228. The making of a
+   children into `locks/trash` (the host command's own trash; steps use each mount root's `.trash`) and empties the trash after releasing them, so no pipeline step is held for the removal (host and the next reset remove a leftover trash; NRV-E1235 if the cache root is not safe, has an ACL, or pipelines hold a lock for `NERVA_CI_RESET_WAIT` seconds, default 60). A reset racing a main step never gives that step NRV-E1228. The making of a
    child by root runs under `<root>-children.lock`, so concurrent steps do not refuse each other over a reset (it is a rename: the one that loses the race
    finds the other's fresh directory; NRV-E1228 stays for a child another uid owns, or one still not usable after the reset); a step
    waits `CI_CHILD_LOCK_WAIT` (30 s) for it, then NRV-E1234. A direct child that the job owns and cannot use,
@@ -412,7 +417,7 @@ set:
    (NRV-W1202) and the job runs; a branch's own cache lock waits `CI_LOCK_WAIT` (300 s) and then
    fails NRV-E1225 (another step's prune of that cache, or a process on the host, holds it);
    main's shared lock, which every step takes, waits at most `CI_MAIN_LOCK_WAIT` (1800 s) and then
-   fails NRV-E1224 (main's prune, running a long `rm -rf`, or a process on the host; steps hold it
+   fails NRV-E1224 (a prune or reset of main's caches, each a rename, or a process on the host; steps hold it
    shared, which never blocks another shared holder). `lslocks` on the host shows the pid. A lock
    file that cannot be opened at all is NRV-E1227, with the reason, not a wait.
 

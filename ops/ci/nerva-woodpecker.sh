@@ -84,14 +84,23 @@ host() {
     [ ! -d "$root/locks/trash" ] || rm -rf --one-file-system -- "$root/locks/trash"
     for n in main branches jepsen; do
         t="$root/$n/.trash"
-        if [ -L "$t" ] || { [ -e "$t" ] && [ "$(stat -c %u "$t")" != 0 ]; }; then
-            # Not root's: a job made it while it owned the mount root (an earlier layout). A step
-            # refuses it (NRV-E1236); removed whole, never followed.
+        if [ -L "$t" ] || { [ -e "$t" ] && { [ ! -d "$t" ] || [ "$(stat -c %u "$t")" != 0 ]; }; }; then
+            # A link, a file or a FIFO, or a directory that is not root's (a job made it while it
+            # owned the mount root, an earlier layout): a step refuses it (NRV-E1236). Removed
+            # whole, never followed; the next step makes a trash of its own.
             rm -rf --one-file-system -- "$t"
         elif [ -d "$t" ]; then
+            # Root's, but a step also refuses a mode other than 0700 and an ACL (an operator's
+            # mkdir, a restore from a backup): set right, so that E1236 does not outlast this
+            # command. Then what is in it is removed.
+            chmod 0700 -- "$t"
+            ! command -v setfacl >/dev/null || setfacl -b -k -- "$t" 2>/dev/null || true
             find "$t" -mindepth 1 -maxdepth 1 -exec rm -rf --one-file-system -- {} +
         fi
     done
+    # A size record's temporary file (ci/cache.sh, ci_branch_measure) that a killed step left: a
+    # live step's is a minute old at most, so only a day-old one is removed.
+    find "$root/locks" -maxdepth 1 -type f -name '*.size.??????' -mmin +1440 -delete 2>/dev/null || true
     # What the first layout left (one shared cache for every branch) is no longer read. A plain
     # loop: on a fresh box none of them exists, which would fail an `ls` under pipefail.
     local old=""
