@@ -12,10 +12,10 @@
 #   latest  Prints the newest snapshot's id.
 #
 # The Hetzner token is read from /etc/nerva-ci/hcloud.token (root, 0600) and passed to curl on stdin
-# (lib.sh `hcloud`): never in argv, the environment or a log. Needs curl, jq, ssh, ssh-keygen and rsync.
+# (lib.sh `hcloud`): never in argv, the environment or a log. Needs curl, jq, ssh, ssh-keygen, rsync and flock.
 # Where it looks, for ci/autoscaler_test.sh: NERVA_CI_ETC, NERVA_HCLOUD_API, NERVA_CI_CACHE_ROOT
 # (/var/cache/nerva-ci), NERVA_AS_KEEP (2: how many snapshots prune keeps, at least 1) and NERVA_AS_POLL
-# (10: seconds between polls).
+# (10: seconds between polls). Build servers and keys carry the label nerva-ci-pool=build.
 # shellcheck disable=SC2154,SC2034 # etc, tool and the pins come from lib.sh (not followed: no -x)
 set -euo pipefail
 
@@ -51,6 +51,31 @@ prune() {
     say "kept the newest $keep snapshots"
 }
 
+# sweep: deletes the build servers and SSH keys (label nerva-ci-pool=build) that an earlier build left behind: a
+# crash, a SIGKILL or a lost reply to the create call skips the exit trap. Only ones older than two hours, so
+# that a build running now (the timer and a hand run) is never touched.
+sweep() {
+    local kind id old='.[$k][]? | select((.created | sub("(\\.[0-9]+)?(\\+00:00|Z)$"; "Z") | fromdateiso8601) < (now - 7200)) | .id'
+    for kind in servers ssh_keys; do
+        for id in $(hcloud GET "/$kind?label_selector=$POOL_LABEL%3Dbuild&per_page=50" | jq -r --arg k "$kind" "$old"); do
+            hcloud DELETE "/$kind/$id" > /dev/null
+            say "deleted a leftover build ${kind%s} $id (older than 2 hours)"
+        done
+    done
+}
+
+# seed_copy SRC_ROOT DEST: copies what a branch job reads of main's cache (tools/ and zig/p/, as ci_branch_prepare
+# does: nothing else of main/ is read by a cloud job) to the build server, holding main's lock SHARED while it
+# does, as a branch's own seed copy does: that keeps out a prune or reset of main's cache (an exclusive holder),
+# not main's steps, which hold it shared too and write zig/p (content-addressed, once each) without any other lock.
+seed_copy() {
+    local lk="${NERVA_CI_CACHE_ROOT:-/var/cache/nerva-ci}/locks/main.lock" d
+    local -a paths=() pre=()
+    for d in tools zig/p; do [ ! -d "$1/$d" ] || paths+=("$d"); done
+    [ ! -f "$lk" ] || pre=(flock -s -w 1800 "$lk")
+    (cd "$1" && "${pre[@]}" rsync -aR -e "ssh ${ssh_opts[*]}" "${paths[@]}" "$2")
+}
+
 wait_for() { # wait_for DESCRIPTION JQ_EXPR PATH: polls (at most 60 x 10 s) until the jq expression holds
     local i
     for i in $(seq 1 60); do
@@ -67,17 +92,19 @@ build() {
     conf_load
     secret_file "$etc/hcloud.token" "the Hetzner API token"
     seed="${NERVA_CI_CACHE_ROOT:-/var/cache/nerva-ci}/main"
-    [ -d "$seed" ] && [ -n "$(ls -A "$seed")" ] || fail "NRV-E1242: the image was not built: the box's main cache $seed is missing or empty (run a pipeline on main first: it is the warm-cache seed)"
-    for i in curl jq ssh ssh-keygen rsync; do command -v "$i" > /dev/null || fail "NRV-E1239: $i is not installed"; done
+    { [ -d "$seed/tools" ] || [ -d "$seed/zig/p" ]; } || fail "NRV-E1242: the image was not built: the box's main cache $seed has no tools/ or zig/p/ (run a pipeline on main first: it is the warm-cache seed)"
+    for i in curl jq ssh ssh-keygen rsync flock; do command -v "$i" > /dev/null || fail "NRV-E1239: $i is not installed"; done
     tmp=$(mktemp -d /var/tmp/nerva-image.XXXXXX)
     # shellcheck disable=SC2064
     trap "cleanup_build '$tmp'" EXIT
+    sweep
     stamp=$(date -u +%Y%m%d-%H%M)
+    echo "nerva-ci-image-$stamp" > "$tmp/name"
     ssh-keygen -q -t ed25519 -N '' -f "$tmp/key" -C "nerva-ci-image-$stamp"
-    key_id=$(hcloud POST /ssh_keys "$(jq -n --arg n "nerva-ci-image-$stamp-$$" --arg k "$(cat "$tmp/key.pub")" --arg l "$POOL_LABEL" '{name: $n, public_key: $k, labels: {($l): "image-build"}}')" | jq -r '.ssh_key.id')
+    key_id=$(hcloud POST /ssh_keys "$(jq -n --arg n "nerva-ci-image-$stamp-$$" --arg k "$(cat "$tmp/key.pub")" --arg l "$POOL_LABEL" '{name: $n, public_key: $k, labels: {($l): "build"}}')" | jq -r '.ssh_key.id')
     echo "$key_id" > "$tmp/key_id"
     srv_id=$(hcloud POST /servers "$(jq -n --arg n "nerva-ci-image-$stamp" --arg t "$AS_SERVER_TYPE" --arg l "$AS_LOCATION" --argjson k "$key_id" --arg p "$POOL_LABEL" \
-        '{name: $n, server_type: $t, location: $l, image: "ubuntu-24.04", ssh_keys: [$k], start_after_create: true, labels: {($p): "image-build"}}')" | jq -r '.server.id')
+        '{name: $n, server_type: $t, location: $l, image: "ubuntu-24.04", ssh_keys: [$k], start_after_create: true, labels: {($p): "build"}}')" | jq -r '.server.id')
     echo "$srv_id" > "$tmp/srv_id"
     say "build server $srv_id created"
     wait_for "the build server to run" '.server.status == "running"' "/servers/$srv_id"
@@ -92,7 +119,7 @@ build() {
     # shellcheck disable=SC2046 # CI_TREE is a list of names without spaces
     rsync -a -e "ssh ${ssh_opts[*]}" $(for i in $CI_TREE; do printf '%s ' "$tree/$i"; done) "root@$ip:/root/ci/" || fail "NRV-E1242: the image was not built: could not copy ops/ci to the build server"
     ssh "${ssh_opts[@]}" "root@$ip" 'install -d -m 0755 /var/cache/nerva-ci/main'
-    rsync -a -e "ssh ${ssh_opts[*]}" "$seed/" "root@$ip:/var/cache/nerva-ci/main/" || fail "NRV-E1242: the image was not built: could not copy the warm-cache seed to the build server"
+    seed_copy "$seed" "root@$ip:/var/cache/nerva-ci/main/" || fail "NRV-E1242: the image was not built: could not copy the warm-cache seed to the build server"
     ssh "${ssh_opts[@]}" "root@$ip" 'NERVA_AS_ON_BUILD_SERVER=yes bash /root/ci/autoscaler/provision-image.sh' || fail "NRV-E1242: the image was not built: provisioning failed on the build server (output above)"
     hcloud POST "/servers/$srv_id/actions/poweroff" > /dev/null
     wait_for "the build server to power off" '.server.status == "off"' "/servers/$srv_id"
@@ -105,12 +132,18 @@ build() {
     say "OK snapshot $img (nerva-ci-agent-$stamp) is now the one cloud agents boot from"
 }
 
-# cleanup_build TMP: deletes the build server and the SSH key, whatever happened (an exit trap).
+# cleanup_build TMP: deletes the build server and the SSH key, whatever happened (an exit trap). If the create
+# call's reply was lost, the server is looked up by its name. What no trap can reach (SIGKILL, a reboot) is
+# swept by the next build (sweep).
 cleanup_build() {
     local rc=$? id
     set +e
-    if [ -s "$1/srv_id" ]; then id=$(cat "$1/srv_id"); hcloud DELETE "/servers/$id" > /dev/null 2>&1 || echo "$tool: warning: could not delete the build server $id: delete it in the Hetzner console" >&2; fi
-    if [ -s "$1/key_id" ]; then id=$(cat "$1/key_id"); hcloud DELETE "/ssh_keys/$id" > /dev/null 2>&1 || echo "$tool: warning: could not delete the build SSH key $id" >&2; fi
+    if [ ! -s "$1/srv_id" ] && [ -s "$1/name" ]; then
+        id=$(hcloud GET "/servers?name=$(cat "$1/name")" 2> /dev/null | jq -r '.servers[0].id // empty' 2> /dev/null)
+        [ -z "$id" ] || echo "$id" > "$1/srv_id"
+    fi
+    if [ -s "$1/srv_id" ]; then id=$(cat "$1/srv_id"); (hcloud DELETE "/servers/$id" > /dev/null 2>&1) || echo "$tool: warning: could not delete the build server $id: delete it in the Hetzner console" >&2; fi
+    if [ -s "$1/key_id" ]; then id=$(cat "$1/key_id"); (hcloud DELETE "/ssh_keys/$id" > /dev/null 2>&1) || echo "$tool: warning: could not delete the build SSH key $id" >&2; fi
     rm -rf "$1"
     exit "$rc"
 }

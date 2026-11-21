@@ -81,6 +81,9 @@ EOF
 cat > "$stubs/rsync" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$STUB_LOG/rsync.args"
+st=free
+if [ -n "${STUB_LOCK:-}" ] && [ -f "$STUB_LOCK" ] && ! flock -x -n "$STUB_LOCK" true; then st=held; fi
+printf '%s %s\n' "$st" "$*" >> "$STUB_LOG/rsync.lock"
 exit 0
 EOF
 chmod +x "$stubs"/*
@@ -240,11 +243,15 @@ refuses "build without the token file" NRV-E1237 env NERVA_CI_CACHE_ROOT="$tmp/n
 
 # --- build, from the INSTALLED copy, against stubs: what it copies is what provision-image.sh needs ----
 secret hcloud.token "$token"
-mkdir -p "$tmp/cache/main/tools"
+mkdir -p "$tmp/cache/main/tools" "$tmp/cache/main/zig/p/h" "$tmp/cache/main/zig-local" "$tmp/cache/locks"
 echo seed > "$tmp/cache/main/tools/x"
+echo pkg > "$tmp/cache/main/zig/p/h/y"
+echo local > "$tmp/cache/main/zig-local/z"
+: > "$tmp/cache/locks/main.lock"
+export STUB_LOCK="$tmp/cache/locks/main.lock"
 inst_img="$tmp/lib/ci/autoscaler/nerva-autoscaler-image.sh"
 api_for_build() {
-    rm -f "$STUB_API"/* "$STUB_LOG"/cnt_* "$STUB_LOG/rsync.args" "$STUB_LOG/ssh.args"
+    rm -f "$STUB_API"/* "$STUB_LOG"/cnt_* "$STUB_LOG/rsync.args" "$STUB_LOG/ssh.args" "$STUB_LOG/rsync.lock"
     : > "$STUB_LOG/curl.calls"
     printf '{"servers":[]}\n200' > "$STUB_API/GET__servers"
     printf '{"ssh_keys":[]}\n200' > "$STUB_API/GET__ssh_keys"
@@ -265,6 +272,9 @@ n=$((n + 1))
 has "build ran provision-image.sh where rsync put it" "$STUB_LOG/ssh.args" 'bash /root/ci/autoscaler/provision-image.sh'
 has "build deleted its server" "$STUB_LOG/curl.calls" '^DELETE /servers/8$'
 has "build deleted its key" "$STUB_LOG/curl.calls" '^DELETE /ssh_keys/7$'
+# The seed is tools/ and zig/p/ of main's cache only, copied while holding main's lock shared.
+has "the seed copy has tools" "$STUB_LOG/rsync.lock" '^held .*-aR .* tools zig/p root@1.2.3.4:/var/cache/nerva-ci/main/$'
+hasnt "the seed copy leaves zig-local out" "$STUB_LOG/rsync.lock" 'zig-local'
 # What rsync copied to /root/ci/ is, with nothing else, what provision-image.sh opens (relative to its own place).
 rm -rf "$tmp/remote"
 mkdir -p "$tmp/remote/ci"
@@ -283,6 +293,29 @@ for r in $refs; do
     n=$((n + 1))
     [ -e "$tmp/remote/ci/autoscaler/${r#\$here/}" ] || bad "provision-image.sh opens $r, which the build does not copy to the build server"
 done
+
+# --- The exit trap and the sweep (the stubs fail the build after its server exists) --------------------
+now=$(date -u +%Y-%m-%dT%H:%M:%S+00:00)
+old_server=91
+api_for_build
+printf '{"servers":[{"id":91,"created":"2020-01-01T00:00:00+00:00"},{"id":92,"created":"%s"}]}\n200' "$now" > "$STUB_API/GET__servers"
+printf '{"ssh_keys":[{"id":93,"created":"2020-01-01T00:00:00Z"},{"id":94,"created":"%s"}]}\n200' "$now" > "$STUB_API/GET__ssh_keys"
+STUB_SSH_FAIL=1 refuses "a build whose provisioning fails" NRV-E1242 build_inst
+has "the trap deleted the server" "$STUB_LOG/curl.calls" '^DELETE /servers/8$'
+has "the trap deleted the key" "$STUB_LOG/curl.calls" '^DELETE /ssh_keys/7$'
+has "the sweep deleted a leftover server" "$STUB_LOG/curl.calls" '^DELETE /servers/91$'
+has "the sweep deleted a leftover key" "$STUB_LOG/curl.calls" '^DELETE /ssh_keys/93$'
+hasnt "the sweep kept the young server" "$STUB_LOG/curl.calls" '^DELETE /servers/92$'
+hasnt "the sweep kept the young key" "$STUB_LOG/curl.calls" '^DELETE /ssh_keys/94$'
+# The create call's reply is lost: the server exists, but its id was never read. The trap finds it by name.
+api_for_build
+printf '{"error":{"message":"timeout"}}\n500' > "$STUB_API/POST__servers"
+printf '{"servers":[{"id":9,"created":"%s"}]}\n200' "$now" > "$STUB_API/GET__servers"
+refuses "a build whose create reply is lost" NRV-E1241 build_inst
+has "the trap found the server by its name" "$STUB_LOG/curl.calls" '^GET /servers$'
+has "the trap deleted that server" "$STUB_LOG/curl.calls" '^DELETE /servers/9$'
+has "the trap deleted the key of that build" "$STUB_LOG/curl.calls" '^DELETE /ssh_keys/7$'
+api_for_build
 
 # --- NRV-E1239: not root, a tool missing --------------------------------------------------------------
 bash_bin=$(command -v bash)

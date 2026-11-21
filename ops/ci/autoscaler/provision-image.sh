@@ -19,7 +19,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [ "$(id -u)" = 0 ] || fail "NRV-E1242: the image was not built: provision-image.sh must run as root, on the temporary server"
 [ "${NERVA_AS_ON_BUILD_SERVER:-}" = yes ] || fail "NRV-E1242: the image was not built: provision-image.sh only runs on the temporary build server (it is started by nerva-autoscaler-image.sh)"
 seed=/var/cache/nerva-ci/main
-[ -d "$seed" ] && [ -n "$(ls -A "$seed")" ] || fail "NRV-E1242: the image was not built: the warm-cache seed $seed was not copied to the build server"
+{ [ -d "$seed/tools" ] || [ -d "$seed/zig/p" ]; } || fail "NRV-E1242: the image was not built: the warm-cache seed $seed was not copied to the build server"
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
