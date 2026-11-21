@@ -39,6 +39,10 @@ esac
 # CI_STEP_MINUTES (a pipeline variable) replaces it for a run.
 minutes="${CI_STEP_MINUTES:-$minutes}"
 [[ "$minutes" =~ ^[1-9][0-9]*$ ]] || { ci_error "NRV-E1208: CI_STEP_MINUTES='$minutes' is not a whole number of minutes"; exit 2; }
+# The scripts' own tests (check-scripts, run as root before the job) take about 20 seconds; a hang
+# there is bounded on its own, not by the job's whole limit. CI_SCRIPTS_TEST_MINUTES replaces it.
+test_minutes="${CI_SCRIPTS_TEST_MINUTES:-10}"
+[[ "$test_minutes" =~ ^[1-9][0-9]*$ ]] || { ci_error "NRV-E1208: CI_SCRIPTS_TEST_MINUTES='$test_minutes' is not a whole number of minutes"; exit 2; }
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get -o Acquire::Retries=5 update -qq
@@ -140,13 +144,12 @@ as_ci=(setpriv --reuid "$user" --regid "$user" --init-groups
 # root does (the uid spies, the ownership and mount tests) are vacuous, and say so, as anyone else.
 # The checkout is this commit's and nothing untrusted has run in this step yet, as for the scripts
 # above. Without CAP_SYS_ADMIN (this container's) their mount tests print a skip note. The job then
-# skips its own run of them (CI_SCRIPTS_TESTED), and the step fails if either failed.
-tests_status=0
-if [ "$job" = check-scripts ]; then
-    ci_run_timed "$job's ci_test.sh, as root" "$((minutes * 60))" bash ci/ci_test.sh 6>&- 7>&- 8>&- 9<&- || tests_status=$?
-    as_ci+=(CI_SCRIPTS_TESTED=1)
-fi
+# skips its own run of them (CI_SCRIPTS_TESTED), and the step fails if either failed. The tests
+# have a bound of their own, 10 minutes (CI_SCRIPTS_TEST_MINUTES).
+tests_cmd=(bash ci/ci_test.sh)
+job_cmd=("${as_ci[@]}" ci/job.sh "$job" ${arg:+"$arg"})
 status=0
-ci_run_timed "$job" "$((minutes * 60))" "${as_ci[@]}" ci/job.sh "$job" ${arg:+"$arg"} 6>&- 7>&- 8>&- 9<&- || status=$?
-[ "$status" != 0 ] || status=$tests_status
+# (ci_step_run_with_tests is in ci/lib.sh, with its tests: for check-scripts the tests run first,
+# bounded by CI_SCRIPTS_TEST_MINUTES, not by the job's whole limit; either failing fails the step.)
+ci_step_run_with_tests "$job" "$((test_minutes * 60))" "$((minutes * 60))" tests_cmd job_cmd || status=$?
 exit "$status"

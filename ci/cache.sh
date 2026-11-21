@@ -22,7 +22,13 @@
 # it changes nothing) and unlinks (rm -rf of a path whose parent is a mount root, which never
 # follows a link in its last component). A path with any other job-writable component (a
 # partial directory's zig/p, a branch's zig link) is unlinked by the job user.
-# What is then not a plain directory the job can write is refused: NRV-E1228.
+# What is then not a plain directory the job can write is refused: NRV-E1228. One repair, by an
+# unlink and no more: a DIRECT child of a mount root (a branch's own directory, main's zig,
+# zig-local or tools) that is a real directory the job's own uid owns and the job cannot write (its
+# `chmod 0555`) is removed with rm -rf --one-file-system, as the prune removes one, under the lock
+# that keeps the other jobs out (the key's lock for a branch, main's exclusive one for main), and
+# made again by the job's user: NRV-W1204. A directory another user owns, and anything deeper (a
+# branch's own zig), stays NRV-E1228.
 #
 # A branch's pipeline mounts main/ read-only (.woodpecker/*.yaml) and branches/ writable; main's
 # mounts main/ writable and not branches/. ci_cache_check refuses a mount that is the wrong way
@@ -72,8 +78,38 @@ ci_cache_job_writable() {
             return 0
         fi
     fi
-    ci_error "NRV-E1229: $d is mounted read-write but the job's user (${CI_JOB_USER:-$(id -un)}) cannot write it (owner $(stat -c '%U, uid %u' "$d"), mode $(stat -c %a "$d")): on the host, run bash ci/nerva-woodpecker.sh host again, or chown it to that user and chmod 0755 it"
+    if [ -L "$d" ]; then
+        # The link's own mode is always 777 and says nothing; it is never followed.
+        ci_error "NRV-E1229: $d is mounted read-write but the job's user (${CI_JOB_USER:-$(id -un)}) cannot write it (it is a link, not a directory; it is never followed): on the host, run bash ci/nerva-woodpecker.sh host again, or remove the link and make the directory the job's user's, mode 0755"
+    else
+        ci_error "NRV-E1229: $d is mounted read-write but the job's user (${CI_JOB_USER:-$(id -un)}) cannot write it (owner $(stat -c '%U, uid %u' "$d"), mode $(stat -c %a "$d")): on the host, run bash ci/nerva-woodpecker.sh host again, or chown it to that user and chmod 0755 it"
+    fi
     return 1
+}
+
+# ci_child_unwritable PATH: whether PATH is a real directory (never a link) that the job's own uid
+# owns and the job cannot write: what a job's `chmod 0555` of a cache directory leaves. Only a test.
+ci_child_unwritable() {
+    local p="$1"
+    [ ! -L "$p" ] && [ -d "$p" ] || return 1
+    [ "$(stat -c %u "$p")" = "$(id -u "${CI_JOB_USER:-$(id -un)}")" ] || return 1
+    ! ci_as_job test -w "$p"
+}
+
+# ci_child_reset PATH MOUNT: removes PATH, a DIRECT child of MOUNT (a mount's own root, which a job
+# cannot swap for a link), if ci_child_unwritable: a job's chmod of it would otherwise fail every
+# later pipeline with NRV-E1228 until an operator acted. The same operation the prune does on a
+# direct child (rm -rf of one name, never following a link, one file system); the caller holds the
+# lock that keeps every other job out of it, and ci_job_dir makes it again. Foreign-owned
+# directories and deeper paths are left (return 1), and NRV-E1228 says so. NRV-W1204.
+ci_child_reset() {
+    local p="$1" mount="$2" was
+    [ "$(dirname -- "$p")" = "${mount%/}" ] || return 1
+    ci_child_unwritable "$p" || return 1
+    was=$(stat -c %a "$p")
+    rm -rf --one-file-system -- "$p" 2>/dev/null || true
+    [ ! -e "$p" ] || return 1
+    ci_warning "NRV-W1204: $p, owned by the job's user (${CI_JOB_USER:-$(id -un)}), had mode $was and was not writable for it: removed, to be made again (it is only a cache; a job's chmod); if this keeps happening, look for the script that does it"
 }
 
 # ci_cache_check ROLE ROOT: ROLE is main or branch. NRV-E1202 if ROOT is not laid out as above, or
@@ -253,6 +289,17 @@ ci_branch_prune() {
     done < <(find "$b" -mindepth 1 -maxdepth 1 -name 'b-*' -printf '%T@ %f\0' 2>/dev/null | sort -z -rn)
 }
 
+# ci_branch_own_lock KEY LOCKED: a shared lock on fd 6 (the branch's own lock, opened by the caller),
+# waiting at most CI_LOCK_WAIT seconds; NRV-E1225 if it is not free (and the branches' lock on fd 7
+# is let go, if LOCKED is yes).
+ci_branch_own_lock() {
+    flock -s -w "${CI_LOCK_WAIT:-300}" 6 || {
+        ci_error "NRV-E1225: $1's own cache lock was held for ${CI_LOCK_WAIT:-300} s: another step's prune of this branch's cache (it holds the lock exclusively while it removes it; see NRV-W1202), or a process on the host, holds it; lslocks on the host shows its pid; if the holder is just slow, raise CI_LOCK_WAIT"
+        [ "$2" != yes ] || flock -u 7
+        return 1
+    }
+}
+
 # ci_branch_prepare ROOT BRANCH: creates this branch's cache (zig/p, the fetched packages, a copy of main's, if that is no
 # larger than CI_BRANCH_SEED_MAX_GIB; zig-local/ empty), prunes the others, and holds a shared lock on its own on
 # fd 6 for the rest of the process, so a prune by another job leaves it alone. Sets CI_BRANCH_DIR.
@@ -296,11 +343,16 @@ ci_branch_prepare() {
         [ "$locked" != yes ] || flock -u 7
         return 1
     fi
-    flock -s -w "${CI_LOCK_WAIT:-300}" 6 || {
-        ci_error "NRV-E1225: $key's own cache lock was held for ${CI_LOCK_WAIT:-300} s: another step's prune of this branch's cache (it holds the lock exclusively while it removes it; see NRV-W1202), or a process on the host, holds it; lslocks on the host shows its pid; if the holder is just slow, raise CI_LOCK_WAIT"
-        [ "$locked" != yes ] || flock -u 7
-        return 1
-    }
+    ci_branch_own_lock "$key" "$locked" || return 1
+    # A job's `chmod 0555` of this branch's directory: removed, and made again below (NRV-W1204),
+    # under the key's lock held exclusively, as a prune holds it: ours is let go first (a second
+    # descriptor's exclusive lock would wait for it), and taken again after. If another job of the
+    # branch holds it, nothing is removed and NRV-E1228 says so below.
+    if ci_child_unwritable "$dir"; then
+        flock -u 6
+        ( { exec 5>>"$locks/$key.lock"; } 2>/dev/null && flock -x -n 5 && ci_child_reset "$dir" "$b" ) || true
+        ci_branch_own_lock "$key" "$locked" || return 1
+    fi
     # A link at $dir is the job's own doing: unlinked (never followed), then made again below.
     if [ -L "$dir" ]; then rm -f -- "$dir" 2>/dev/null || true; fi
     if [ ! -e "$dir" ]; then
@@ -375,10 +427,18 @@ ci_main_prune() {
 # directories, made by USER itself (ci_job_dir): root chowns and installs nothing in main/, which a
 # job writes, so a link a job planted at main/zig, zig-local or tools is replaced or refused
 # (NRV-E1228), never followed. The prune removes main/zig and main/zig-local, so the directories
-# come after it. The caller takes its shared lock (flock -s 9) after this returns.
+# come after it. A directory of main's that a job's chmod made unwritable for it is removed first
+# (ci_child_reset, NRV-W1204). The caller takes its shared lock (flock -s 9) after this returns.
 ci_main_prepare() {
-    local root="$1" CI_JOB_USER="$2" low="$3" min="$4"
+    local root="$1" CI_JOB_USER="$2" low="$3" min="$4" p
     ci_main_lock_open "$root" || return 1 # root's, in the lock directory a job cannot write
     [ "$low" = no ] || { echo "Below $min GiB free"; ci_main_prune "$root" "$min"; }
+    # A job's `chmod 0555` of one of main's directories: removed under main's exclusive lock (what
+    # the prune takes; held already if it ran), and made again below (NRV-W1204). Waits as the prune does.
+    for p in zig zig-local tools; do
+        if ci_child_unwritable "$root/main/$p" && flock -x -w "${CI_PRUNE_WAIT:-5}" 9; then
+            ci_child_reset "$root/main/$p" "$root/main" || true
+        fi
+    done
     ci_job_dir "$root/main/zig" "$root/main/zig-local" "$root/main/tools"
 }

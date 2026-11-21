@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Table test for the CI scripts' own refusals and cache rules (NRV-E1201 to E1232, NRV-B1201,
-# NRV-W1201 to W1203, docs/ERRORS.md; decision O4). Needs flock and jq. Takes a few seconds;
+# NRV-W1201 to W1204, docs/ERRORS.md; decision O4). Needs flock and jq. Takes about a minute;
 # touches only a scratch directory. Not covered, as they need a Woodpecker step or a daemon:
 # NRV-E1203 (the Docker socket is not mounted), NRV-E1209 and E1210 (Jepsen), the io_uring check on
 # a real refusing daemon, woodpecker-bootstrap.sh's NRV-E1213 (its preflight wants root on Ubuntu
@@ -9,6 +9,14 @@
 # skipped ("note: ..."). Both CIs run this suite as root (ci/job.sh check-scripts): a run that prints
 # those notes did not prove the behavioural guards (review 6000930445).
 set -eu
+# Hermetic (review 6001089776): the scripts read CI_* knobs (CI_BRANCH_PRUNE_ALL, which a step
+# exports when the box is low on disk, CI_DOCKER_MAX_BYTES, CI_LOCK_WAIT, CI_BRANCH_CACHES, ...), and
+# the step runs this suite as root with the step's environment, pipeline variables included. Every
+# exported CI_* variable is dropped; a test that needs one sets it itself, for its own command.
+# CI_TEST_TMP (a scratch directory) and CI_TEST_NESTED (the guard of the self-test at the end) stay.
+for v in $(compgen -e | grep '^CI_' || true); do
+    case "$v" in CI_TEST_TMP | CI_TEST_NESTED) ;; *) unset "$v" ;; esac
+done
 root=$(cd "$(dirname "$0")/.." && pwd)
 tmp=${CI_TEST_TMP:-$(mktemp -d)}
 ro_mounts=() # bind mounts made by the tests below (root only); unmounted before the scratch directory goes
@@ -190,6 +198,26 @@ if [ "$(id -u)" = 0 ] && mount -t tmpfs -o size=64k tmpfs "$tmp/dc/tiny" 2>/dev/
     umount "$tmp/dc/tiny"
 else
     echo "note: no tmpfs here (not root, or mount is denied): the full-disk test of docker_client.sh ran only with a stub head" >&2
+fi
+# NRV-E1232 when the private directory cannot even be made (mktemp -d fails: a TMPDIR that is not
+# there, here), with mktemp's own reason, not "no reason given" and not E1230 (review 6001089776).
+mkdir -p "$tmp/dc/c10"
+cp "$tmp/dc/docker-9.tgz" "$tmp/dc/c10/docker-9.tgz"
+out=$(env TMPDIR="$tmp/nonexistent" CI_ARCH=x86_64 CI_DOCKER_BIN_DIR="$tmp/dc/bin10" ci/docker_client.sh 9 "$dsha" "$tmp/dc/c10" install 2>&1 || true)
+{ grep -q "NRV-E1232: .*(.*No such file or directory).*TMPDIR" <<<"$out" && ! grep -q "NRV-E1230\|NRV-E1205\|rm -rf" <<<"$out"; } || { echo "FAIL mktemp -d fails: $out" >&2; fail=1; }
+is "docker client install: a TMPDIR that is not there leaves the archive alone and unpacks nothing" "yes no" "$([ -f "$tmp/dc/c10/docker-9.tgz" ] && echo yes) $([ -e "$tmp/dc/bin10/docker" ] && echo yes || echo no)"
+# NRV-E1232 when the directory is made and the COPY cannot be created in it (no inodes, a quota):
+# bash opens the file for head, so without a create of its own first this was reported as a bad
+# archive (NRV-E1230). A tmpfs with two inodes has room for mktemp -d and none for the file.
+mkdir -p "$tmp/dc/noino"
+if [ "$(id -u)" = 0 ] && mount -t tmpfs -o size=1m,nr_inodes=2 tmpfs "$tmp/dc/noino" 2>/dev/null; then
+    ro_mounts+=("$tmp/dc/noino")
+    out=$(env TMPDIR="$tmp/dc/noino" CI_ARCH=x86_64 CI_DOCKER_BIN_DIR="$tmp/dc/bin11" ci/docker_client.sh 9 "$dsha" "$tmp/dc/c10" install 2>&1 || true)
+    { grep -q "NRV-E1232: .*No space left on device.*TMPDIR" <<<"$out" && ! grep -q "NRV-E1230\|NRV-E1205\|rm -rf" <<<"$out"; } || { echo "FAIL no inode for the copy (tmpfs, nr_inodes=2): $out" >&2; fail=1; }
+    is "docker client install: no inode for the copy leaves the archive alone" "yes no" "$([ -f "$tmp/dc/c10/docker-9.tgz" ] && echo yes) $([ -e "$tmp/dc/bin11/docker" ] && echo yes || echo no)"
+    umount "$tmp/dc/noino"
+else
+    echo "note: no tmpfs here (not root, or mount is denied): the no-inode test of docker_client.sh was skipped" >&2
 fi
 # NRV-E1231: CI_DOCKER_MAX_BYTES is a whole number before any arithmetic; an expression in it is
 # never evaluated (it would be, as root, by the shell's $(( )) and [ -gt ]).
@@ -534,11 +562,15 @@ is "the branches' lock is released after NRV-E1227" free "$(flock -x -n "$o3/loc
 refuses NRV-E1227 "an open failure refuses" open_fail "$o3" feature/o
 
 # The step closes its lock descriptors (6 to 9) for the job: bash's exec does not set close-on-exec,
-# so a job would inherit them and could take them for good. Both `as_ci` commands do it.
+# so a job would inherit them and could take them for good. The install_zig command closes them on
+# its own line; the job's (and the root tests') are closed inside ci_step_run_with_tests, whose
+# behavioural test below checks it.
 as_ci_lines=$(grep -c '"${as_ci\[@\]}"' ci/woodpecker_step.sh || true)
 closing_lines=$(grep -c '"${as_ci\[@\]}".* 6>&- 7>&- 8>&- 9<&-' ci/woodpecker_step.sh || true)
 is "woodpecker_step.sh runs two commands as ci" 2 "$as_ci_lines"
-is "both close fds 6 to 9 for the job" 2 "$closing_lines"
+is "install_zig closes fds 6 to 9 for the job's user (static; the job's own are tested behaviourally)" 1 "$closing_lines"
+is "the step's tail is ci_step_run_with_tests, with the root tests and the job as arrays (static)" 2 "$(grep -c '^tests_cmd=(bash ci/ci_test.sh)$\|^ci_step_run_with_tests .* tests_cmd job_cmd || status=\$?$' ci/woodpecker_step.sh || true)"
+is "the root tests are bounded by their own limit, not the job's (static)" 1 "$(grep -c '"$((test_minutes \* 60))" "$((minutes \* 60))"' ci/woodpecker_step.sh || true)"
 # Both places that take main's lock use ci_shared_lock (bounded, NRV-E1224), never a bare flock; the
 # jepsen lock file is made by ci_lock_file.
 is "main's lock is taken by ci_shared_lock in both roles" 2 "$(grep -c 'ci_shared_lock || exit 1' ci/woodpecker_step.sh || true)"
@@ -781,7 +813,6 @@ fi
 is "only ci_main_lock_open opens fd 9" 1 "$(grep -c 'exec 9<' ci/cache.sh ci/woodpecker_step.sh | awk -F: '{n += $2} END {print n}')"
 is "the Docker client is downloaded as the job's user, root only unpacks it" 1 "$(grep -c '^    ci_as_job ci/docker_client.sh .* fetch$' ci/woodpecker_step.sh || true)"
 # Both CIs run this suite as root (review 6000930445); static, as a workflow's behaviour is not run here.
-is "woodpecker_step.sh runs ci_test.sh itself, as root, for check-scripts (static)" 1 "$(grep -c 'bash ci/ci_test.sh 6>&- 7>&- 8>&- 9<&-' ci/woodpecker_step.sh || true)"
 is "ci.yml runs ci_test.sh through sudo (static)" 1 "$(grep -c 'run: sudo env "PATH=\$PATH" bash ci/ci_test.sh' .github/workflows/ci.yml || true)"
 is "the jepsen lock's E1227 probes a read open" 1 "$(grep -c "ci_lock_open_failed \"\$cache/locks/jepsen.lock\" '<'" ci/woodpecker_step.sh || true)"
 
@@ -875,7 +906,15 @@ r=$(attack_tree f2)
 chmod a-w "$r/main/zig-local"
 chown 0 "$r/main/zig-local" 2>/dev/null || true
 [ "$(id -u)" != 0 ] || chmod 755 "$r/main/zig-local"
-refuses NRV-E1228 "main: a directory the job cannot write" bash -c '. ci/cache.sh; ci_main_prepare "$1" "$2" no 0' _ "$r" "$jobuser"
+if [ "$(id -u)" = 0 ]; then
+    refuses NRV-E1228 "main: a directory the job cannot write" bash -c '. ci/cache.sh; ci_main_prepare "$1" "$2" no 0' _ "$r" "$jobuser"
+else
+    # Not root: the directory cannot be made another user's, so it is the job's own 0555, which is
+    # repaired (NRV-W1204, below) and not refused.
+    out=$(bash -c '. ci/cache.sh; ci_main_prepare "$1" "$2" no 0' _ "$r" "$jobuser" 2>&1 || true)
+    grep -q "NRV-W1204" <<<"$out" || { echo "FAIL main: the job's own unwritable zig-local (not root): $out" >&2; fail=1; }
+    skip_note "the E1228 for a directory another user owns"
+fi
 r=$(attack_tree f3)
 d="$r/branches/$branch_key"
 ci_as mkdir -p "$d"
@@ -1064,16 +1103,23 @@ if [ "$(id -u)" = 0 ]; then
         ! grep -q "NRV-W1203" <<<"$out" || { echo "FAIL $role's role, root-owned $sub/ is 'repaired': $out" >&2; fail=1; }
         is "$role's role, root-owned 0555 $sub/: owner and mode untouched" "0 555" "$(stat -c '%u %a' "$tmp/foreign-$role/$sub")"
     done
-    # A link at the mount root is never followed: the target keeps its mode.
+    # A link at the mount root is never followed: the target keeps its mode. The link is made BY
+    # THE JOB (review 6001089776): it is then owned by the job's uid, so `stat` of it matches the
+    # job's and, without the `! -L` test, root's chmod 0755 would follow it to the job's 0500 target.
+    # (A link made by root is owned by root and never reaches that chmod: it proves nothing.)
     mk_roots "$tmp/linkroot"
     mkdir "$tmp/linkroot/target"
     chown "$jobuser" "$tmp/linkroot/target"
-    ci_as chmod 0555 "$tmp/linkroot/target"
+    ci_as chmod 0500 "$tmp/linkroot/target"
     rm -rf "$tmp/linkroot/main"
-    ln -s target "$tmp/linkroot/main"
+    chown "$jobuser" "$tmp/linkroot"
+    ci_as ln -s target "$tmp/linkroot/main"
+    chown root "$tmp/linkroot"
+    is "(the link is the job's: owner)" "$jobuser" "$(stat -c %U "$tmp/linkroot/main")"
     out=$(chk main "$tmp/linkroot" || true)
-    grep -q "NRV-E1229" <<<"$out" || { echo "FAIL a link at main/: $out" >&2; fail=1; }
-    is "a link at main/: its target keeps its mode" 555 "$(stat -c %a "$tmp/linkroot/target")"
+    grep -q "NRV-E1229: .*main is mounted read-write but the job's user ($jobuser) cannot write it (it is a link, not a directory" <<<"$out" || { echo "FAIL a link at main/: $out" >&2; fail=1; }
+    ! grep -q "mode 777\|NRV-W1203" <<<"$out" || { echo "FAIL a link at main/ is reported by its own mode, or repaired: $out" >&2; fail=1; }
+    is "a link at main/: its target keeps its mode" 500 "$(stat -c %a "$tmp/linkroot/target")"
     mk_roots "$tmp/e1229-ok"
     chown "$jobuser" "$tmp/e1229-ok/main"
     ok "main's role, main/ the job's and rw" chk main "$tmp/e1229-ok"
@@ -1122,6 +1168,114 @@ if [ "$(id -u)" = 0 ]; then
     fi
 else
     skip_note "the mount and ownership tests of ci_cache_check (E1202, E1229, W1203)"
+fi
+
+# A job's `chmod 0555` of a DIRECT child of a mount root (review 6001089776): a branch's own
+# directory, or main's zig, zig-local or tools. It used to fail every later pipeline for that
+# directory with NRV-E1228 until an operator acted. Root removes it (rm -rf of the one name: the
+# prune's own operation) under the lock that keeps the other jobs out, warns (NRV-W1204), and the
+# job's user makes it again. A foreign owner and anything deeper stay NRV-E1228. Root only: as the
+# job's own uid, rm -rf cannot empty a 0555 subdirectory, and a second user is needed.
+if [ "$(id -u)" = 0 ]; then
+    w_tree() { # w_tree NAME: a tree with a file, a 0555 subdirectory and a file in it, in each cache directory
+        local r q
+        r=$(attack_tree "$1")
+        for q in main/zig main/zig-local main/tools "branches/$branch_key/zig" "branches/$branch_key/zig-local"; do
+            ci_as mkdir -p "$r/$q/sub"
+            ci_as touch "$r/$q/keep" "$r/$q/sub/f"
+            ci_as chmod 0555 "$r/$q/sub"
+        done
+        echo "$r"
+    }
+    run_branch() { ( . ci/cache.sh; CI_JOB_USER=$jobuser CI_LOCK_WAIT=2 ci_branch_prepare "$1" feature/atk 2>&1 && echo RC0 ) || true; }
+    run_main() { bash -c '. ci/cache.sh; CI_PRUNE_WAIT=1 ci_main_prepare "$1" "$2" no 0 2>&1 && echo RC0' _ "$1" "$jobuser" || true; }
+    # A branch's own directory.
+    r=$(w_tree wb)
+    d="$r/branches/$branch_key"
+    ci_as chmod 0555 "$d"
+    out=$(run_branch "$r")
+    grep -q "NRV-W1204: $d, owned by the job's user ($jobuser), had mode 555" <<<"$out" || { echo "FAIL a branch directory chmod 0555 by the job: no NRV-W1204: $out" >&2; fail=1; }
+    { grep -q RC0 <<<"$out" && ! grep -q "NRV-E12" <<<"$out"; } || { echo "FAIL a branch directory chmod 0555 by the job is refused: $out" >&2; fail=1; }
+    is "branch: the unwritable directory is made again, empty, the job's, writable" "yes yes yes no no" "$([ -d "$d/zig" ] && echo yes) $([ -d "$d/zig-local" ] && echo yes) $(ci_as test -w "$d" && echo yes) $([ -e "$d/zig/keep" ] && echo yes || echo no) $([ -e "$d/zig/sub" ] && echo yes || echo no)"
+    # Another job of the branch holds its lock (shared, as a running step does): nothing is removed.
+    r=$(w_tree wbb)
+    d="$r/branches/$branch_key"
+    ci_as chmod 0555 "$d"
+    : >"$r/locks/$branch_key.lock"
+    chmod 600 "$r/locks/$branch_key.lock"
+    flock -s "$r/locks/$branch_key.lock" sleep 30 &
+    holder=$!
+    for _ in 1 2 3 4 5 6 7 8 9 10; do flock -x -n "$r/locks/$branch_key.lock" true 2>/dev/null || break; sleep 0.2; done
+    out=$(run_branch "$r")
+    kill "$holder" 2>/dev/null || true
+    wait "$holder" 2>/dev/null || true
+    grep -q "NRV-E1228: $d" <<<"$out" || { echo "FAIL a branch directory in use by another job is not E1228: $out" >&2; fail=1; }
+    ! grep -q "NRV-W1204" <<<"$out" || { echo "FAIL a branch directory in use by another job is removed: $out" >&2; fail=1; }
+    is "branch: in use by another job: kept as it was" "yes 555" "$([ -e "$d/zig/keep" ] && echo yes) $(stat -c %a "$d")"
+    # A direct child of main's, each of the three.
+    for sub in zig zig-local tools; do
+        r=$(w_tree wm-$sub)
+        ci_as chmod 0555 "$r/main/$sub"
+        out=$(run_main "$r")
+        grep -q "NRV-W1204: $r/main/$sub, owned by the job's user ($jobuser), had mode 555" <<<"$out" || { echo "FAIL main/$sub chmod 0555 by the job: no NRV-W1204: $out" >&2; fail=1; }
+        { grep -q RC0 <<<"$out" && ! grep -q "NRV-E12" <<<"$out"; } || { echo "FAIL main/$sub chmod 0555 by the job is refused: $out" >&2; fail=1; }
+        is "main/$sub: made again, empty, the job's, writable" "yes no no $jobuser" "$(ci_as test -w "$r/main/$sub" && echo yes) $([ -e "$r/main/$sub/keep" ] && echo yes || echo no) $([ -e "$r/main/$sub/sub" ] && echo yes || echo no) $(stat -c %U "$r/main/$sub")"
+        for other in zig zig-local tools; do
+            [ "$other" = "$sub" ] || is "main/$sub reset: main/$other is left alone" yes "$([ -e "$r/main/$other/keep" ] && echo yes)"
+        done
+    done
+    # Other jobs hold main's lock (shared, as every running step does): nothing is removed, E1228.
+    r=$(w_tree wmb)
+    ci_as chmod 0555 "$r/main/zig"
+    : >"$r/locks/main.lock"
+    chmod 600 "$r/locks/main.lock"
+    flock -s "$r/locks/main.lock" sleep 30 &
+    holder=$!
+    for _ in 1 2 3 4 5 6 7 8 9 10; do flock -x -n "$r/locks/main.lock" true 2>/dev/null || break; sleep 0.2; done
+    out=$(run_main "$r")
+    kill "$holder" 2>/dev/null || true
+    wait "$holder" 2>/dev/null || true
+    grep -q "NRV-E1228: $r/main/zig" <<<"$out" || { echo "FAIL main/zig in use by other jobs is not E1228: $out" >&2; fail=1; }
+    is "main/zig: other jobs hold main's lock: kept as it was" "yes 555" "$([ -e "$r/main/zig/keep" ] && echo yes) $(stat -c %a "$r/main/zig")"
+    # A foreign owner: root's own 0555 child is NRV-E1228 and is left exactly as it was.
+    for sub in zig tools; do
+        r=$(w_tree wf-$sub)
+        chown root "$r/main/$sub"
+        chmod 0555 "$r/main/$sub"
+        out=$(run_main "$r")
+        { grep -q "NRV-E1228: $r/main/$sub" <<<"$out" && ! grep -q "NRV-W1204\|RC0" <<<"$out"; } || { echo "FAIL a root-owned 0555 main/$sub: $out" >&2; fail=1; }
+        is "main/$sub owned by root, 0555: kept as it was" "0 555 yes" "$(stat -c '%u %a' "$r/main/$sub") $([ -e "$r/main/$sub/keep" ] && echo yes)"
+    done
+    r=$(w_tree wfb)
+    d="$r/branches/$branch_key"
+    chown root "$d"
+    chmod 0555 "$d"
+    out=$(run_branch "$r")
+    { grep -q "NRV-E1228: $d" <<<"$out" && ! grep -q "NRV-W1204\|RC0" <<<"$out"; } || { echo "FAIL a root-owned 0555 branch directory: $out" >&2; fail=1; }
+    is "branch directory owned by root, 0555: kept as it was" "0 555 yes" "$(stat -c '%u %a' "$d") $([ -e "$d/zig/keep" ] && echo yes)"
+    # Deeper than a direct child: NRV-E1228, never removed. A branch's own zig, and main's zig/p.
+    r=$(w_tree wd)
+    d="$r/branches/$branch_key"
+    ci_as chmod 0555 "$d/zig"
+    out=$(run_branch "$r")
+    { grep -q "NRV-E1228: $d/zig" <<<"$out" && ! grep -q "NRV-W1204\|RC0" <<<"$out"; } || { echo "FAIL a branch's own zig 0555: $out" >&2; fail=1; }
+    is "branch zig 0555 (deeper than a child of branches/): kept as it was" "yes 555" "$([ -e "$d/zig/keep" ] && echo yes) $(stat -c %a "$d/zig")"
+    r=$(w_tree wd2)
+    ci_as chmod 0555 "$r/main/zig/sub"
+    out=$(run_main "$r")
+    { grep -q RC0 <<<"$out" && ! grep -q "NRV-W1204\|NRV-E12" <<<"$out"; } || { echo "FAIL main/zig/sub 0555 (not a cache directory the step makes): $out" >&2; fail=1; }
+    is "main/zig/sub 0555: left alone" "yes 555" "$([ -e "$r/main/zig/sub/f" ] && echo yes) $(stat -c %a "$r/main/zig/sub")"
+    # ci_child_reset itself refuses what is not a direct child of the mount, and a link.
+    r=$(w_tree wr)
+    ci_as chmod 0555 "$r/main/zig/sub"
+    ( . ci/cache.sh; CI_JOB_USER=$jobuser ci_child_reset "$r/main/zig/sub" "$r/main" ) >/dev/null 2>&1 && { echo "FAIL ci_child_reset removed a grandchild" >&2; fail=1; }
+    is "ci_child_reset: a grandchild is kept" "yes" "$([ -e "$r/main/zig/sub/f" ] && echo yes)"
+    ci_as chmod 0555 "$r/main/zig"
+    ci_as ln -s "$r/main/zig" "$r/branches/zlink"
+    ( . ci/cache.sh; CI_JOB_USER=$jobuser ci_child_reset "$r/branches/zlink" "$r/branches" ) >/dev/null 2>&1 && { echo "FAIL ci_child_reset followed a link" >&2; fail=1; }
+    is "ci_child_reset: a link to an unwritable directory is not followed" "yes" "$([ -e "$r/main/zig/keep" ] && echo yes)"
+else
+    skip_note "the repair of a cache directory the job made unwritable (NRV-W1204, E1228)"
 fi
 
 # Lock files a prune makes are the step's own, 0600 (they used to be 0644 by root's umask, and a
@@ -1210,6 +1364,77 @@ grep -q NRV-W1201 <<<"$out" || { echo "FAIL install_zig: no NRV-W1201 in: $out" 
 is "a branch never replaces main's toolchain" tampered "$(cat "$tc/$asha.tar.xz")"
 ok "install_zig on main replaces a bad archive" run_zig CI_TOOLCHAIN_WRITE=1
 is "main's toolchain repaired" "yes" "$([ "$(sha256sum "$tc/$asha.tar.xz" | cut -d ' ' -f 1)" = "$asha" ] && echo yes)"
+
+# --- ci_step_run_with_tests (ci/lib.sh): the tail of a Woodpecker step (review 6001089776). Stub
+# commands that log what they saw; the real step runs `bash ci/ci_test.sh` and `ci/job.sh` here.
+st="$tmp/step"
+mkdir -p "$st"
+cat >"$st/tests.sh" <<'EOS'
+#!/bin/bash
+echo "tests fd9:$([ -e /proc/self/fd/9 ] && echo open || echo closed)" >>"$LOG"
+[ -z "${T_SLEEP:-}" ] || sleep "$T_SLEEP"
+exit "${T_RC:-0}"
+EOS
+cat >"$st/job.sh" <<'EOS'
+#!/bin/bash
+echo "job CI_SCRIPTS_TESTED=${CI_SCRIPTS_TESTED-unset} fd9:$([ -e /proc/self/fd/9 ] && echo open || echo closed)" >>"$LOG"
+exit "${J_RC:-0}"
+EOS
+step_run() { # step_run JOB T_RC J_RC TEST_SECONDS [VAR=value...]: sets step_rc, step_log, step_err
+    local job="$1" t_rc="$2" j_rc="$3" tsec="$4"
+    shift 4
+    rm -f "$st/log"
+    step_rc=0
+    (
+        . ci/lib.sh
+        export CI_KILL_AFTER=1
+        for kv in "$@"; do export "${kv?}"; done
+        exec 9<"$st/tests.sh" # an open lock descriptor, as the step has
+        tests_cmd=(env LOG="$st/log" T_RC="$t_rc" bash "$st/tests.sh")
+        job_cmd=(env LOG="$st/log" J_RC="$j_rc" bash "$st/job.sh")
+        ci_step_run_with_tests "$job" "$tsec" 60 tests_cmd job_cmd
+    ) 2>"$st/err" || step_rc=$?
+    step_log=$(tr '\n' '|' <"$st/log" 2>/dev/null || true)
+    step_err=$(cat "$st/err")
+}
+step_run check-scripts 1 0 60 X=1
+is "step tail: the tests fail, the job passes: the step fails" 1 "$step_rc"
+is "step tail: check-scripts runs the tests first, then the job with CI_SCRIPTS_TESTED=1, both with fd 9 closed" "tests fd9:closed|job CI_SCRIPTS_TESTED=1 fd9:closed|" "$step_log"
+step_run check-scripts 0 3 60 X=1
+is "step tail: the tests pass, the job fails: the job's status" 3 "$step_rc"
+step_run check-scripts 0 0 60 X=1
+is "step tail: both pass" 0 "$step_rc"
+step_run check-scripts 1 3 60 X=1
+is "step tail: both fail: the job's status" 3 "$step_rc"
+step_run check 1 0 60 CI_SCRIPTS_TESTED=1
+is "step tail: another job does not run the root tests (they would fail here), and passes alone" 0 "$step_rc"
+is "step tail: another job runs alone, CI_SCRIPTS_TESTED unset (even if a pipeline variable set it), fd 9 closed" "job CI_SCRIPTS_TESTED=unset fd9:closed|" "$step_log"
+step_run check 0 3 60 X=1
+is "step tail: another job's failure is the step's" 3 "$step_rc"
+# The tests have a bound of their own, and the message names its knob; the job still runs after it.
+step_run check-scripts 0 0 1 X=1 T_SLEEP=30
+is "step tail: root tests past their bound fail the step" 124 "$step_rc"
+grep -q "NRV-E1215: check-scripts's ci_test.sh, as root ran past its 1 seconds.*CI_SCRIPTS_TEST_MINUTES raises it" <<<"$step_err" || { echo "FAIL the tests' bound is not E1215 with its own knob: $step_err" >&2; fail=1; }
+is "step tail: the job still ran after the tests timed out" "yes" "$(grep -q 'job CI_SCRIPTS_TESTED=1' <<<"$step_log" && echo yes)"
+# The job's own timeout names CI_STEP_MINUTES.
+out=$(. ci/lib.sh; CI_KILL_AFTER=1 ci_run_timed demo 1 sleep 30 2>&1 || true)
+grep -q "NRV-E1215: demo ran past its 1 seconds.*CI_STEP_MINUTES raises it" <<<"$out" || { echo "FAIL the job's bound does not name CI_STEP_MINUTES: $out" >&2; fail=1; }
+refuses NRV-E1208 "CI_SCRIPTS_TEST_MINUTES not a number" env CI_SCRIPTS_TEST_MINUTES=soon ci/woodpecker_step.sh check
+refuses NRV-E1208 "CI_SCRIPTS_TEST_MINUTES zero" env CI_SCRIPTS_TEST_MINUTES=0 ci/woodpecker_step.sh check
+
+# --- The suite is hermetic (review 6001089776): the root run in a Woodpecker step has the step's
+# environment, and a step exports CI_BRANCH_PRUNE_ALL=1 when the box is low on disk. Run the whole
+# suite with every knob it exercises set to something hostile; it must still be ok. CI_TEST_NESTED
+# stops it from running itself again.
+if [ -z "${CI_TEST_NESTED:-}" ]; then
+    nested=$(env CI_TEST_NESTED=1 CI_BRANCH_PRUNE_ALL=1 CI_DOCKER_MAX_BYTES=10 CI_LOCK_WAIT=0 CI_MAIN_LOCK_WAIT=0 \
+        CI_BRANCH_CACHES=0 CI_BRANCH_CACHE_DAYS=0 CI_BRANCH_CACHE_MAX_GIB=0 CI_BRANCH_SEED_MAX_GIB=0 CI_PRUNE_WAIT=0 \
+        CI_FREE_MIN_GIB=99999 CI_JEPSEN_WAIT=0 CI_STEP_MINUTES=x CI_SCRIPTS_TEST_MINUTES=x CI_KILL_AFTER=0 CI_ARCH=aarch64 \
+        CI_DOCKER_BIN_DIR=/nonexistent CI_DOCKER_CLIENT_URL=file:///nonexistent CI_JOB_USER=nobody CI_CACHE_SHARED=0 \
+        CI_TOOLCHAIN_DIR=/nonexistent CI_TOOLCHAIN_WRITE=0 CI_COMMIT_BRANCH=main CI_PIPELINE_EVENT=push CI_SECCOMP=no \
+        bash "$root/ci/ci_test.sh" 2>&1) || true
+    grep -q '^ci_test: ok$' <<<"$nested" || { echo "FAIL the suite with every CI_* knob set (as a step or a pipeline variable can): $(grep -v '^note' <<<"$nested" | head -20)" >&2; fail=1; }
+fi
 
 if [ "$fail" = 0 ]; then echo "ci_test: ok"; fi
 exit "$fail"

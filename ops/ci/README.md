@@ -263,7 +263,12 @@ both call `ci/job.sh <job>`, so the two run the same checks. Each `.woodpecker/*
 runs `ci/woodpecker_step.sh <job>` in a pinned `ubuntu:24.04` image. That script installs the
 base packages, skips a docs-only push (`ci/changes.sh`), and runs the job as an unprivileged
 user `ci` under a timeout (75 minutes, 330 for the long searches; `CI_STEP_MINUTES` replaces it for a
-run, and a job that passes it fails NRV-E1215; ci.yml's are 30 to 60, but here
+run, and a job that passes it fails NRV-E1215). In `check-scripts` the step first runs
+`ci/ci_test.sh` as root under a bound of its own, 10 minutes (`CI_SCRIPTS_TEST_MINUTES` replaces it,
+a whole number of minutes, else NRV-E1208; it takes about a minute), so a hung test does not use
+the job's whole limit; the job then runs with `CI_SCRIPTS_TESTED=1` and the step fails if either
+failed. The suite ignores the step's `CI_*` variables (a low disk sets `CI_BRANCH_PRUNE_ALL`; a
+pipeline variable may set the rest); ci.yml's are 30 to 60, but here
 a push runs 16 workflows on one box beside the simulator fleet). No step is privileged, and only a
 push to `main` writes the shared caches (decision O4, `docs/decisions/O4-self-hosted-ci-trust.md`,
 which also says what a pusher of any branch can still do here: read it before giving anyone write
@@ -355,7 +360,14 @@ set:
    (`nerva-woodpecker.sh host` again, or `chown` and `chmod 0755` it on the host); a root `rm -rf` is only on a path whose parent is a mount root, and anything
    deeper is unlinked by the job's user. The step makes what a job needs there as the job's user (`ci_as_job`), replaces a
    symlink it finds (`rm` unlinks and never follows) and refuses what is not a plain directory the
-   job can write (NRV-E1228: `rm -rf` it on the host; it is only a cache).
+   job can write (NRV-E1228: `rm -rf` it on the host; it is only a cache). One repair, which is
+   an unlink and nothing else: a job's `chmod 0555` of a direct child of a mount root (a branch's
+   own `branches/b-<key>`, or main's `zig`, `zig-local` or `tools`) that its own uid owns would
+   fail every later pipeline for that directory, so root removes it (`rm -rf --one-file-system`,
+   the prune's own operation on a direct child, never through a link) under the lock that keeps the
+   other jobs out (the branch's own lock held exclusively; main's lock, waiting `CI_PRUNE_WAIT`),
+   warns (NRV-W1204) and the job's user makes it again. If other jobs hold that lock, a directory
+   another user owns, or a deeper path (a branch's `zig`, `main/zig/p`), it is NRV-E1228 as before.
    A lock that stays busy is never waited on for good: the branch caches' lock and a prune warn
    (NRV-W1202) and the job runs; a branch's own cache lock waits `CI_LOCK_WAIT` (300 s) and then
    fails NRV-E1225 (another step's prune of that cache, or a process on the host, holds it);
@@ -418,7 +430,7 @@ CI_PIPELINE_EVENT=manual ci/woodpecker_step.sh check-code
 - Nerva's workflows, after decision O4 (no step privileged; main and branch caches):
   - **Run (in a scratch directory, by `ci/ci_test.sh`, in `check-scripts`):** every refusal of
     the `ci/` scripts but E1203, E1209 and E1210 (E1201 with a stand-in for the kernel's refusal; E1202 for a writable main cache in a branch's role and a
-    missing mount; E1229 to E1232; E1204 to E1208; W1201 to W1203), and `ci_redact`; the cache rules (a
+    missing mount; E1229 to E1232; E1204 to E1208; W1201 to W1204), and `ci_redact`; the cache rules (a
     branch's cache is a copy, not a link; main is untouched by a branch; the count bound; a cache
     in use is not pruned; main's prune and its busy case); the toolchain archive checked and
     replaced on main, never replaced by a branch. `ci/changes_test.sh` covers the docs-only skip.

@@ -8,7 +8,7 @@
 # download does not match its pin, NRV-E1230 if the archive's path holds something that is not a
 # regular file (a link, a directory) or one over CI_DOCKER_MAX_BYTES, or cannot be read, NRV-E1231 if
 # CI_DOCKER_MAX_BYTES is not a whole number of bytes, NRV-E1232 if the private copy cannot be
-# written (a full disk under $TMPDIR: not the archive's fault).
+# created or written (no room, no inodes or a quota under $TMPDIR: not the archive's fault).
 # CI_DOCKER_CLIENT_URL replaces the download URL (for the table test); CI_ARCH replaces `uname -m`.
 #
 # An optional fourth word splits the work for a step that runs as root over a cache a job writes:
@@ -72,6 +72,9 @@ no_room() { # no_room WHY: NRV-E1232, the disk under $work (or $TMPDIR) is full 
 }
 work=$(mktemp -d 2>&1) || no_room "${work##*: }"
 trap 'rm -rf "$work"' EXIT
+# The copy is created before head runs: bash opens `>file` for head, and a failure of that open
+# (no inodes, a quota, no room for the entry) would otherwise look like a failed read of the archive.
+if ! why=$( { : >"$work/docker.tgz"; } 2>&1); then no_room "${why##*: }"; fi
 if not_regular; then exit 1; fi
 # head, not cat: bounded. Its stderr is kept in memory (a full disk could not hold a file for it).
 # A failure on the write side (head's own "error writing") is the disk under $work, not the archive.
