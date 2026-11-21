@@ -15,7 +15,7 @@ Cloudflare and GitHub settings. No new dependency enters the Zig build.
 ## Goal
 
 1. Nerva's site is served at `https://nerva.pro/`. It is still the one page `index.html` in
-   `NervaLog/nervalog.github.io`, and a merge to that repository's `main` is still a deploy. Now
+   `NervaOrg/nerva-site`, and a merge to that repository's `main` is still a deploy. Now
    **Cloudflare builds and deploys it, as a Worker of static assets** (Workers Builds, through its
    Git integration; P410). GitHub Pages is turned off. The release pull request flow (the App,
    `site-check`, the ruleset, P364's merge) does not change.
@@ -25,7 +25,7 @@ Cloudflare and GitHub settings. No new dependency enters the Zig build.
 3. The release is still one approval: the owner approves `mac` in `apple-signing`, and
    everything after it, the repositories included, runs without anyone. Nothing is published by
    hand afterwards.
-4. **Everything the packages' trust depends on lives in `NervaLog/nerva`,** under the same guard
+4. **Everything the packages' trust depends on lives in `NervaOrg/nerva`,** under the same guard
    as the release workflows and the signing environments: the public key, the pinned
    fingerprints, and the code that writes and checks the repositories. The site repository holds
    a static page and a copy of the public key for WKD (P376). That copy is a second channel for
@@ -41,7 +41,7 @@ https://nerva.pro/                 index.html: the Cloudflare Worker nerva-site 
 https://www.nerva.pro/             a Cloudflare redirect rule: 301 to https://nerva.pro/<path>
 https://nervalog.github.io/        GitHub Pages is off: GitHub's 404 (accepted, see "The old URL")
 https://packages.nerva.pro/        the R2 bucket nerva-packages, public, read-only (R2 custom domain)
-https://raw.githubusercontent.com/NervaLog/nerva/main/packaging/keys/nerva-release.asc
+https://raw.githubusercontent.com/NervaOrg/nerva/main/packaging/keys/nerva-release.asc
                                    the repositories' public key: a file in Nerva's repository
 https://nerva.pro/.well-known/openpgpkey/hu/ndqm47zydhyqyzabecddtdk1q3bponab?l=nerva
                                    the same key by WKD's direct method (P376), from the site
@@ -58,7 +58,7 @@ certificate.
 The site is a Worker made of static assets only (P410, which amends P365 point 1 and P398;
 Cloudflare Pages, which P365 chose, is the legacy product and is heading for its end of life).
 
-**How it deploys.** The Worker `nerva-site` is connected to `NervaLog/nervalog.github.io` through
+**How it deploys.** The Worker `nerva-site` is connected to `NervaOrg/nerva-site` through
 Cloudflare's GitHub App and built by **Workers Builds**. The App is installed on that one
 repository only. Its production branch is `main`: a merge to `main` starts a build, which runs the
 build command and then the deploy command, and a green build is the deploy. No Cloudflare token
@@ -123,7 +123,7 @@ three commands, set in the dashboard (setup step 2), each one line:
 Build command:
 
 ```
-f=/tmp/gate.sh; { curl -fsSo $f https://raw.githubusercontent.com/NervaLog/nerva/<commit>/.github/scripts/site_build.sh && echo "<sha256>  $f" | sha256sum -c --status; } || { echo 'error[NRV-E1164]: site build: site_build.sh not fetched, or its SHA-256 differs; nothing is deployed' >&2; exit 1; }; sh $f
+f=/tmp/gate.sh; { curl -fsSo $f https://raw.githubusercontent.com/NervaOrg/nerva/<commit>/.github/scripts/site_build.sh && echo "<sha256>  $f" | sha256sum -c --status; } || { echo 'error[NRV-E1164]: site build: site_build.sh not fetched, or its SHA-256 differs; nothing is deployed' >&2; exit 1; }; sh $f
 ```
 
 Deploy command:
@@ -1223,7 +1223,7 @@ fails with "Release file … is expired" while dnf keeps working. Two alarms com
    no environment and no secret, and never writes the bucket.
 
 The recovery, if the refresh was disabled: `gh workflow enable package-repos-refresh.yml --repo
-NervaLog/nerva`, then `gh workflow run package-repos-refresh.yml --repo NervaLog/nerva --ref main`.
+NervaOrg/nerva`, then `gh workflow run package-repos-refresh.yml --repo NervaOrg/nerva --ref main`.
 
 ### `repos-verify`
 
@@ -1430,7 +1430,7 @@ The `publish` job then runs `package_repos.sh sums-verify`, which needs no secre
 **Publication, and the trust anchor.** The public key is `packaging/keys/nerva-release.asc` in
 this repository, next to `packaging/keys/fingerprints`. Both change only by a pull request merged
 to `main` here. Users fetch it from
-`https://raw.githubusercontent.com/NervaLog/nerva/main/packaging/keys/nerva-release.asc`, and
+`https://raw.githubusercontent.com/NervaOrg/nerva/main/packaging/keys/nerva-release.asc`, and
 INSTALL.md prints the primary fingerprint to compare. The site serves the same bytes by WKD as a
 second channel for users to check (see "The key by WKD"). The job never reads that copy, and the
 bucket holds none. So neither a site merge nor the R2 token can change what the job trusts. A
@@ -1548,7 +1548,7 @@ under `pub`, never a subkey's. Slice 2's test compares the first two `bash` bloc
 
 ```bash
 sudo install -d -m 0755 /etc/apt/keyrings
-curl -fsSL https://raw.githubusercontent.com/NervaLog/nerva/main/packaging/keys/nerva-release.asc | sudo tee /etc/apt/keyrings/nerva.asc > /dev/null
+curl -fsSL https://raw.githubusercontent.com/NervaOrg/nerva/main/packaging/keys/nerva-release.asc | sudo tee /etc/apt/keyrings/nerva.asc > /dev/null
 gpg --show-keys /etc/apt/keyrings/nerva.asc     # the pub line's fingerprint must be <FINGERPRINT>
 sudo tee /etc/apt/sources.list.d/nerva.sources > /dev/null <<'EOF'
 Types: deb
@@ -1577,7 +1577,7 @@ baseurl=https://packages.nerva.pro/rpm/stable
 enabled=1
 gpgcheck=1
 repo_gpgcheck=1
-gpgkey=https://raw.githubusercontent.com/NervaLog/nerva/main/packaging/keys/nerva-release.asc
+gpgkey=https://raw.githubusercontent.com/NervaOrg/nerva/main/packaging/keys/nerva-release.asc
 EOF
 sudo dnf install nerva      # dnf shows the primary key's fingerprint and asks: it must be <FINGERPRINT>
 ```
@@ -1762,9 +1762,9 @@ git show "$(git log -1 --format=%H origin/main -- .github/scripts/site_build.sh)
   above). No IP filter, no expiry. **Create Token.** Do not copy the value anywhere: Workers
   Builds asks you to select it.
 - **Workers & Pages**, **Create**, then **Import a repository** (or **Connect to Git**, whichever
-  is shown). **GitHub:** Cloudflare asks to install its GitHub App. Install it on the **NervaLog**
-  organisation with **Only select repositories**, `nervalog.github.io`, and nothing else. Select
-  `NervaLog/nervalog.github.io`, then:
+  is shown). **GitHub:** Cloudflare asks to install its GitHub App. Install it on the **NervaOrg**
+  organisation with **Only select repositories**, `nerva-site`, and nothing else. Select
+  `NervaOrg/nerva-site`, then:
   - **Project name:** `nerva-site` (it must equal the `name` the gate writes);
   - **Build command:** the build command in "The site on a Cloudflare Worker", with `<commit>`
     and `<sha256>` filled in, exactly, on one line;
@@ -1779,7 +1779,7 @@ git show "$(git log -1 --format=%H origin/main -- .github/scripts/site_build.sh)
     refuses to run without it.
 - **Deploy** (or **Save and Deploy**). The first build may fail on a field this form did not
   show; finish the settings below, then retry it. In the Worker, **Settings**, **Build**:
-  - **Git repository** and **Git branch:** `NervaLog/nervalog.github.io`, `main`;
+  - **Git repository** and **Git branch:** `NervaOrg/nerva-site`, `main`;
   - **Build command**, **Deploy command**, **Non-production branch deploy command**: as above;
   - **API token:** `nerva-site build`;
   - **Build variables and secrets:** `SKIP_DEPENDENCY_INSTALL` = `1`, and nothing else;
@@ -1984,64 +1984,64 @@ slice 3 commits them to `packaging/keys/` as `current`.
 **6. The GitHub environment `package-repos`** (`main` only, no reviewers, no admin bypass):
 
 ```bash
-printf '%s' '{"can_admins_bypass":false,"deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}' | gh api -X PUT repos/NervaLog/nerva/environments/package-repos --input -
+printf '%s' '{"can_admins_bypass":false,"deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}' | gh api -X PUT repos/NervaOrg/nerva/environments/package-repos --input -
 ```
 
 ```bash
-gh api -X POST repos/NervaLog/nerva/environments/package-repos/deployment-branch-policies -f name=main -f type=branch
+gh api -X POST repos/NervaOrg/nerva/environments/package-repos/deployment-branch-policies -f name=main -f type=branch
 ```
 
 `gh` prompts for each secret's value. Paste it from the token page.
 
 ```bash
-gh secret set R2_ACCESS_KEY_ID --env package-repos --repo NervaLog/nerva
+gh secret set R2_ACCESS_KEY_ID --env package-repos --repo NervaOrg/nerva
 ```
 
 ```bash
-gh secret set R2_SECRET_ACCESS_KEY --env package-repos --repo NervaLog/nerva
+gh secret set R2_SECRET_ACCESS_KEY --env package-repos --repo NervaOrg/nerva
 ```
 
 ```bash
-gh variable set R2_ENDPOINT --env package-repos --repo NervaLog/nerva --body 'https://<account-id>.r2.cloudflarestorage.com'
+gh variable set R2_ENDPOINT --env package-repos --repo NervaOrg/nerva --body 'https://<account-id>.r2.cloudflarestorage.com'
 ```
 
 ```bash
-gh variable set R2_BUCKET --env package-repos --repo NervaLog/nerva --body nerva-packages
+gh variable set R2_BUCKET --env package-repos --repo NervaOrg/nerva --body nerva-packages
 ```
 
 ```bash
-gh variable set PACKAGES_BASE_URL --repo NervaLog/nerva --body 'https://packages.nerva.pro'
+gh variable set PACKAGES_BASE_URL --repo NervaOrg/nerva --body 'https://packages.nerva.pro'
 ```
 
 `PACKAGES_BASE_URL` is a repository variable, not the environment's (P404): `ci.yml`'s
 `repos-fresh`, the daily watch and `repos-verify` read it and have no environment. Do not set it on
 `package-repos` as well; if an earlier setup did, remove it there
-(`gh variable delete PACKAGES_BASE_URL --env package-repos --repo NervaLog/nerva`), so that the two
+(`gh variable delete PACKAGES_BASE_URL --env package-repos --repo NervaOrg/nerva`), so that the two
 cannot disagree.
 
 Then, in step 4's terminal. **4A:**
 
 ```bash
-gh secret set REPO_SIGNING_KEY --env package-repos --repo NervaLog/nerva < "$HOME/nerva-ci-subkey.asc"
+gh secret set REPO_SIGNING_KEY --env package-repos --repo NervaOrg/nerva < "$HOME/nerva-ci-subkey.asc"
 ```
 
 **4B** (GnuPG asks for the key's passphrase):
 
 ```bash
-gpg --armor --export-secret-keys "$fpr" | gh secret set REPO_SIGNING_KEY --env package-repos --repo NervaLog/nerva
+gpg --armor --export-secret-keys "$fpr" | gh secret set REPO_SIGNING_KEY --env package-repos --repo NervaOrg/nerva
 ```
 
 Then the passphrase of what you just set (4A: the CI passphrase; 4B: the key's):
 
 ```bash
-gh secret set REPO_SIGNING_PASSPHRASE --env package-repos --repo NervaLog/nerva
+gh secret set REPO_SIGNING_PASSPHRASE --env package-repos --repo NervaOrg/nerva
 ```
 
 The label the alarm job files under (see "Alarms"):
 
 ```bash
-gh label create package-repos --repo NervaLog/nerva --color B60205 --description 'A package repository run failed or a refresh was missed'
-gh variable set PACKAGE_REPOS_OWNER --repo NervaLog/nerva --body '<your GitHub login>'
+gh label create package-repos --repo NervaOrg/nerva --color B60205 --description 'A package repository run failed or a refresh was missed'
+gh variable set PACKAGE_REPOS_OWNER --repo NervaOrg/nerva --body '<your GitHub login>'
 ```
 
 The variable names who the alarm issue is assigned to (P376), so a real alarm notifies you
@@ -2064,10 +2064,13 @@ rm -P "$HOME/nerva-release-secret.asc" "$HOME/nerva-release.rev" && gpgconf --ki
 
 The fingerprints are not variables: they are pinned in `packaging/keys/fingerprints`.
 
-**7. Turn off GitHub Pages**, only once step 3's check showed `nerva.pro` served by Cloudflare:
+**7. Turn off GitHub Pages**, only once step 3's check showed `nerva.pro` served by Cloudflare.
+`NervaOrg/nerva-site` never had Pages (the Pages site was the old user site, `nervalog.github.io`,
+which is gone with its account), so on it this step is not needed: the call answers 404, which is
+expected there. Run it only if Pages was turned on for the new repository by mistake:
 
 ```bash
-gh api -X DELETE repos/NervaLog/nervalog.github.io/pages
+gh api -X DELETE repos/NervaOrg/nerva-site/pages
 ```
 
 `https://nervalog.github.io/` then answers 404 (see "The old URL").
@@ -2078,23 +2081,30 @@ request, `topwombat` cannot approve its own, and the ruleset has no bypass. Toda
 bare line `topwombat`) owns nothing, so `require_code_owner_review` has never applied. Turn that
 one field off and keep everything else as it is live (`site-check` required, no approvals, no
 bypass, the integration id and the review options it holds today). Read it, change one field,
-write it back:
+write it back. The ruleset's id is not fixed: it is the one on `NervaOrg/nerva-site`, named `main`
+(created in the automation guide's step 6), found by name. The old repository's id (27139365) means
+nothing here. A ruleset created from that guide has no `pull_request` rule, so the field is absent
+and this step changes nothing; it applies only to a ruleset that has one.
 
 ```bash
-gh api repos/NervaLog/nervalog.github.io/rulesets/27139365 --jq '{name, target, enforcement, conditions, bypass_actors, rules: [.rules[] | if .type == "pull_request" then .parameters.require_code_owner_review = false else . end]}' > "$HOME/site-ruleset.json"
+RS=$(gh api repos/NervaOrg/nerva-site/rulesets --jq '.[] | select(.name=="main") | .id') && echo "$RS"
+```
+
+```bash
+gh api repos/NervaOrg/nerva-site/rulesets/"$RS" --jq '{name, target, enforcement, conditions, bypass_actors, rules: [.rules[] | if .type == "pull_request" then .parameters.require_code_owner_review = false else . end]}' > "$HOME/site-ruleset.json"
 ```
 
 Compare it with the live ruleset:
 
 ```bash
-gh api repos/NervaLog/nervalog.github.io/rulesets/27139365 --jq '{name, target, enforcement, conditions, bypass_actors, rules}' | jq . > "$HOME/site-ruleset-live.json" && jq . "$HOME/site-ruleset.json" | diff "$HOME/site-ruleset-live.json" -
+gh api repos/NervaOrg/nerva-site/rulesets/"$RS" --jq '{name, target, enforcement, conditions, bypass_actors, rules}' | jq . > "$HOME/site-ruleset-live.json" && jq . "$HOME/site-ruleset.json" | diff "$HOME/site-ruleset-live.json" -
 ```
 
 The diff must show exactly one changed line, `"require_code_owner_review": true` to `false`.
 Anything else, stop. Then:
 
 ```bash
-gh api -X PUT repos/NervaLog/nervalog.github.io/rulesets/27139365 --input "$HOME/site-ruleset.json" && rm "$HOME/site-ruleset.json" "$HOME/site-ruleset-live.json"
+gh api -X PUT repos/NervaOrg/nerva-site/rulesets/"$RS" --input "$HOME/site-ruleset.json" && rm "$HOME/site-ruleset.json" "$HOME/site-ruleset-live.json"
 ```
 
 Cloudflare's check is **not** added to the ruleset (see "Preview deployments"). CODEOWNERS is
@@ -2104,7 +2114,7 @@ request does.
 **9. Homepages.**
 
 ```bash
-gh repo edit NervaLog/nervalog.github.io --homepage 'https://nerva.pro/' && gh repo edit NervaLog/nerva --homepage 'https://nerva.pro/'
+gh repo edit NervaOrg/nerva-site --homepage 'https://nerva.pro/' && gh repo edit NervaOrg/nerva --homepage 'https://nerva.pro/'
 ```
 
 **10. Check it.**
@@ -2118,30 +2128,29 @@ curl -sI 'https://packages.nerva.pro/nothing' | head -n1
 ```
 
 ```bash
-gh secret list --env package-repos --repo NervaLog/nerva && gh variable list --env package-repos --repo NervaLog/nerva && gh variable list --repo NervaLog/nerva
+gh secret list --env package-repos --repo NervaOrg/nerva && gh variable list --env package-repos --repo NervaOrg/nerva && gh variable list --repo NervaOrg/nerva
 ```
 
 ```bash
-gh api repos/NervaLog/nerva/environments/package-repos --jq '[.can_admins_bypass, .deployment_branch_policy.custom_branch_policies, (.protection_rules | map(.type) | join(","))] | @tsv'
+gh api repos/NervaOrg/nerva/environments/package-repos --jq '[.can_admins_bypass, .deployment_branch_policy.custom_branch_policies, (.protection_rules | map(.type) | join(","))] | @tsv'
 ```
 
 ```bash
-gh api repos/NervaLog/nervalog.github.io/rulesets/27139365 --jq '.rules[] | select(.type == "pull_request") | .parameters.require_code_owner_review'
+gh api repos/NervaOrg/nerva-site/rulesets/"$RS" --jq '.rules[] | select(.type == "pull_request") | .parameters.require_code_owner_review'
 ```
 
 ```bash
-gh api repos/NervaLog/nervalog.github.io/pages --silent; echo "pages exit $?"
+gh api repos/NervaOrg/nerva-site/pages --silent; echo "pages exit $?"
 ```
 
 ```bash
-gh label list --repo NervaLog/nerva --search package-repos
+gh label list --repo NervaOrg/nerva --search package-repos
 ```
 
 Expect: a 200 from `nerva.pro`; a 404 from `nervalog.github.io`; a 404 from `packages.nerva.pro`
 (served by R2: the bucket is empty); four secrets (`R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`,
 `REPO_SIGNING_KEY`, `REPO_SIGNING_PASSPHRASE`) and two variables (`R2_ENDPOINT`, `R2_BUCKET`) on the
-environment, and among the repository's variables `PACKAGES_BASE_URL` and `PACKAGE_REPOS_OWNER`; `false`, `true` and `branch_policy`; `false`; `pages exit 1` (Pages is
-off); and the label `package-repos`. Then tell the supervisor.
+environment, and among the repository's variables `PACKAGES_BASE_URL` and `PACKAGE_REPOS_OWNER`; `false`, `true` and `branch_policy`; `false`; `pages exit 1` (expected: `NervaOrg/nerva-site` never had Pages, so a 404 here proves nothing about step 7); and the label `package-repos`. Then tell the supervisor.
 
 **Rotating the R2 token** (yearly, or if it may have leaked): create a new token as in step 5, set
 both secrets again as in step 6, then delete the old token in the dashboard. A run in progress
@@ -2270,7 +2279,7 @@ packages (a dispatch for a published release would stop with NRV-E1148):
 **Afterwards:** the cleanup in automation.md stays as it is. The candidate stays in the `rc`
 channel. Nothing is deleted from the bucket. The run link goes in the worklog note of the pull
 request that records the result, and that pull request's author runs
-`gh variable set REPOS_LIVE --repo NervaLog/nerva --body true`, which switches on `repos-fresh`.
+`gh variable set REPOS_LIVE --repo NervaOrg/nerva --body true`, which switches on `repos-fresh`.
 
 **Not verified until the rehearsal** (slices 1 and 2 test the rest locally, with stand-ins, and in
 containers):

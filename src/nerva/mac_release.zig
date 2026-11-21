@@ -15,7 +15,7 @@ const assert = std.debug.assert;
 
 pub const default_identity = "Developer ID Application: Alex Zuzin (56A872L679)";
 pub const default_profile = "nerva-notary";
-const release_url = "https://github.com/NervaLog/nerva/releases/download";
+const release_url = "https://github.com/NervaOrg/nerva/releases/download";
 
 /// The longest release version the tool and `-Dversion` accept; every name buffer below is sized
 /// from it, so none can overflow.

@@ -187,7 +187,7 @@ is (P147i). Its tests need no network: `python3 ops/sim-fleet/test_sim_fleet.py`
      rounds are still counted, nothing is filed, and the daily totals stop appearing on the
      tracker.
 3. **No deploy key.** The repository is public, and the fleet fetches it over HTTPS
-   (`SIM_FLEET_REMOTE=https://github.com/NervaLog/nerva.git`, the default). Should it ever go
+   (`SIM_FLEET_REMOTE=https://github.com/NervaOrg/nerva.git`, the default). Should it ever go
    private: `ssh-keygen -t ed25519 -N '' -f nerva-fleet`, add `nerva-fleet.pub` under the
    repository's Settings, Deploy keys, **read-only**, set an `ssh` remote in `fleet.env` and give
    `setup.sh --deploy-key-file nerva-fleet`.
@@ -209,7 +209,7 @@ On a fresh host, as root:
 
 ```
 cd /root
-git clone https://github.com/NervaLog/nerva.git nerva
+git clone https://github.com/NervaOrg/nerva.git nerva
 sh nerva/ops/sim-fleet/setup.sh --token-file /root/github/token
 editor /etc/sim-fleet/fleet.env              # SIM_FLEET_TRACKER=<the tracking issue>
 systemctl restart sim-fleet

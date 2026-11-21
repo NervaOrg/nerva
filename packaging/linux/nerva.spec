@@ -1,4 +1,4 @@
-# Part of Nerva (https://github.com/NervaLog/nerva): builds nerva-<version>-1.<arch>.rpm with
+# Part of Nerva (https://github.com/NervaOrg/nerva): builds nerva-<version>-1.<arch>.rpm with
 # rpmbuild -bb (v0.7.1, P284b; docs/briefs/v0.7.1.md, slice 5). Nothing is compiled: the release
 # binary for the target is a build input, so the spec has no BuildRequires and one x86_64 machine
 # builds both architectures (`--target aarch64`). It is driven by packages.py and, later, by
@@ -24,7 +24,7 @@ Version:        %{nerva_version}
 Release:        1
 Summary:        Nerva, a research database with derived state maintained from one replicated log
 License:        Apache-2.0
-URL:            https://github.com/NervaLog/nerva
+URL:            https://github.com/NervaOrg/nerva
 # The binary is static: nothing to compute, and rpmfc cannot read a foreign architecture's.
 AutoReqProv:    no
 Requires(pre):  shadow-utils coreutils glibc-common

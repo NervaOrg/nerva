@@ -93,7 +93,7 @@ status=0
 # shellcheck disable=SC2016 # the scripts are run by the shells it starts, not expanded here
 flock -n -o -E 75 "$LOCK" runuser -u jepsen -- env HOME="$HOME_DIR" sh -c 'sh -c "$0" _ "$1" || exit 1' '
     set -e
-    [ -d "$1/.git" ] || git clone --quiet https://github.com/NervaLog/nerva.git "$1"
+    [ -d "$1/.git" ] || git clone --quiet https://github.com/NervaOrg/nerva.git "$1"
     cd "$1" && git fetch --quiet origin main && git checkout --quiet --detach FETCH_HEAD &&
         ./zig/download.sh && tests/jepsen/tools.sh >/dev/null' "$CHECKOUT" || status=$?
 if [ "$status" -eq 75 ]; then

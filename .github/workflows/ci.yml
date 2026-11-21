@@ -25,7 +25,7 @@ on:
   # Markdown alone (docs, CHANGELOG) pushed to main starts nothing (N68); release.yml's call still
   # runs. A pull request always runs, since the ruleset requires every check on it, but the
   # `changes` job turns every step of a docs-only one into a no-op (see below). The site is
-  # NervaLog/nervalog.github.io now (P148).
+  # NervaOrg/nerva-site now (P148).
   push:
     branches: [main]
     paths-ignore: ['**.md']

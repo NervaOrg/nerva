@@ -73,7 +73,7 @@ if [[ "${1:-}" == site ]]; then
       "the site's release list shows one sentence"
   fi
   # Printable ASCII, and none of < > & \ ` ": the site writes the sentence into a string in its script
-  # and into HTML (NervaLog/nervalog.github.io's site check holds the same rule).
+  # and into HTML (NervaOrg/nerva-site's site check holds the same rule).
   if LC_ALL=C grep -q '[^ -~]' <<< "$text" || [[ "$text" == *['<>&\`"']* ]]; then
     site_refuse "the site line of $tag holds a character the site does not take" \
       'the sentence must be printable ASCII without < > & \ ` or ", because the site writes it into its script and its HTML'

@@ -34,22 +34,26 @@ zip by its own `.sha256` file: [check a download first](#checking-a-download).
 ### Homebrew
 
 ```bash
-brew tap nervalog/tap
-brew trust nervalog/tap        # current Homebrew only; see below
-brew install nervalog/tap/nerva
+brew tap nervaorg/tap
+brew trust nervaorg/tap        # current Homebrew only; see below
+brew install nervaorg/tap/nerva
 nerva version
 ```
 
-Current Homebrew refuses a formula from a tap you have not trusted: `brew install nervalog/tap/nerva`
-stops with `Refusing to load formula nervalog/tap/nerva from untrusted tap nervalog/tap`, and
-`brew trust nervalog/tap` (or `brew trust --formula nervalog/tap/nerva`, for the one formula) is the
+Current Homebrew refuses a formula from a tap you have not trusted: `brew install nervaorg/tap/nerva`
+stops with `Refusing to load formula nervaorg/tap/nerva from untrusted tap nervaorg/tap`, and
+`brew trust nervaorg/tap` (or `brew trust --formula nervaorg/tap/nerva`, for the one formula) is the
 fix. A formula is code Homebrew runs, so read
-[`Formula/nerva.rb`](https://github.com/NervaLog/homebrew-tap/blob/main/Formula/nerva.rb), before you trust the tap; it is the
+[`Formula/nerva.rb`](https://github.com/NervaOrg/homebrew-tap/blob/main/Formula/nerva.rb), before you trust the tap; it is the
 formula described below. An older Homebrew has no `brew trust` and needs no such step: leave that line out
 (NRV-E1167 is the release check's version of this refusal).
 
-The tap is `NervaLog/homebrew-tap`, which exists once the first release is out; from then on
-`brew install nervalog/tap/nerva` installs the latest release from its `main`. A release candidate's
+**Upgrading from the old tap (`nervalog/tap`).** `brew untap` refuses a tap with `nerva` still
+installed, and the old tap is gone, so: `brew uninstall nerva`, `brew untap nervalog/tap`, then the
+three commands above. Your data files are not touched.
+
+The tap is `NervaOrg/homebrew-tap`, which exists once the first release is out; from then on
+`brew install nervaorg/tap/nerva` installs the latest release from its `main`. A release candidate's
 formula is on the tap's `rc/v<V>` branch, never on `main`, so `brew install` never installs one.
 The formula is generated from
 [`packaging/homebrew/nerva.rb`](../packaging/homebrew/nerva.rb) by `zig build -Drelease mac-release`, which the
@@ -107,7 +111,7 @@ trust the key: the key file comes from GitHub, and the steps below show you the 
 
 ```bash
 sudo install -d -m 0755 /etc/apt/keyrings
-curl -fsSL https://raw.githubusercontent.com/NervaLog/nerva/main/packaging/keys/nerva-release.asc | sudo tee /etc/apt/keyrings/nerva.asc > /dev/null
+curl -fsSL https://raw.githubusercontent.com/NervaOrg/nerva/main/packaging/keys/nerva-release.asc | sudo tee /etc/apt/keyrings/nerva.asc > /dev/null
 gpg --show-keys /etc/apt/keyrings/nerva.asc     # the pub line's fingerprint must be 949F066FB37C440E54B2A902AEA7B66340A6DBAB
 sudo tee /etc/apt/sources.list.d/nerva.sources > /dev/null <<'EOF'
 Types: deb
@@ -136,7 +140,7 @@ baseurl=https://packages.nerva.pro/rpm/stable
 enabled=1
 gpgcheck=1
 repo_gpgcheck=1
-gpgkey=https://raw.githubusercontent.com/NervaLog/nerva/main/packaging/keys/nerva-release.asc
+gpgkey=https://raw.githubusercontent.com/NervaOrg/nerva/main/packaging/keys/nerva-release.asc
 EOF
 sudo dnf install nerva      # dnf shows the key's fingerprint and asks: it must be 949F066FB37C440E54B2A902AEA7B66340A6DBAB
 ```
@@ -294,7 +298,7 @@ Zig is pinned inside the repository and `./zig/download.sh` installs it; nothing
 The commands are in the README's [Building](../README.md#building):
 
 ```bash
-git clone https://github.com/NervaLog/nerva.git && cd nerva
+git clone https://github.com/NervaOrg/nerva.git && cd nerva
 ./zig/download.sh
 ./zig/zig build -Drelease      # zig-out/bin/nerva
 ```

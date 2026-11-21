@@ -28,7 +28,7 @@ import test_r2 as T  # noqa: E402
 HERE = Path(__file__).resolve().parent
 SCRIPT = HERE / "package_repos.sh"
 R2 = HERE / "r2.py"
-REPO = "NervaLog/nerva"
+REPO = "NervaOrg/nerva"
 COMMIT = "c0ffee" * 6 + "c0de"
 PASS = {"a": "pw-a", "b": "pw-b", "c": "pw-c"}
 FOOT = "Check the signing key and the package's NEVRA and payload against the release's file, then run again"

@@ -56,7 +56,7 @@ with them (P312).
 
 ## Support
 
-GitHub issues on [NervaLog/nerva](https://github.com/NervaLog/nerva/issues). There is no SLA
+GitHub issues on [NervaOrg/nerva](https://github.com/NervaOrg/nerva/issues). There is no SLA
 and no other support channel. A vulnerability goes through [SECURITY.md](../SECURITY.md), not
 an issue.
 

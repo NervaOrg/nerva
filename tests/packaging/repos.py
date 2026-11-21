@@ -66,7 +66,7 @@ def normalize(block):
                             "$SUDO apt-get update && $SUDO apt-get install -y nerva=$APT_VER")
         line = line.replace("sudo dnf install nerva", "$SUDO dnf install -y nerva-$RPM_VER")
         line = line.replace("sudo ", "$SUDO ")
-        line = line.replace("https://raw.githubusercontent.com/NervaLog/nerva/main/packaging/keys/nerva-release.asc",
+        line = line.replace("https://raw.githubusercontent.com/NervaOrg/nerva/main/packaging/keys/nerva-release.asc",
                             "$KEY_URL")
         line = line.replace("https://packages.nerva.pro/apt", "$BASE/apt")
         line = line.replace("https://packages.nerva.pro/rpm/stable", "$BASE/rpm/$CHANNEL")

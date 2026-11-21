@@ -46,9 +46,9 @@ VERSION commit merged to main (CHANGELOG section with its site line, P360)
                              └─ publish  env release-publish (main only, no reviewers)
                                   ├─ release_check.sh publish-ready: draft, same commit, 12 assets, prerelease flag = tag (P361)
                                   ├─ publish the draft  → GitHub creates tag v<V> at the target
-                                  ├─ tap:  Formula/nerva.rb → NervaLog/homebrew-tap main   (App token)
+                                  ├─ tap:  Formula/nerva.rb → NervaOrg/homebrew-tap main   (App token)
                                   │        (a prerelease: branch rc/v<V>, never main)
-                                  └─ site: PR to NervaLog/nervalog.github.io, merged after site-check  (App token)
+                                  └─ site: PR to NervaOrg/nerva-site, merged after site-check  (App token)
                                            (a prerelease: PR opened, no auto-merge)
                                   └─ verify  (mac-verify.yml on the published release:
                                               arm64 + x86_64, brew install from the tap, nerva version, brew test)
@@ -117,7 +117,7 @@ full commit SHA, as today.
   `permissions: contents: write` (listing a draft). This is the existing check of the draft on
   `macos-15` and `macos-15-intel`, where `brew` is skipped.
 - **`publish`** (new): `needs: [mac, mac-verify]`, `runs-on: ubuntu-24.04`, `timeout-minutes: 45`,
-  `environment: release-publish`, `permissions: contents: write` (the draft in `NervaLog/nerva`
+  `environment: release-publish`, `permissions: contents: write` (the draft in `NervaOrg/nerva`
   only). `env: TAG`. The steps, each idempotent, so "Re-run failed jobs" finishes a half-done
   publish:
   1. Check out the workflow's own ref (`persist-credentials: false`). The scripts come from it,
@@ -131,7 +131,7 @@ full commit SHA, as today.
      (the `publish` job, after `sums-verify`), required: fifteen assets. It prints the commit.
   3. Download the `homebrew-formula` artifact (`actions/download-artifact`, pinned). Refuse,
      with a new code, unless its `url` is
-     `https://github.com/NervaLog/nerva/releases/download/<tag>/nerva-<tag>-universal-macos.zip`,
+     `https://github.com/NervaOrg/nerva/releases/download/<tag>/nerva-<tag>-universal-macos.zip`,
      its `version` is `<tag>` without the `v`, and its `sha256` equals the first field of the
      draft's `.zip.sha256`, downloaded with the token.
   4. **Publish:** `gh release edit "$TAG" --draft=false`, with `--latest` for a release and
@@ -141,20 +141,20 @@ full commit SHA, as today.
      come after this step, because a formula must never name a URL that is not public yet.
      Then check that `git/ref/tags/<tag>` resolves to the commit from step 2.
   5. **App token:** `actions/create-github-app-token` (pinned), `app-id: ${{ vars.RELEASE_APP_ID }}`,
-     `private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}`, `owner: NervaLog`,
-     `repositories: homebrew-tap,nervalog.github.io`, `permission-contents: write`,
+     `private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}`, `owner: NervaOrg`,
+     `repositories: homebrew-tap,nerva-site`, `permission-contents: write`,
      `permission-pull-requests: write`. The token is given only to steps 6 and 7, as `GH_TOKEN`
      in `env:`, and it expires within the hour.
-  6. **Tap:** clone `NervaLog/homebrew-tap` over HTTPS using a credential helper that reads
+  6. **Tap:** clone `NervaOrg/homebrew-tap` over HTTPS using a credential helper that reads
      `GH_TOKEN` from the environment, never a URL holding the token. Write the artifact to
      `Formula/nerva.rb`. If a file was there before, refuse (new code) when `git diff` changes any
      line but `url`, `version` and `sha256`. If nothing differs, skip the commit (a re-run).
      Otherwise commit `nerva <V>` as the App's bot identity and push: **to `main` for a release,
      and to branch `rc/v<V>` for a prerelease**. A prerelease never reaches the tap's `main`, so
-     `brew install nervalog/tap/nerva` never installs a candidate.
+     `brew install nervaorg/tap/nerva` never installs a candidate.
   7. **Site:** `python3 .github/scripts/site_release.py index.html <version> <date> <site line>`
      (new script, unit-tested in `ci.yml`'s scripts step) edits a checkout of
-     `NervaLog/nervalog.github.io`. It prepends `{v:"<V>", date:"<date>", d:"<site line>"}` to
+     `NervaOrg/nerva-site`. It prepends `{v:"<V>", date:"<date>", d:"<site line>"}` to
      `RELEASES` and sets `SITE.version`, `SITE.released` and `SITE.updated`. It refuses (new code)
      unless `const SITE = {`, `const RELEASES = [` and each of those three keys occur exactly once,
      and it does nothing if `RELEASES` already holds `<V>`. The step pushes branch
@@ -175,8 +175,8 @@ full commit SHA, as today.
        as today (CLAUDE.md, "README and site status").
 - **`verify`** (new): `needs: publish`, `uses: ./.github/workflows/mac-verify.yml` with `tag` and
   `tap-ref` (`main`, or `rc/v<V>` for a prerelease), `permissions: contents: write`. The release is
-  now published, so the brew step runs on both architectures: it taps `nervalog/tap`, checks out
-  `tap-ref`, then `brew install nervalog/tap/nerva`, `nerva version` (ending `version <V>`) and
+  now published, so the brew step runs on both architectures: it taps `nervaorg/tap`, checks out
+  `tap-ref`, then `brew install nervaorg/tap/nerva`, `nerva version` (ending `version <V>`) and
   `brew test nerva`. No environment and no secret.
 
 ### `mac-sign.yml` (comments only)
@@ -188,7 +188,7 @@ cannot happen in that path.
 ### `mac-verify.yml` (changed)
 
 - A new optional input, `tap-ref` (default `main`), for both `workflow_call` and
-  `workflow_dispatch`. After `brew tap nervalog/tap`, the brew step checks out that ref in the tap's
+  `workflow_dispatch`. After `brew tap nervaorg/tap`, the brew step checks out that ref in the tap's
   repository. The `release: published` trigger stays, for a draft published by hand.
 - With `workflow_call` on a published release, the step makes one attempt (`EVENT` is not
   `release`), which is right: the tap is committed before `verify` starts.
@@ -213,7 +213,7 @@ early). It also refuses a tag that is not `v<X.Y.Z>` or `v<X.Y.Z>-rc.<N>`: only 
 prereleases are published by the automation (P361). The check runs in `version`, before CI. The supervisor writes the line in the `VERSION` PR, as it
 writes the rest of the section.
 
-### `NervaLog/nervalog.github.io` (new file there)
+### `NervaOrg/nerva-site` (new file there)
 
 `.github/workflows/check.yml` runs on every pull request to `main`. It extracts the page's
 `<script>`, runs `node --check` on it, and evaluates the data block to assert that `RELEASES` is
@@ -243,7 +243,7 @@ stood for them before that document; it no longer holds a design.
    covers it, as `mac-sign.yml`'s dispatch does today.
 5. **`docs/INSTALL.md`** says the tap is "not published yet". The implementing PR words it for a
    tap that exists once the first release is out.
-6. **The site repository** has no workflow, no ruleset, and `allow_auto_merge` off (checked
+6. **The site repository** (`NervaLog/nervalog.github.io`) had no workflow, no ruleset, and `allow_auto_merge` off (checked
    2026-11-12). Auto-merge cannot work until the setup below is done.
 7. **The site's `d` text** has no source in this repository. The site line fills that gap and
    adds a refusal to the `version` job.
@@ -267,7 +267,7 @@ stood for them before that document; it no longer holds a design.
   `actions/download-artifact` are added, each pinned, with the tag in a comment.
 - **The App's reach.** "Nerva Release" has these repository permissions: Contents read and write,
   Pull requests read and write, Metadata read. It has nothing else. It is installed only on
-  `NervaLog/homebrew-tap` and `NervaLog/nervalog.github.io`, **not on `NervaLog/nerva`**: writes to
+  `NervaOrg/homebrew-tap` and `NervaOrg/nerva-site`, **not on `NervaOrg/nerva`**: writes to
   Nerva itself use the run's `GITHUB_TOKEN`. Its key and id live only in the environment
   `release-publish`, which accepts deployments from `main` only, so only a workflow merged to
   `main` can read them. Each run mints a token for those two repositories, narrowed to the two
@@ -304,31 +304,31 @@ read (environment settings and secrets). The owner checks those with the command
 
 | # | Item | Kind | Where | Owner of it | Exists? |
 |---|---|---|---|---|---|
-| 1 | GitHub App "Nerva Release": Contents RW, Pull requests RW, Metadata R | GitHub App | NervaLog org, installed on `homebrew-tap`, `nervalog.github.io` | owner | new |
+| 1 | GitHub App "Nerva Release": Contents RW, Pull requests RW, Metadata R | GitHub App | NervaOrg org, installed on `homebrew-tap`, `nerva-site` | owner | new |
 | 2 | `RELEASE_APP_ID` | variable | env `release-publish` | owner | new |
 | 3 | `RELEASE_APP_PRIVATE_KEY` (the App's `.pem`) | secret | env `release-publish` | owner | new |
-| 4 | Environment `release-publish`: deployments from `main` only, no reviewers | environment | NervaLog/nerva | owner | new |
-| 5 | Environment `apple-signing`: owner as required reviewer, `main` only, no admin bypass | environment | NervaLog/nerva | owner | unknown (P343 says the owner creates it; `mac-sign.yml` names it) |
+| 4 | Environment `release-publish`: deployments from `main` only, no reviewers | environment | NervaOrg/nerva | owner | new |
+| 5 | Environment `apple-signing`: owner as required reviewer, `main` only, no admin bypass | environment | NervaOrg/nerva | owner | unknown (P343 says the owner creates it; `mac-sign.yml` names it) |
 | 6 | `APPLE_DEVELOPER_ID_P12` (base64 of the CI Developer ID `.p12`, P343 7c), `APPLE_DEVELOPER_ID_P12_PASSWORD` | secrets | env `apple-signing` | owner | unknown; P343: none added yet |
 | 7 | `APPLE_NOTARY_KEY_P8` (base64 of `AuthKey_<id>.p8`), `APPLE_NOTARY_KEY_ID`, `APPLE_NOTARY_ISSUER_ID` | secrets | env `apple-signing` | owner | unknown; P343: none added yet |
 | 8 | `NERVA_SIGN_IDENTITY` (optional; unset means `build.zig`'s default) | variable | env `apple-signing` | owner | unknown |
-| 9 | `NervaLog/homebrew-tap`, public, `main` with a README | repository | NervaLog | owner | new (owner creates it) |
-| 10 | Ruleset on the tap's `main`: no force push, no deletion | ruleset | NervaLog/homebrew-tap | owner | new |
-| 11 | `allow_auto_merge` on | setting | NervaLog/nervalog.github.io | owner | no (off) |
-| 12 | Ruleset on the site's `main`: required check `site-check`, owner (admin) may bypass | ruleset | NervaLog/nervalog.github.io | owner | no (no rulesets) |
-| 13 | `.github/workflows/check.yml` (job `site-check`) | workflow | NervaLog/nervalog.github.io | implementer | no (no workflows) |
-| 14 | `.github/workflows/release-finish.yml` | workflow | NervaLog/nerva | implementer | new |
-| 15 | `release.yml`: `version` site-line check; `mac` and `mac-verify` replaced by `finish` | workflow | NervaLog/nerva | implementer | changed |
-| 16 | `mac-verify.yml`: `tap-ref` input, header | workflow | NervaLog/nerva | implementer | changed |
-| 17 | `mac-sign.yml`: comments only | workflow | NervaLog/nerva | implementer | exists |
-| 18 | `release_check.sh publish-ready`, `release_notes.sh site`, with tests in `test_release_check.py` | script | NervaLog/nerva | implementer | changed |
-| 19 | `.github/scripts/site_release.py` and its test | script | NervaLog/nerva | implementer | new |
-| 20 | `mac_keychain.sh`, `mac_zip_check.sh` | scripts | NervaLog/nerva | — | exist, unchanged |
-| 21 | New codes from NRV-E1130 in `docs/ERRORS.md` (site line, publish-ready, formula, tap diff, site edit, site merge, finish ref) | docs | NervaLog/nerva | implementer | new |
+| 9 | `NervaOrg/homebrew-tap`, public, `main` with a README | repository | NervaOrg | owner | new (owner creates it) |
+| 10 | Ruleset on the tap's `main`: no force push, no deletion | ruleset | NervaOrg/homebrew-tap | owner | new |
+| 11 | `allow_auto_merge` on | setting | NervaOrg/nerva-site | owner | new (owner sets it; on `NervaLog/nervalog.github.io` it was off, 2026-11-12) |
+| 12 | Ruleset on the site's `main`: required check `site-check`, owner (admin) may bypass | ruleset | NervaOrg/nerva-site | owner | new (owner creates it; `NervaLog/nervalog.github.io` had none, 2026-11-12) |
+| 13 | `.github/workflows/check.yml` (job `site-check`) | workflow | NervaOrg/nerva-site | implementer | new (`NervaLog/nervalog.github.io` had no workflows, 2026-11-12) |
+| 14 | `.github/workflows/release-finish.yml` | workflow | NervaOrg/nerva | implementer | new |
+| 15 | `release.yml`: `version` site-line check; `mac` and `mac-verify` replaced by `finish` | workflow | NervaOrg/nerva | implementer | changed |
+| 16 | `mac-verify.yml`: `tap-ref` input, header | workflow | NervaOrg/nerva | implementer | changed |
+| 17 | `mac-sign.yml`: comments only | workflow | NervaOrg/nerva | implementer | exists |
+| 18 | `release_check.sh publish-ready`, `release_notes.sh site`, with tests in `test_release_check.py` | script | NervaOrg/nerva | implementer | changed |
+| 19 | `.github/scripts/site_release.py` and its test | script | NervaOrg/nerva | implementer | new |
+| 20 | `mac_keychain.sh`, `mac_zip_check.sh` | scripts | NervaOrg/nerva | — | exist, unchanged |
+| 21 | New codes from NRV-E1130 in `docs/ERRORS.md` (site line, publish-ready, formula, tap diff, site edit, site merge, finish ref) | docs | NervaOrg/nerva | implementer | new |
 | 22 | `actions/create-github-app-token`, `actions/download-artifact`, each pinned to a full SHA | actions | `release-finish.yml` | implementer | new |
-| 23 | CHANGELOG site line in each release section | docs | NervaLog/nerva | supervisor | new |
-| 24 | CLAUDE.md: "release.yml publishes after the owner's one approval; a session never approves a deployment"; `docs/INSTALL.md` tap wording | docs | NervaLog/nerva | implementer | changed |
-| 25 | Tag rulesets: none on NervaLog/nerva today (the one ruleset, "To Auto-merge", targets branches). If one is added for `v*`, GitHub Actions needs to be on its bypass list, because publishing creates the tag. | ruleset | NervaLog/nerva | owner | none, nothing to do |
+| 23 | CHANGELOG site line in each release section | docs | NervaOrg/nerva | supervisor | new |
+| 24 | CLAUDE.md: "release.yml publishes after the owner's one approval; a session never approves a deployment"; `docs/INSTALL.md` tap wording | docs | NervaOrg/nerva | implementer | changed |
+| 25 | Tag rulesets: none on NervaLog/nerva on 2026-11-12 (the one ruleset, "To Auto-merge", targets branches); a new `NervaOrg/nerva` has none until the owner adds one. If one is added for `v*`, GitHub Actions needs to be on its bypass list, because publishing creates the tag. | ruleset | NervaOrg/nerva | owner | new (none; nothing to do unless one is added) |
 
 ## Setup guide (owner, once)
 
@@ -338,43 +338,43 @@ your Mac (`base64 -i` and `rm -P` are macOS forms), signed in to `gh` as `topwom
 **1. The tap repository.**
 
 ```bash
-gh repo create NervaLog/homebrew-tap --public --add-readme --description "Homebrew tap for Nerva: brew install nervalog/tap/nerva"
+gh repo create NervaOrg/homebrew-tap --public --add-readme --description "Homebrew tap for Nerva: brew install nervaorg/tap/nerva"
 ```
 
 ```bash
-printf '%s' '{"name":"main","target":"branch","enforcement":"active","conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"non_fast_forward"},{"type":"deletion"}]}' | gh api -X POST repos/NervaLog/homebrew-tap/rulesets --input -
+printf '%s' '{"name":"main","target":"branch","enforcement":"active","conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"non_fast_forward"},{"type":"deletion"}]}' | gh api -X POST repos/NervaOrg/homebrew-tap/rulesets --input -
 ```
 
-**2. The GitHub App.** This part is in the browser. Go to the NervaLog organisation, then
+**2. The GitHub App.** This part is in the browser. Go to the NervaOrg organisation, then
 Settings, Developer settings, GitHub Apps, New GitHub App.
-- Name: `Nerva Release`. Homepage: `https://github.com/NervaLog/nerva`.
+- Name: `Nerva Release`. Homepage: `https://github.com/NervaOrg/nerva`.
 - Webhook: untick Active.
 - Repository permissions: **Contents: Read and write**, **Pull requests: Read and write**,
   Metadata: Read. Nothing else.
 - Where it can be installed: "Only on this account".
 - Create it, and note the App ID. Then **Generate a private key**, and a `.pem` downloads.
-- Then **Install App**, choose NervaLog, then **Only select repositories**: `homebrew-tap` and
-  `nervalog.github.io`. Do not select `nerva`.
+- Then **Install App**, choose NervaOrg, then **Only select repositories**: `homebrew-tap` and
+  `nerva-site`. Do not select `nerva`.
 
 **3. The environment `release-publish`.**
 
 ```bash
-printf '%s' '{"deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}' | gh api -X PUT repos/NervaLog/nerva/environments/release-publish --input -
+printf '%s' '{"deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}' | gh api -X PUT repos/NervaOrg/nerva/environments/release-publish --input -
 ```
 
 ```bash
-gh api -X POST repos/NervaLog/nerva/environments/release-publish/deployment-branch-policies -f name=main -f type=branch
+gh api -X POST repos/NervaOrg/nerva/environments/release-publish/deployment-branch-policies -f name=main -f type=branch
 ```
 
 **4. The App's id and key in it.** The first command prompts for the App ID. The second reads the
 `.pem` from standard input. Give the path when asked.
 
 ```bash
-read -rp 'Nerva Release App ID: ' app_id && printf '%s' "$app_id" | gh variable set RELEASE_APP_ID --env release-publish --repo NervaLog/nerva
+read -rp 'Nerva Release App ID: ' app_id && printf '%s' "$app_id" | gh variable set RELEASE_APP_ID --env release-publish --repo NervaOrg/nerva
 ```
 
 ```bash
-read -rp 'Path to the App private key (.pem): ' pem && gh secret set RELEASE_APP_PRIVATE_KEY --env release-publish --repo NervaLog/nerva < "$pem" && rm -P "$pem"
+read -rp 'Path to the App private key (.pem): ' pem && gh secret set RELEASE_APP_PRIVATE_KEY --env release-publish --repo NervaOrg/nerva < "$pem" && rm -P "$pem"
 ```
 
 (The App can issue a new key at any time, so the `.pem` is deleted.)
@@ -384,22 +384,22 @@ you as the only required reviewer, `main` only, with no administrator bypass. It
 those are already the settings.
 
 ```bash
-id=$(gh api users/topwombat --jq .id) && printf '{"reviewers":[{"type":"User","id":%s}],"can_admins_bypass":false,"deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}' "$id" | gh api -X PUT repos/NervaLog/nerva/environments/apple-signing --input -
+id=$(gh api users/topwombat --jq .id) && printf '{"reviewers":[{"type":"User","id":%s}],"can_admins_bypass":false,"deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}' "$id" | gh api -X PUT repos/NervaOrg/nerva/environments/apple-signing --input -
 ```
 
 ```bash
-gh api repos/NervaLog/nerva/environments/apple-signing/deployment-branch-policies --jq '.branch_policies[].name' | grep -qx main || gh api -X POST repos/NervaLog/nerva/environments/apple-signing/deployment-branch-policies -f name=main -f type=branch
+gh api repos/NervaOrg/nerva/environments/apple-signing/deployment-branch-policies --jq '.branch_policies[].name' | grep -qx main || gh api -X POST repos/NervaOrg/nerva/environments/apple-signing/deployment-branch-policies -f name=main -f type=branch
 ```
 
 Export the **CI** Developer ID Application certificate (P343 7c: not the laptop's) with its key
 as a `.p12`, with an export password. Use Keychain Access, under My Certificates, then Export.
 
 ```bash
-read -rp 'Path to the CI Developer ID .p12: ' p12 && base64 -i "$p12" | gh secret set APPLE_DEVELOPER_ID_P12 --env apple-signing --repo NervaLog/nerva && rm -P "$p12"
+read -rp 'Path to the CI Developer ID .p12: ' p12 && base64 -i "$p12" | gh secret set APPLE_DEVELOPER_ID_P12 --env apple-signing --repo NervaOrg/nerva && rm -P "$p12"
 ```
 
 ```bash
-gh secret set APPLE_DEVELOPER_ID_P12_PASSWORD --env apple-signing --repo NervaLog/nerva
+gh secret set APPLE_DEVELOPER_ID_P12_PASSWORD --env apple-signing --repo NervaOrg/nerva
 ```
 
 (`gh` prompts for the value.) Next, the notary key. In App Store Connect, go to Users and Access,
@@ -407,26 +407,26 @@ Integrations, App Store Connect API, Team Keys. Generate a key with the role **D
 its Key ID and the Issuer ID, and download `AuthKey_<id>.p8` (it can be downloaded once).
 
 ```bash
-read -rp 'Path to AuthKey_<id>.p8: ' p8 && base64 -i "$p8" | gh secret set APPLE_NOTARY_KEY_P8 --env apple-signing --repo NervaLog/nerva && rm -P "$p8"
+read -rp 'Path to AuthKey_<id>.p8: ' p8 && base64 -i "$p8" | gh secret set APPLE_NOTARY_KEY_P8 --env apple-signing --repo NervaOrg/nerva && rm -P "$p8"
 ```
 
 ```bash
-gh secret set APPLE_NOTARY_KEY_ID --env apple-signing --repo NervaLog/nerva
+gh secret set APPLE_NOTARY_KEY_ID --env apple-signing --repo NervaOrg/nerva
 ```
 
 ```bash
-gh secret set APPLE_NOTARY_ISSUER_ID --env apple-signing --repo NervaLog/nerva
+gh secret set APPLE_NOTARY_ISSUER_ID --env apple-signing --repo NervaOrg/nerva
 ```
 
 **6. The site repository: auto-merge and its required check.** Do this after `check.yml` has
 merged there (slice D), so the check has run once and can be required.
 
 ```bash
-gh api -X PATCH repos/NervaLog/nervalog.github.io -F allow_auto_merge=true -F delete_branch_on_merge=true --silent
+gh api -X PATCH repos/NervaOrg/nerva-site -F allow_auto_merge=true -F delete_branch_on_merge=true --silent
 ```
 
 ```bash
-printf '%s' '{"name":"main","target":"branch","enforcement":"active","bypass_actors":[{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"}],"conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"deletion"},{"type":"non_fast_forward"},{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"site-check"}]}}]}' | gh api -X POST repos/NervaLog/nervalog.github.io/rulesets --input -
+printf '%s' '{"name":"main","target":"branch","enforcement":"active","bypass_actors":[{"actor_id":5,"actor_type":"RepositoryRole","bypass_mode":"always"}],"conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"],"exclude":[]}},"rules":[{"type":"deletion"},{"type":"non_fast_forward"},{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false,"required_status_checks":[{"context":"site-check"}]}}]}' | gh api -X POST repos/NervaOrg/nerva-site/rulesets --input -
 ```
 
 (`actor_id` 5 is the repository admin role, so your own direct pushes still go through. The
@@ -437,7 +437,7 @@ from the site repository's variable `RELEASE_APP_LOGIN`: `<app-slug>[bot]`, whic
 `nerva-release[bot]` for the App named `Nerva Release`. Without it that author rule does not hold.
 
 ```bash
-printf '%s' 'nerva-release[bot]' | gh variable set RELEASE_APP_LOGIN --repo NervaLog/nervalog.github.io
+printf '%s' 'nerva-release[bot]' | gh variable set RELEASE_APP_LOGIN --repo NervaOrg/nerva-site
 ```
 
 (Check the slug on the App's settings page; it is the name in lower case with dashes.)
@@ -445,24 +445,36 @@ printf '%s' 'nerva-release[bot]' | gh variable set RELEASE_APP_LOGIN --repo Nerv
 **7. Check.**
 
 ```bash
-gh secret list --env apple-signing --repo NervaLog/nerva
+gh secret list --env apple-signing --repo NervaOrg/nerva
 ```
 
 ```bash
-gh secret list --env release-publish --repo NervaLog/nerva && gh variable list --env release-publish --repo NervaLog/nerva
+gh secret list --env release-publish --repo NervaOrg/nerva && gh variable list --env release-publish --repo NervaOrg/nerva
 ```
 
 ```bash
-gh variable list --repo NervaLog/nervalog.github.io
+gh variable list --repo NervaOrg/nerva-site
 ```
 
 ```bash
-gh api repos/NervaLog/nerva/environments --jq '.environments[] | [.name, (.protection_rules | map(.type) | join(","))] | @tsv'
+gh api repos/NervaOrg/nerva/environments --jq '.environments[] | [.name, (.protection_rules | map(.type) | join(","))] | @tsv'
 ```
 
 Expect five Apple secrets in `apple-signing`, `RELEASE_APP_PRIVATE_KEY` and `RELEASE_APP_ID` in
 `release-publish`, `RELEASE_APP_LOGIN` on the site, `apple-signing` with `required_reviewers,branch_policy`, and `release-publish`
 with `branch_policy` only. Then tell the supervisor, and the rehearsal follows.
+
+**8. After the move to NervaOrg (O2): the site's own setup.** The site repository is new, so these
+four things are the owner's and none of them is in the repository's files:
+
+- **Re-pin the `nerva-site` Worker's build command.** In the Cloudflare dashboard the Worker's
+  build command carries a commit and a SHA-256 of `.github/scripts/site_build.sh` in **this**
+  repository (packages.md, "The site on a Cloudflare Worker", and its setup step 2). Pin it to a
+  commit of `NervaOrg/nerva` and that file's SHA-256 there, and connect the Worker to
+  `NervaOrg/nerva-site`. Until then the build refuses (NRV-E1164) or runs the old gate.
+- **Set `RELEASE_APP_LOGIN`** on `NervaOrg/nerva-site` (step 6 above gives the command).
+- **Change `SITE.repo`** in the site's `index.html` to `NervaOrg/nerva`, in a site pull request.
+- **Create the site's ruleset** (step 6 above): required check `site-check`, no force push, no deletion.
 
 ## A release afterwards
 
@@ -549,7 +561,7 @@ mechanical tier for work fully specified by a pattern.
 | Slice | What | Files | Model (tier) |
 |---|---|---|---|
 | A | `mac_keychain.sh` re-wraps the `.p12` (see "Security notes") with a test; `release_check.sh publish-ready`; `release_notes.sh site` and dropping the site line; `site_release.py`; their tests in `ci.yml`'s scripts step; the new codes in `docs/ERRORS.md` | `.github/scripts/*`, `docs/ERRORS.md`, `ci.yml` (one step) | implementation tier; review tier |
-| D | The site's `check.yml` (`site-check`), as a PR on `NervaLog/nervalog.github.io` (runs in parallel with A) | that repository only | implementation tier; review tier |
+| D | The site's `check.yml` (`site-check`), as a PR on `NervaOrg/nerva-site` (runs in parallel with A) | that repository only | implementation tier; review tier |
 | B | `release-finish.yml`; `release.yml`'s `finish` and site-line refusal; `mac-verify.yml`'s `tap-ref`. Tried on a dispatch with a prerelease before review where it can be (no secrets are needed up to `mac`). After A. | `.github/workflows/{release,release-finish,mac-verify}.yml` | implementation tier; review tier (security focus: environments, tokens, argv) |
 | C | Header comments of `mac-sign.yml`, `release.yml` and `mac-verify.yml`; `docs/INSTALL.md`'s tap wording; the CLAUDE.md release line, and a CLAUDE.md rule that a session never approves a deployment (P360 2 relies on it). Mechanical, from this spec. After B. | those files | mechanical tier; the supervisor checks the diff |
 | E | The setup guide above | GitHub settings | owner (in parallel with A and D) |
