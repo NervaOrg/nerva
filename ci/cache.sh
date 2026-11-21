@@ -24,8 +24,8 @@
 # partial directory's zig/p, a branch's zig link) is unlinked by the job user.
 # What is then not a plain directory the job can write is refused: NRV-E1228. One repair, by an
 # unlink and no more: a DIRECT child of a mount root (a branch's own directory, main's zig,
-# zig-local or tools) that is a real directory the job's own uid owns and the job cannot write (its
-# `chmod 0555`) is removed with rm -rf --one-file-system, as the prune removes one, under the lock
+# zig-local or tools) that is a real directory the job's own uid owns and the job cannot use (not writable or not
+# searchable: its `chmod 0555`, `0600`, `0666` or `0200`) is removed with rm -rf --one-file-system, as the prune removes one, under the lock
 # that keeps the other jobs out (the key's lock for a branch, main's exclusive one for main), and
 # made again by the job's user: NRV-W1204. A directory another user owns, and anything deeper (a
 # branch's own zig), stays NRV-E1228.
@@ -35,7 +35,11 @@
 # round (NRV-E1202: root's access(2) test, which only a read-only mount changes, never the owner or
 # the mode of the mount root), and a mount root the job's user cannot write (the job's own test: if
 # the job owns it and only its mode, from a job's chmod, stops it, it is set back to 0755 with
-# NRV-W1203; if another user owns it, NRV-E1229 with the owner and mode in the message). The mounts are
+# NRV-W1203; if another user owns it, NRV-E1229 with the owner and mode in the message). "Can write"
+# is ci_job_usable everywhere: writable AND searchable, asked as the job, so a `chmod 0600`, `0666` or
+# `0200` is caught as a `chmod 0555` is. Deeper paths (main/zig/p, a branch's zig) are not checked:
+# root cannot remove them without walking a job-writable parent (a link planted there would be
+# followed), so a job's chmod there fails inside the job, not in the preamble. The mounts are
 # what enforce the rule: this script only notices a wrong one.
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
@@ -57,6 +61,15 @@ ci_cache_writable() {
     test -w "$1"
 }
 
+# ci_job_usable DIR: whether the job's user can use DIR as a directory it makes things in: writable
+# AND searchable, asked as the job (access(2) for it). `test -w` alone ignores the search bit: a
+# job's `chmod 0600`, `0666` or `0200` of its own directory leaves it writable by the mode and yet
+# nothing can be made inside it (review 6001444818). The one question every check of a job's
+# directory (ci_cache_job_writable, ci_child_unwritable, ci_job_dir) asks.
+ci_job_usable() {
+    ci_as_job sh -c 'test -w "$1" && test -x "$1"' _ "$1"
+}
+
 # ci_cache_job_writable DIR: the ownership question, apart from the mount's: whether the job's user
 # can write DIR (the mount root a job makes its directories in), whoever owns it and whatever its
 # mode: Docker makes a missing mount source root 0755, and an owner (a job) can chmod it.
@@ -69,11 +82,11 @@ ci_cache_writable() {
 #    directory it was not given.
 ci_cache_job_writable() {
     local d="$1" job_uid was
-    ci_as_job test -w "$d" && return 0
+    ci_job_usable "$d" && return 0
     job_uid=$(id -u "${CI_JOB_USER:-$(id -un)}")
     if [ ! -L "$d" ] && [ "$(stat -c %u "$d")" = "$job_uid" ]; then
         was=$(stat -c %a "$d")
-        if chmod 0755 -- "$d" 2>/dev/null && ci_as_job test -w "$d"; then
+        if chmod 0755 -- "$d" 2>/dev/null && ci_job_usable "$d"; then
             ci_warning "NRV-W1203: $d, owned by the job's user (${CI_JOB_USER:-$(id -un)}), had mode $was and was not writable: set it back to 0755 (a job's chmod); on the host, run bash ci/nerva-woodpecker.sh host again if this keeps happening"
             return 0
         fi
@@ -88,12 +101,13 @@ ci_cache_job_writable() {
 }
 
 # ci_child_unwritable PATH: whether PATH is a real directory (never a link) that the job's own uid
-# owns and the job cannot write: what a job's `chmod 0555` of a cache directory leaves. Only a test.
+# owns and the job cannot use (ci_job_usable: not writable or not searchable): what a job's
+# `chmod 0555`, `0600`, `0666` or `0200` of a cache directory leaves. Only a test.
 ci_child_unwritable() {
     local p="$1"
     [ ! -L "$p" ] && [ -d "$p" ] || return 1
     [ "$(stat -c %u "$p")" = "$(id -u "${CI_JOB_USER:-$(id -un)}")" ] || return 1
-    ! ci_as_job test -w "$p"
+    ! ci_job_usable "$p"
 }
 
 # ci_child_reset PATH MOUNT: removes PATH, a DIRECT child of MOUNT (a mount's own root, which a job
@@ -238,7 +252,7 @@ ci_job_dir() {
     for p in "$@"; do
         if [ -L "$p" ]; then ci_as_job rm -f -- "$p" 2>/dev/null || true; fi
         if [ ! -e "$p" ] && [ ! -L "$p" ]; then ci_as_job mkdir -- "$p" 2>/dev/null || true; fi
-        if [ -L "$p" ] || [ ! -d "$p" ] || ! ci_as_job test -w "$p"; then
+        if [ -L "$p" ] || [ ! -d "$p" ] || ! ci_job_usable "$p"; then
             ci_error "NRV-E1228: $p is not a plain directory that the job's user (${CI_JOB_USER:-$(id -un)}) can write (a link, a file, or another user's directory): on the host, rm -rf it (it is only a cache) and start the pipeline again"
             return 1
         fi
@@ -392,7 +406,14 @@ ci_branch_prepare() {
     # The branches' lock is let go before anything can return: seeding is done, or never started.
     [ "$locked" != yes ] || flock -u 7
     # Whichever way $dir was made (or not), it must be a directory now (a file there is the box's damage).
-    [ -d "$dir" ] || { ci_error "NRV-E1214: $dir is not a directory: remove it"; return 1; }
+    if [ ! -d "$dir" ]; then
+        if [ -e "$dir" ] || [ -L "$dir" ]; then
+            ci_error "NRV-E1214: $dir is not a directory: remove it"
+        else
+            ci_error "NRV-E1214: $dir could not be made by the job's user (${CI_JOB_USER:-$(id -un)}) in $b (a full disk, or $b not usable by it; NRV-W1203 repairs that when the job's own uid owns it): free space or check $b on the host"
+        fi
+        return 1
+    fi
     # The job's own directories, as the job user: a missing one is made, a link is replaced, and
     # one the job cannot write (a file, another user's) is refused (NRV-E1228). No chown: root
     # touches nothing in $dir.

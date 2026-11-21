@@ -67,14 +67,14 @@ ci_run_timed() {
 
 ci_step_run_with_tests() {
     local job="$1" test_seconds="$2" job_seconds="$3" tests_status=0 status=0
-    local -n tests_cmd="$4" job_cmd="$5"
+    local -n _ci_tests_ref="$4" _ci_job_ref="$5" # private names: the caller's arrays are tests_cmd and job_cmd
     if [ "$job" = check-scripts ]; then
-        CI_TIMEOUT_KNOB=CI_SCRIPTS_TEST_MINUTES ci_run_timed "$job's ci_test.sh, as root" "$test_seconds" "${tests_cmd[@]}" 6>&- 7>&- 8>&- 9<&- || tests_status=$?
+        CI_TIMEOUT_KNOB=CI_SCRIPTS_TEST_MINUTES ci_run_timed "$job's ci_test.sh, as root" "$test_seconds" "${_ci_tests_ref[@]}" 6>&- 7>&- 8>&- 9<&- || tests_status=$?
         export CI_SCRIPTS_TESTED=1
     else
         unset CI_SCRIPTS_TESTED
     fi
-    ci_run_timed "$job" "$job_seconds" "${job_cmd[@]}" 6>&- 7>&- 8>&- 9<&- || status=$?
+    ci_run_timed "$job" "$job_seconds" "${_ci_job_ref[@]}" 6>&- 7>&- 8>&- 9<&- || status=$?
     [ "$status" != 0 ] || status=$tests_status
     return "$status"
 }

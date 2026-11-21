@@ -352,8 +352,10 @@ set:
    mounted read-write is asked of root (`test -w`, which reports a read-only mount and ignores
    the owner and the mode, so a job that chmods its own mount root changes nothing), not probed by
    creating a file; whether the job's user can write the root it makes its directories in is a
-   second question, asked of the job's user. If the job's own uid owns the root and only its mode
-   stops the job (a job's `chmod 0555`), the step sets it back to `0755` and warns (NRV-W1203): one
+   second question, asked of the job's user: writable AND searchable (`test -w` and `test -x`, run as
+   the job: `ci_job_usable`), as `test -w` alone ignores the search bit and a job's `chmod 0600`
+   would pass it. If the job's own uid owns the root and only its mode
+   stops the job (a job's `chmod 0555`, `0600`, `0666` or `0200`), the step sets it back to `0755` and warns (NRV-W1203): one
    job cannot fail every later pipeline. That `chmod` is the one root does inside these paths
    besides `install -d -o ci /cache/jepsen`; it is on a mount's own root (no link, no rename), is
    never done to a link, and never to a directory another user owns, which is NRV-E1229
@@ -367,7 +369,10 @@ set:
    the prune's own operation on a direct child, never through a link) under the lock that keeps the
    other jobs out (the branch's own lock held exclusively; main's lock, waiting `CI_PRUNE_WAIT`),
    warns (NRV-W1204) and the job's user makes it again. If other jobs hold that lock, a directory
-   another user owns, or a deeper path (a branch's `zig`, `main/zig/p`), it is NRV-E1228 as before.
+   another user owns, or a branch's own `zig` or `zig-local`, it is NRV-E1228 as before. Main's deeper
+   paths (`main/zig/p`, `main/zig/z`) are not checked at all: removing one would mean root walking
+   `main/zig`, which a job can swap for a link, so a job's `chmod` there fails inside the job (in
+   Zig), not in the preamble; an operator clears it with `rm -rf` on the host.
    A lock that stays busy is never waited on for good: the branch caches' lock and a prune warn
    (NRV-W1202) and the job runs; a branch's own cache lock waits `CI_LOCK_WAIT` (300 s) and then
    fails NRV-E1225 (another step's prune of that cache, or a process on the host, holds it);

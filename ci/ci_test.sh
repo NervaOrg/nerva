@@ -1083,7 +1083,7 @@ if [ "$(id -u)" = 0 ]; then
     }
     for role in main branch; do
         if [ "$role" = main ]; then sub=main; else sub=branches; fi
-        for mode in 0555 0000 0500; do
+        for mode in 0555 0000 0500 0600 0666 0200; do
             mk_roots "$tmp/w1203-$role-$mode"
             chown "$jobuser" "$tmp/w1203-$role-$mode/$sub"
             ci_as chmod "$mode" "$tmp/w1203-$role-$mode/$sub"
@@ -1092,7 +1092,7 @@ if [ "$(id -u)" = 0 ]; then
             grep -q RC0 <<<"$out" || { echo "FAIL $role's role, $sub/ chmod $mode by the job is refused: $out" >&2; fail=1; }
             ! grep -q "NRV-E12" <<<"$out" || { echo "FAIL $role's role, $sub/ chmod $mode by the job gives an error: $out" >&2; fail=1; }
             is "$role's role, $sub/ chmod $mode by the job: set back to the job's, 0755" "$jobuser 755" "$(stat -c '%U %a' "$tmp/w1203-$role-$mode/$sub")"
-            ci_as test -w "$tmp/w1203-$role-$mode/$sub" || { echo "FAIL $role's role, $sub/ is still not the job's to write after the repair" >&2; fail=1; }
+            ci_as sh -c 'test -w "$1" && test -x "$1"' _ "$tmp/w1203-$role-$mode/$sub" || { echo "FAIL $role's role, $sub/ is still not the job's to write after the repair" >&2; fail=1; }
         done
         # Not the job's: root does not chown or chmod what it was not given. E1229 as before.
         mk_roots "$tmp/foreign-$role"
@@ -1189,14 +1189,32 @@ if [ "$(id -u)" = 0 ]; then
     }
     run_branch() { ( . ci/cache.sh; CI_JOB_USER=$jobuser CI_LOCK_WAIT=2 ci_branch_prepare "$1" feature/atk 2>&1 && echo RC0 ) || true; }
     run_main() { bash -c '. ci/cache.sh; CI_PRUNE_WAIT=1 ci_main_prepare "$1" "$2" no 0 2>&1 && echo RC0' _ "$1" "$jobuser" || true; }
-    # A branch's own directory.
-    r=$(w_tree wb)
-    d="$r/branches/$branch_key"
-    ci_as chmod 0555 "$d"
+    # A branch's own directory, in each mode that leaves it unusable for the job: not writable (0555) or
+    # not searchable (0600, 0666, 0200: `test -w` alone says writable, review 6001444818).
+    for mode in 0555 0600 0666 0200; do
+        r=$(w_tree "wb-$mode")
+        d="$r/branches/$branch_key"
+        ci_as chmod "$mode" "$d"
+        # In a subshell, to see its descriptors before it exits: the step keeps its shared lock on fd 6
+        # for the job's whole run, so after the reset (which lets go of it, to take the lock exclusively)
+        # it must be taken again, and a prune of another job must not be able to take it.
+        out=$( (
+            . ci/cache.sh
+            CI_JOB_USER=$jobuser CI_LOCK_WAIT=2 ci_branch_prepare "$r" feature/atk 2>&1 && echo RC0
+            flock -x -n "$r/locks/$branch_key.lock" true && echo LOCKFREE || echo LOCKHELD
+        ) ) || true
+        grep -q "NRV-W1204: $d, owned by the job's user ($jobuser), had mode $(printf '%o' $((8#$mode))) and was not writable" <<<"$out" || { echo "FAIL a branch directory chmod $mode by the job: no NRV-W1204: $out" >&2; fail=1; }
+        { grep -q RC0 <<<"$out" && ! grep -q "NRV-E12" <<<"$out"; } || { echo "FAIL a branch directory chmod $mode by the job is refused: $out" >&2; fail=1; }
+        is "branch $mode: the lock on fd 6 is taken again after the reset (a prune cannot take it)" LOCKHELD "$(grep -o 'LOCK[A-Z]*' <<<"$out")"
+        is "branch $mode: the unwritable directory is made again, empty, the job's, usable" "yes yes yes yes no no" "$([ -d "$d/zig" ] && echo yes) $([ -d "$d/zig-local" ] && echo yes) $(ci_as sh -c 'test -w "$1" && test -x "$1"' _ "$d" && echo yes) $(ci_as touch "$d/zig/new" && echo yes) $([ -e "$d/zig/keep" ] && echo yes || echo no) $([ -e "$d/zig/sub" ] && echo yes || echo no)"
+    done
+    # A branches/ the job cannot search, with no check before it (ci_cache_check repairs it, W1203): the
+    # job cannot make the branch's directory in it, and NRV-E1214 must say that, not "not a directory".
+    r=$(attack_tree e1214)
+    ci_as chmod 0600 "$r/branches"
     out=$(run_branch "$r")
-    grep -q "NRV-W1204: $d, owned by the job's user ($jobuser), had mode 555" <<<"$out" || { echo "FAIL a branch directory chmod 0555 by the job: no NRV-W1204: $out" >&2; fail=1; }
-    { grep -q RC0 <<<"$out" && ! grep -q "NRV-E12" <<<"$out"; } || { echo "FAIL a branch directory chmod 0555 by the job is refused: $out" >&2; fail=1; }
-    is "branch: the unwritable directory is made again, empty, the job's, writable" "yes yes yes no no" "$([ -d "$d/zig" ] && echo yes) $([ -d "$d/zig-local" ] && echo yes) $(ci_as test -w "$d" && echo yes) $([ -e "$d/zig/keep" ] && echo yes || echo no) $([ -e "$d/zig/sub" ] && echo yes || echo no)"
+    { grep -q "NRV-E1214: $r/branches/$branch_key could not be made by the job's user" <<<"$out" && ! grep -q "is not a directory\|RC0" <<<"$out"; } || { echo "FAIL an unsearchable branches/: E1214 does not say the directory could not be made: $out" >&2; fail=1; }
+    ci_as chmod 0755 "$r/branches"
     # Another job of the branch holds its lock (shared, as a running step does): nothing is removed.
     r=$(w_tree wbb)
     d="$r/branches/$branch_key"
@@ -1212,16 +1230,18 @@ if [ "$(id -u)" = 0 ]; then
     grep -q "NRV-E1228: $d" <<<"$out" || { echo "FAIL a branch directory in use by another job is not E1228: $out" >&2; fail=1; }
     ! grep -q "NRV-W1204" <<<"$out" || { echo "FAIL a branch directory in use by another job is removed: $out" >&2; fail=1; }
     is "branch: in use by another job: kept as it was" "yes 555" "$([ -e "$d/zig/keep" ] && echo yes) $(stat -c %a "$d")"
-    # A direct child of main's, each of the three.
+    # A direct child of main's, each of the three, in each mode that leaves it unusable for the job.
     for sub in zig zig-local tools; do
-        r=$(w_tree wm-$sub)
-        ci_as chmod 0555 "$r/main/$sub"
-        out=$(run_main "$r")
-        grep -q "NRV-W1204: $r/main/$sub, owned by the job's user ($jobuser), had mode 555" <<<"$out" || { echo "FAIL main/$sub chmod 0555 by the job: no NRV-W1204: $out" >&2; fail=1; }
-        { grep -q RC0 <<<"$out" && ! grep -q "NRV-E12" <<<"$out"; } || { echo "FAIL main/$sub chmod 0555 by the job is refused: $out" >&2; fail=1; }
-        is "main/$sub: made again, empty, the job's, writable" "yes no no $jobuser" "$(ci_as test -w "$r/main/$sub" && echo yes) $([ -e "$r/main/$sub/keep" ] && echo yes || echo no) $([ -e "$r/main/$sub/sub" ] && echo yes || echo no) $(stat -c %U "$r/main/$sub")"
-        for other in zig zig-local tools; do
-            [ "$other" = "$sub" ] || is "main/$sub reset: main/$other is left alone" yes "$([ -e "$r/main/$other/keep" ] && echo yes)"
+        for mode in 0555 0600 0666 0200; do
+            r=$(w_tree "wm-$sub-$mode")
+            ci_as chmod "$mode" "$r/main/$sub"
+            out=$(run_main "$r")
+            grep -q "NRV-W1204: $r/main/$sub, owned by the job's user ($jobuser), had mode $(printf '%o' $((8#$mode))) and was not writable" <<<"$out" || { echo "FAIL main/$sub chmod $mode by the job: no NRV-W1204: $out" >&2; fail=1; }
+            { grep -q RC0 <<<"$out" && ! grep -q "NRV-E12" <<<"$out"; } || { echo "FAIL main/$sub chmod $mode by the job is refused: $out" >&2; fail=1; }
+            is "main/$sub $mode: made again, empty, the job's, usable (a file can be made in it)" "yes yes no no $jobuser" "$(ci_as sh -c 'test -w "$1" && test -x "$1"' _ "$r/main/$sub" && echo yes) $(ci_as touch "$r/main/$sub/new" && echo yes) $([ -e "$r/main/$sub/keep" ] && echo yes || echo no) $([ -e "$r/main/$sub/sub" ] && echo yes || echo no) $(stat -c %U "$r/main/$sub")"
+            for other in zig zig-local tools; do
+                [ "$other" = "$sub" ] || is "main/$sub reset: main/$other is left alone" yes "$([ -e "$r/main/$other/keep" ] && echo yes)"
+            done
         done
     done
     # Other jobs hold main's lock (shared, as every running step does): nothing is removed, E1228.
@@ -1260,6 +1280,15 @@ if [ "$(id -u)" = 0 ]; then
     out=$(run_branch "$r")
     { grep -q "NRV-E1228: $d/zig" <<<"$out" && ! grep -q "NRV-W1204\|RC0" <<<"$out"; } || { echo "FAIL a branch's own zig 0555: $out" >&2; fail=1; }
     is "branch zig 0555 (deeper than a child of branches/): kept as it was" "yes 555" "$([ -e "$d/zig/keep" ] && echo yes) $(stat -c %a "$d/zig")"
+    # The same for a mode that leaves it writable but not searchable (ci_job_dir's own test).
+    for mode in 0600 0666 0200; do
+        r=$(w_tree "wd-$mode")
+        d="$r/branches/$branch_key"
+        ci_as chmod "$mode" "$d/zig"
+        out=$(run_branch "$r")
+        { grep -q "NRV-E1228: $d/zig" <<<"$out" && ! grep -q "NRV-W1204\|RC0" <<<"$out"; } || { echo "FAIL a branch's own zig $mode: $out" >&2; fail=1; }
+        is "branch zig $mode: kept as it was" "yes $(printf '%o' $((8#$mode)))" "$([ -e "$d/zig/keep" ] && echo yes) $(stat -c %a "$d/zig")"
+    done
     r=$(w_tree wd2)
     ci_as chmod 0555 "$r/main/zig/sub"
     out=$(run_main "$r")
@@ -1396,6 +1425,9 @@ step_run() { # step_run JOB T_RC J_RC TEST_SECONDS [VAR=value...]: sets step_rc,
     ) 2>"$st/err" || step_rc=$?
     step_log=$(tr '\n' '|' <"$st/log" 2>/dev/null || true)
     step_err=$(cat "$st/err")
+    # The caller's arrays are named tests_cmd and job_cmd, as in woodpecker_step.sh: the function's own
+    # namerefs must not take those names (review 6001444818: "circular name reference" on every step).
+    ! grep -q "circular" <<<"$step_err" || { echo "FAIL ci_step_run_with_tests warns about its namerefs: $step_err" >&2; fail=1; }
 }
 step_run check-scripts 1 0 60 X=1
 is "step tail: the tests fail, the job passes: the step fails" 1 "$step_rc"
@@ -1427,7 +1459,7 @@ refuses NRV-E1208 "CI_SCRIPTS_TEST_MINUTES zero" env CI_SCRIPTS_TEST_MINUTES=0 c
 # suite with every knob it exercises set to something hostile; it must still be ok. CI_TEST_NESTED
 # stops it from running itself again.
 if [ -z "${CI_TEST_NESTED:-}" ]; then
-    nested=$(env CI_TEST_NESTED=1 CI_BRANCH_PRUNE_ALL=1 CI_DOCKER_MAX_BYTES=10 CI_LOCK_WAIT=0 CI_MAIN_LOCK_WAIT=0 \
+    nested=$(env -u CI_TEST_TMP CI_TEST_NESTED=1 CI_BRANCH_PRUNE_ALL=1 CI_DOCKER_MAX_BYTES=10 CI_LOCK_WAIT=0 CI_MAIN_LOCK_WAIT=0 \
         CI_BRANCH_CACHES=0 CI_BRANCH_CACHE_DAYS=0 CI_BRANCH_CACHE_MAX_GIB=0 CI_BRANCH_SEED_MAX_GIB=0 CI_PRUNE_WAIT=0 \
         CI_FREE_MIN_GIB=99999 CI_JEPSEN_WAIT=0 CI_STEP_MINUTES=x CI_SCRIPTS_TEST_MINUTES=x CI_KILL_AFTER=0 CI_ARCH=aarch64 \
         CI_DOCKER_BIN_DIR=/nonexistent CI_DOCKER_CLIENT_URL=file:///nonexistent CI_JOB_USER=nobody CI_CACHE_SHARED=0 \
