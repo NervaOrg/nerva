@@ -2064,7 +2064,10 @@ rm -P "$HOME/nerva-release-secret.asc" "$HOME/nerva-release.rev" && gpgconf --ki
 
 The fingerprints are not variables: they are pinned in `packaging/keys/fingerprints`.
 
-**7. Turn off GitHub Pages**, only once step 3's check showed `nerva.pro` served by Cloudflare:
+**7. Turn off GitHub Pages**, only once step 3's check showed `nerva.pro` served by Cloudflare.
+`NervaOrg/nerva-site` never had Pages (the Pages site was the old user site, `nervalog.github.io`,
+which is gone with its account), so on it this step is not needed: the call answers 404, which is
+expected there. Run it only if Pages was turned on for the new repository by mistake:
 
 ```bash
 gh api -X DELETE repos/NervaOrg/nerva-site/pages
@@ -2078,23 +2081,30 @@ request, `topwombat` cannot approve its own, and the ruleset has no bypass. Toda
 bare line `topwombat`) owns nothing, so `require_code_owner_review` has never applied. Turn that
 one field off and keep everything else as it is live (`site-check` required, no approvals, no
 bypass, the integration id and the review options it holds today). Read it, change one field,
-write it back:
+write it back. The ruleset's id is not fixed: it is the one on `NervaOrg/nerva-site`, named `main`
+(created in the automation guide's step 6), found by name. The old repository's id (27139365) means
+nothing here. A ruleset created from that guide has no `pull_request` rule, so the field is absent
+and this step changes nothing; it applies only to a ruleset that has one.
 
 ```bash
-gh api repos/NervaOrg/nerva-site/rulesets/27139365 --jq '{name, target, enforcement, conditions, bypass_actors, rules: [.rules[] | if .type == "pull_request" then .parameters.require_code_owner_review = false else . end]}' > "$HOME/site-ruleset.json"
+RS=$(gh api repos/NervaOrg/nerva-site/rulesets --jq '.[] | select(.name=="main") | .id') && echo "$RS"
+```
+
+```bash
+gh api repos/NervaOrg/nerva-site/rulesets/"$RS" --jq '{name, target, enforcement, conditions, bypass_actors, rules: [.rules[] | if .type == "pull_request" then .parameters.require_code_owner_review = false else . end]}' > "$HOME/site-ruleset.json"
 ```
 
 Compare it with the live ruleset:
 
 ```bash
-gh api repos/NervaOrg/nerva-site/rulesets/27139365 --jq '{name, target, enforcement, conditions, bypass_actors, rules}' | jq . > "$HOME/site-ruleset-live.json" && jq . "$HOME/site-ruleset.json" | diff "$HOME/site-ruleset-live.json" -
+gh api repos/NervaOrg/nerva-site/rulesets/"$RS" --jq '{name, target, enforcement, conditions, bypass_actors, rules}' | jq . > "$HOME/site-ruleset-live.json" && jq . "$HOME/site-ruleset.json" | diff "$HOME/site-ruleset-live.json" -
 ```
 
 The diff must show exactly one changed line, `"require_code_owner_review": true` to `false`.
 Anything else, stop. Then:
 
 ```bash
-gh api -X PUT repos/NervaOrg/nerva-site/rulesets/27139365 --input "$HOME/site-ruleset.json" && rm "$HOME/site-ruleset.json" "$HOME/site-ruleset-live.json"
+gh api -X PUT repos/NervaOrg/nerva-site/rulesets/"$RS" --input "$HOME/site-ruleset.json" && rm "$HOME/site-ruleset.json" "$HOME/site-ruleset-live.json"
 ```
 
 Cloudflare's check is **not** added to the ruleset (see "Preview deployments"). CODEOWNERS is
@@ -2126,7 +2136,7 @@ gh api repos/NervaOrg/nerva/environments/package-repos --jq '[.can_admins_bypass
 ```
 
 ```bash
-gh api repos/NervaOrg/nerva-site/rulesets/27139365 --jq '.rules[] | select(.type == "pull_request") | .parameters.require_code_owner_review'
+gh api repos/NervaOrg/nerva-site/rulesets/"$RS" --jq '.rules[] | select(.type == "pull_request") | .parameters.require_code_owner_review'
 ```
 
 ```bash
@@ -2140,8 +2150,7 @@ gh label list --repo NervaOrg/nerva --search package-repos
 Expect: a 200 from `nerva.pro`; a 404 from `nervalog.github.io`; a 404 from `packages.nerva.pro`
 (served by R2: the bucket is empty); four secrets (`R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`,
 `REPO_SIGNING_KEY`, `REPO_SIGNING_PASSPHRASE`) and two variables (`R2_ENDPOINT`, `R2_BUCKET`) on the
-environment, and among the repository's variables `PACKAGES_BASE_URL` and `PACKAGE_REPOS_OWNER`; `false`, `true` and `branch_policy`; `false`; `pages exit 1` (Pages is
-off); and the label `package-repos`. Then tell the supervisor.
+environment, and among the repository's variables `PACKAGES_BASE_URL` and `PACKAGE_REPOS_OWNER`; `false`, `true` and `branch_policy`; `false`; `pages exit 1` (expected: `NervaOrg/nerva-site` never had Pages, so a 404 here proves nothing about step 7); and the label `package-repos`. Then tell the supervisor.
 
 **Rotating the R2 token** (yearly, or if it may have leaked): create a new token as in step 5, set
 both secrets again as in step 6, then delete the old token in the dashboard. A run in progress

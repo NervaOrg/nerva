@@ -9,16 +9,20 @@ work is [WORKLOG.md](./WORKLOG.md).
 
 ### Upgrading from v0.7.1
 
-- **Nerva moved to `NervaOrg/nerva` (O2).** On a Mac, move to the new tap once:
-  `brew untap nervalog/tap && brew tap nervaorg/tap && brew trust nervaorg/tap`, then
-  `brew upgrade nerva`. The apt and dnf repositories at `packages.nerva.pro` and their signing key
-  are unchanged; nothing to do there. Links to `NervaLog/nerva` issues and releases no longer resolve.
-- **Gateway keys need 32 bytes (#335).** `nerva api` and `nerva view` refuse a `NERVA_KEY` or
+- **Nerva moved to `NervaOrg/nerva` (O2).** On a Mac, move to the new tap once. `brew untap` refuses
+  a tap that still has `nerva` installed, and the old tap can no longer be reached, so remove
+  `nerva` first: `brew uninstall nerva`, `brew untap nervalog/tap`, `brew tap nervaorg/tap`, then
+  `brew install nervaorg/tap/nerva`. If your Homebrew has `brew trust` (docs/INSTALL.md), run
+  `brew trust nervaorg/tap` before the install. The apt and dnf repositories at
+  `packages.nerva.pro` and their signing key are unchanged; nothing to do there. Links to
+  `NervaLog/nerva` issues and releases no longer resolve, and the numbers below (`NervaLog/nerva#N`)
+  are that old tracker's.
+- **Gateway keys need 32 bytes (NervaLog/nerva#335).** `nerva api` and `nerva view` refuse a `NERVA_KEY` or
   `NERVA_KEY_NEXT` shorter than 32 bytes, or one with leading or trailing space or tab or a control
   byte (`NRV-E0008`). Before upgrading, rotate a gateway key shorter than 32 bytes through
   `NERVA_KEY_NEXT`: set `NERVA_KEY_NEXT=$(openssl rand -hex 32)`, move clients to it, then make it
   `NERVA_KEY` ([README, Limits](./README.md#limits)).
-- **The development cluster key is refused off loopback (#336).** `nerva start` refuses
+- **The development cluster key is refused off loopback (NervaLog/nerva#336).** `nerva start` refuses
   `NERVA_CLUSTER_KEY` or `NERVA_CLUSTER_KEY_NEXT` equal to the published development key unless
   every address is loopback (`NRV-E0901`).
 

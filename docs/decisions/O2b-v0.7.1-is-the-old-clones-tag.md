@@ -16,7 +16,10 @@ of `NervaLog/nerva` that still has it, along with the history it points at:
 
 That history does not connect to `main` here, but git compares trees, not ancestry. So
 `git diff v0.7.1 main` is the true change from v0.7.1 to v0.7.2, and both of v0.7.2's
-adversarial reviewers (P147b) start from it.
+adversarial reviewers (P147b) start from it. Only that two-dot (tree) form works across the two
+histories. The three-dot form `git diff v0.7.1...main` (the form CLAUDE.md uses for pull request
+diffs), GitHub's compare view `v0.7.1...main` and GitHub's generated release notes from the
+previous tag all fail with "no merge base". Never use them for this release.
 
 The restore point is **not** tagged `v0.7.1`. It contains unreleased work, so a review "since the
 last tag" would skip that work.
@@ -36,3 +39,6 @@ diff either does not exist or leaves out the work between `c886c9f` and `d24340f
 - `release/candidate` still names `c886c9f`, which is in that pushed history but is not an
   ancestor of `main`. The release check will refuse every v0.7.2 `VERSION` commit until a new
   candidate on `main` is written there (P374). That happens when v0.7.2's candidate is chosen.
+- Order: pull request #2 must merge before v0.7.2's candidate is chosen, because it changes
+  `src/nerva/mac_release.zig`, and the release check refuses a `VERSION` commit that changes `src/`
+  since the candidate (P374).

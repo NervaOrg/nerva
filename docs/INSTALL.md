@@ -48,6 +48,10 @@ fix. A formula is code Homebrew runs, so read
 formula described below. An older Homebrew has no `brew trust` and needs no such step: leave that line out
 (NRV-E1167 is the release check's version of this refusal).
 
+**Upgrading from the old tap (`nervalog/tap`).** `brew untap` refuses a tap with `nerva` still
+installed, and the old tap is gone, so: `brew uninstall nerva`, `brew untap nervalog/tap`, then the
+three commands above. Your data files are not touched.
+
 The tap is `NervaOrg/homebrew-tap`, which exists once the first release is out; from then on
 `brew install nervaorg/tap/nerva` installs the latest release from its `main`. A release candidate's
 formula is on the tap's `rc/v<V>` branch, never on `main`, so `brew install` never installs one.

@@ -15,7 +15,7 @@ from pathlib import Path
 SCRIPT = Path(__file__).resolve().parent / "repos_alarm.sh"
 REPO = "NervaOrg/nerva"
 TOKEN = "ghp_FAKE_TOKEN_0123456789"
-RUN = "https://github.com/NervaLog/nerva/actions/runs/42"
+RUN = "https://github.com/NervaOrg/nerva/actions/runs/42"
 NOW = 1_800_000_000
 
 GH = """#!/usr/bin/env python3
@@ -235,7 +235,7 @@ class Alarm(unittest.TestCase):
 
     def test_a_failed_comment_and_a_failed_comment_read_are_w1103(self):
         self.alarm()
-        for what in ("POST repos/NervaLog/nerva/issues/1/comments", "GET repos/NervaLog/nerva/issues/1/comments"):
+        for what in ("POST repos/NervaOrg/nerva/issues/1/comments", "GET repos/NervaOrg/nerva/issues/1/comments"):
             self.fail(what)
             p = self.alarm(code="NRV-E1145")
             self.assertEqual(p.returncode, 0, what)

@@ -243,7 +243,7 @@ stood for them before that document; it no longer holds a design.
    covers it, as `mac-sign.yml`'s dispatch does today.
 5. **`docs/INSTALL.md`** says the tap is "not published yet". The implementing PR words it for a
    tap that exists once the first release is out.
-6. **The site repository** has no workflow, no ruleset, and `allow_auto_merge` off (checked
+6. **The site repository** (`NervaLog/nervalog.github.io`) had no workflow, no ruleset, and `allow_auto_merge` off (checked
    2026-11-12). Auto-merge cannot work until the setup below is done.
 7. **The site's `d` text** has no source in this repository. The site line fills that gap and
    adds a refusal to the `version` job.
@@ -279,11 +279,11 @@ stood for them before that document; it no longer holds a design.
 - **Accepted risk: sessions act as `topwombat`.** Sessions in this repository authenticate to
   GitHub as the owner's account `topwombat`, which is also the only required reviewer of
   `apple-signing`. A session could therefore, in principle, approve a waiting `mac` deployment
-  through `POST /repos/NervaOrg/nerva/actions/runs/{id}/pending_deployments`. From this change on,
+  through `POST /repos/NervaLog/nerva/actions/runs/{id}/pending_deployments`. From this change on,
   that approval would also publish the release. The owner accepts this risk until the machine
   account exists. What keeps it in check today:
   - Sessions have no tool that approves a deployment. The GitHub tools they are given have no such
-    call, and the session proxy refused this session's read of `repos/NervaOrg/nerva/environments`
+    call, and the session proxy refused this session's read of `repos/NervaLog/nerva/environments`
     (2026-11-12). Whether the approval endpoint is refused too was not tried, and must not be
     tried.
   - The rule "a session never approves a deployment" is written into CLAUDE.md by the implementing
@@ -314,9 +314,9 @@ read (environment settings and secrets). The owner checks those with the command
 | 8 | `NERVA_SIGN_IDENTITY` (optional; unset means `build.zig`'s default) | variable | env `apple-signing` | owner | unknown |
 | 9 | `NervaOrg/homebrew-tap`, public, `main` with a README | repository | NervaOrg | owner | new (owner creates it) |
 | 10 | Ruleset on the tap's `main`: no force push, no deletion | ruleset | NervaOrg/homebrew-tap | owner | new |
-| 11 | `allow_auto_merge` on | setting | NervaOrg/nerva-site | owner | no (off) |
-| 12 | Ruleset on the site's `main`: required check `site-check`, owner (admin) may bypass | ruleset | NervaOrg/nerva-site | owner | no (no rulesets) |
-| 13 | `.github/workflows/check.yml` (job `site-check`) | workflow | NervaOrg/nerva-site | implementer | no (no workflows) |
+| 11 | `allow_auto_merge` on | setting | NervaOrg/nerva-site | owner | new (owner sets it; on `NervaLog/nervalog.github.io` it was off, 2026-11-12) |
+| 12 | Ruleset on the site's `main`: required check `site-check`, owner (admin) may bypass | ruleset | NervaOrg/nerva-site | owner | new (owner creates it; `NervaLog/nervalog.github.io` had none, 2026-11-12) |
+| 13 | `.github/workflows/check.yml` (job `site-check`) | workflow | NervaOrg/nerva-site | implementer | new (`NervaLog/nervalog.github.io` had no workflows, 2026-11-12) |
 | 14 | `.github/workflows/release-finish.yml` | workflow | NervaOrg/nerva | implementer | new |
 | 15 | `release.yml`: `version` site-line check; `mac` and `mac-verify` replaced by `finish` | workflow | NervaOrg/nerva | implementer | changed |
 | 16 | `mac-verify.yml`: `tap-ref` input, header | workflow | NervaOrg/nerva | implementer | changed |
@@ -328,7 +328,7 @@ read (environment settings and secrets). The owner checks those with the command
 | 22 | `actions/create-github-app-token`, `actions/download-artifact`, each pinned to a full SHA | actions | `release-finish.yml` | implementer | new |
 | 23 | CHANGELOG site line in each release section | docs | NervaOrg/nerva | supervisor | new |
 | 24 | CLAUDE.md: "release.yml publishes after the owner's one approval; a session never approves a deployment"; `docs/INSTALL.md` tap wording | docs | NervaOrg/nerva | implementer | changed |
-| 25 | Tag rulesets: none on NervaOrg/nerva today (the one ruleset, "To Auto-merge", targets branches). If one is added for `v*`, GitHub Actions needs to be on its bypass list, because publishing creates the tag. | ruleset | NervaOrg/nerva | owner | none, nothing to do |
+| 25 | Tag rulesets: none on NervaLog/nerva on 2026-11-12 (the one ruleset, "To Auto-merge", targets branches); a new `NervaOrg/nerva` has none until the owner adds one. If one is added for `v*`, GitHub Actions needs to be on its bypass list, because publishing creates the tag. | ruleset | NervaOrg/nerva | owner | new (none; nothing to do unless one is added) |
 
 ## Setup guide (owner, once)
 
@@ -463,6 +463,18 @@ gh api repos/NervaOrg/nerva/environments --jq '.environments[] | [.name, (.prote
 Expect five Apple secrets in `apple-signing`, `RELEASE_APP_PRIVATE_KEY` and `RELEASE_APP_ID` in
 `release-publish`, `RELEASE_APP_LOGIN` on the site, `apple-signing` with `required_reviewers,branch_policy`, and `release-publish`
 with `branch_policy` only. Then tell the supervisor, and the rehearsal follows.
+
+**8. After the move to NervaOrg (O2): the site's own setup.** The site repository is new, so these
+four things are the owner's and none of them is in the repository's files:
+
+- **Re-pin the `nerva-site` Worker's build command.** In the Cloudflare dashboard the Worker's
+  build command carries a commit and a SHA-256 of `.github/scripts/site_build.sh` in **this**
+  repository (packages.md, "The site on a Cloudflare Worker", and its setup step 2). Pin it to a
+  commit of `NervaOrg/nerva` and that file's SHA-256 there, and connect the Worker to
+  `NervaOrg/nerva-site`. Until then the build refuses (NRV-E1164) or runs the old gate.
+- **Set `RELEASE_APP_LOGIN`** on `NervaOrg/nerva-site` (step 6 above gives the command).
+- **Change `SITE.repo`** in the site's `index.html` to `NervaOrg/nerva`, in a site pull request.
+- **Create the site's ruleset** (step 6 above): required check `site-check`, no force push, no deletion.
 
 ## A release afterwards
 
