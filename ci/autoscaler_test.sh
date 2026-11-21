@@ -86,7 +86,9 @@ EOF
 chmod +x "$stubs"/*
 export STUB_LOG="$tmp/log" STUB_API="$tmp/api" STUB_HELP="$tmp/help.txt"
 mkdir -p "$STUB_LOG" "$STUB_API"
-for f in max-agents agent-idle-timeout workflows-per-agent cloudinit-template hetznercloud-server-type hetznercloud-image hetznercloud-labels pool-id agent-labels agent-image server-token hetznercloud-api-token; do echo "--$f x" >> "$STUB_HELP"; done
+# The help text lists the environment variables the script passes, as urfave/cli prints them: [$NAME].
+env_names=$(grep -o '"WOODPECKER_[A-Z_]*=' "$root/ops/ci/autoscaler/nerva-autoscaler.sh" | tr -d '"=' | sort -u)
+for f in $env_names; do echo "--flag value (env) [\$$f]" >> "$STUB_HELP"; done
 
 uid=$(id -u)
 export NERVA_CI_ROOT_UID=$uid NERVA_AS_NO_SYSTEMD=1 NERVA_AS_POLL=0 PATH="$stubs:$PATH"
@@ -139,8 +141,16 @@ refuses "a cap over the maximum" NRV-E1238 env NERVA_AS_MAX=17 bash "$as/nerva-a
 refuses "an idle time in hours" NRV-E1238 env NERVA_AS_IDLE=2h bash "$as/nerva-autoscaler.sh" install
 refuses "a plain http server" NRV-E1238 env NERVA_AS_SERVER=http://ci.example.org bash "$as/nerva-autoscaler.sh" install
 rm -f "$etc/autoscaler.conf"
-refuses "an autoscaler without a flag the script passes" NRV-E1240 env STUB_HELP="$tmp/nohelp.txt" bash "$as/nerva-autoscaler.sh" install
-echo "--max-agents" > "$tmp/nohelp.txt"
+# A help text that lacks one variable the script passes is refused, for each of them (a flag name is no proof).
+n=$((n + 1))
+[ "$(wc -l < "$STUB_HELP")" -ge 15 ] || bad "the help stub lists too few variables"
+for f in $env_names; do
+    grep -vF "[\$$f]" "$STUB_HELP" > "$tmp/nohelp.txt"
+    refuses "an autoscaler without \$$f" NRV-E1240 env STUB_HELP="$tmp/nohelp.txt" bash "$as/nerva-autoscaler.sh" install
+    rm -f "$etc/autoscaler.conf"
+done
+printf '%s\n' '--max-agents value' '--agent-labels value' > "$tmp/nohelp.txt"
+refuses "flag names without their environment variables" NRV-E1240 env STUB_HELP="$tmp/nohelp.txt" bash "$as/nerva-autoscaler.sh" install
 rm -f "$etc/autoscaler.conf"
 ok "install" inst
 has "conf has the server" "$etc/autoscaler.conf" '^AS_SERVER=https://ci.example.org$'
@@ -181,6 +191,7 @@ has "run uses TLS" "$a" 'WOODPECKER_GRPC_SECURE=true'
 has "run caps the servers" "$a" 'WOODPECKER_MAX_AGENTS=2'
 has "run names the snapshot" "$a" 'WOODPECKER_HETZNERCLOUD_IMAGE=4242'
 has "run uses a dedicated type in the box's location" "$a" 'WOODPECKER_HETZNERCLOUD_SERVER_TYPE=ccx33:fsn1'
+has "run counts only the cloud workflows" "$a" 'WOODPECKER_FILTER_LABELS=tier=cloud'
 has "run labels the agents" "$a" 'WOODPECKER_AGENT_LABELS=tier=cloud,kvm=false'
 has "run has one workflow per agent" "$a" 'WOODPECKER_WORKFLOWS_PER_AGENT=1'
 has "run passes the token files read-only" "$a" 'hcloud.token:/run/secrets/hcloud.token:ro'

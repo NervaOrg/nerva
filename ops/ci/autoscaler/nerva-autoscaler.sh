@@ -17,7 +17,7 @@
 #   the hard cap on servers, 1 to 16), NERVA_AS_IDLE (10m).
 #   `check`  validates the settings, the secrets and the snapshot, and counts the servers (NRV-W1208).
 #   `status` prints the settings, the snapshot and the servers that exist now.
-#   `run`    is what the service runs: starts the autoscaler container (exec, in the foreground).
+#   `run`    is what the service runs (it counts only the pending workflows labelled tier=cloud: WOODPECKER_FILTER_LABELS): starts the autoscaler container (exec, in the foreground).
 #
 # Secrets, root's, mode 0600, one line each, never in the repository, argv, a unit file or a log:
 #   /etc/nerva-ci/hcloud.token       a Read & Write API token of a Hetzner project that holds only CI.
@@ -55,25 +55,45 @@ secrets_ok() {
     secret_file "$etc/woodpecker.token" "the Woodpecker API token"
 }
 
-count_servers() { # servers with the pool label, by the Hetzner API
-    hcloud GET "/servers?label_selector=$POOL_LABEL&per_page=50" | jq -r '.servers | length'
+count_servers() { # the autoscaler's servers (label nerva-ci-pool=cloud), by the Hetzner API; the snapshot build's are not counted
+    hcloud GET "/servers?label_selector=$POOL_LABEL%3Dcloud&per_page=50" | jq -r '.servers | length'
 }
 
 check_cap() {
     local n
     n=$(count_servers)
     if [ "$n" -gt "$AS_MAX" ]; then
-        echo "$tool: warning: NRV-W1208: $n servers carry the label $POOL_LABEL but the cap is $AS_MAX: delete the extra ones in the Hetzner console (a server left behind is billed by the hour)" >&2
+        echo "$tool: warning: NRV-W1208: $n servers carry the label $POOL_LABEL=cloud but the cap is $AS_MAX: delete the extra ones in the Hetzner console (a server left behind is billed by the hour)" >&2
     fi
     say "$n of at most $AS_MAX cloud servers exist"
 }
 
-help_check() { # the pinned autoscaler must know every setting `run` passes (NRV-E1240)
-    local help f
-    help=$(docker run --rm "$AUTOSCALER_IMAGE" --help 2>&1) || fail "NRV-E1240: could not run the autoscaler image $AUTOSCALER_IMAGE to read its flags"
-    for f in max-agents agent-idle-timeout workflows-per-agent cloudinit-template hetznercloud-server-type hetznercloud-image hetznercloud-labels pool-id agent-labels agent-image server-token hetznercloud-api-token; do
-        grep -q -- "$f" <<< "$help" || fail "NRV-E1240: the pinned autoscaler has no --$f: lib.sh's pin and run() disagree (decision O6)"
-    done
+# autoscaler_env SNAPSHOT_ID: the NAME=VALUE settings `run` passes the container, one per line. help_check
+# checks every NAME against the pinned image, so the two cannot disagree.
+autoscaler_env() {
+    printf '%s\n' \
+        "WOODPECKER_SERVER=$AS_SERVER" "WOODPECKER_GRPC_ADDR=$AS_GRPC" "WOODPECKER_GRPC_SECURE=true" \
+        "WOODPECKER_TOKEN_FILE=/run/secrets/woodpecker.token" \
+        "WOODPECKER_HETZNERCLOUD_API_TOKEN_FILE=/run/secrets/hcloud.token" \
+        "WOODPECKER_PROVIDER=hetznercloud" "WOODPECKER_POOL_ID=nerva-ci" \
+        "WOODPECKER_MIN_AGENTS=0" "WOODPECKER_MAX_AGENTS=$AS_MAX" "WOODPECKER_WORKFLOWS_PER_AGENT=1" \
+        "WOODPECKER_AGENT_IDLE_TIMEOUT=$AS_IDLE" "WOODPECKER_AGENT_IMAGE=$AGENT_IMAGE" \
+        "WOODPECKER_AGENT_LABELS=tier=$AS_TIER,kvm=false" \
+        "WOODPECKER_FILTER_LABELS=tier=$AS_TIER" \
+        "WOODPECKER_CLOUDINIT_TEMPLATE_FILE=/etc/cloud-init.tmpl.yaml" \
+        "WOODPECKER_HETZNERCLOUD_SERVER_TYPE=$AS_SERVER_TYPE:$AS_LOCATION" \
+        "WOODPECKER_HETZNERCLOUD_IMAGE=${1:-0}" "WOODPECKER_HETZNERCLOUD_LABELS=$POOL_LABEL=$AS_TIER"
+}
+
+# help_check: the pinned autoscaler lists every environment variable `run` passes in its --help
+# (urfave/cli prints them as [$NAME]); one it does not list would be ignored silently (NRV-E1240).
+help_check() {
+    local help name
+    help=$(docker run --rm "$AUTOSCALER_IMAGE" --help 2>&1) || fail "NRV-E1240: could not run the autoscaler image $AUTOSCALER_IMAGE to read its settings"
+    while IFS= read -r name; do
+        name=${name%%=*}
+        grep -qE '\$'"$name"'([^A-Za-z0-9_]|$)' <<< "$help" || fail "NRV-E1240: the pinned autoscaler does not list \$$name: lib.sh's pin and run() disagree, so the setting would be ignored (decision O6)"
+    done < <(autoscaler_env)
 }
 
 # install_tree: $lib/ci/ becomes a copy of the parts of ops/ci/ that the snapshot build needs (CI_TREE):
@@ -133,26 +153,18 @@ install_all() {
 }
 
 run() {
-    local id
+    local id l
     conf_load
     secrets_ok
     id=$(snapshot_id)
+    local -a env_args=()
+    while IFS= read -r l; do env_args+=(-e "$l"); done < <(autoscaler_env "$id")
     exec docker run --rm --name nerva-autoscaler --read-only --cap-drop ALL --security-opt no-new-privileges \
         --memory 512m --pids-limit 256 \
         -v "$etc/hcloud.token:/run/secrets/hcloud.token:ro" \
         -v "$etc/woodpecker.token:/run/secrets/woodpecker.token:ro" \
         -v "$lib/ci/autoscaler/cloud-init.tmpl.yaml:/etc/cloud-init.tmpl.yaml:ro" \
-        -e WOODPECKER_SERVER="$AS_SERVER" -e WOODPECKER_GRPC_ADDR="$AS_GRPC" -e WOODPECKER_GRPC_SECURE=true \
-        -e WOODPECKER_TOKEN_FILE=/run/secrets/woodpecker.token \
-        -e WOODPECKER_HETZNERCLOUD_API_TOKEN_FILE=/run/secrets/hcloud.token \
-        -e WOODPECKER_PROVIDER=hetznercloud -e WOODPECKER_POOL_ID=nerva-ci \
-        -e WOODPECKER_MIN_AGENTS=0 -e WOODPECKER_MAX_AGENTS="$AS_MAX" -e WOODPECKER_WORKFLOWS_PER_AGENT=1 \
-        -e WOODPECKER_AGENT_IDLE_TIMEOUT="$AS_IDLE" -e WOODPECKER_AGENT_IMAGE="$AGENT_IMAGE" \
-        -e WOODPECKER_AGENT_LABELS="tier=$AS_TIER,kvm=false" \
-        -e WOODPECKER_CLOUDINIT_TEMPLATE_FILE=/etc/cloud-init.tmpl.yaml \
-        -e WOODPECKER_HETZNERCLOUD_SERVER_TYPE="$AS_SERVER_TYPE:$AS_LOCATION" \
-        -e WOODPECKER_HETZNERCLOUD_IMAGE="$id" -e WOODPECKER_HETZNERCLOUD_LABELS="$POOL_LABEL=$AS_TIER" \
-        "$AUTOSCALER_IMAGE"
+        "${env_args[@]}" "$AUTOSCALER_IMAGE"
 }
 
 mode="${1:-}"
