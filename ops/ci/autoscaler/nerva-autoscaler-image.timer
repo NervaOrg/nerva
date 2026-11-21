@@ -1,0 +1,10 @@
+[Unit]
+Description=Nightly rebuild of the Nerva CI cloud-agent snapshot
+
+[Timer]
+OnCalendar=*-*-* 02:40:00
+RandomizedDelaySec=10m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

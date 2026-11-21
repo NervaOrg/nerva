@@ -1,0 +1,13 @@
+[Unit]
+Description=Nerva CI autoscaler (on-demand Hetzner Cloud agents, decision O6)
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/lib/nerva-ci/nerva-autoscaler.sh run
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

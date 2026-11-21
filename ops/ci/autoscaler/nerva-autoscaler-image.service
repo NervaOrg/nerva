@@ -1,0 +1,12 @@
+[Unit]
+Description=Rebuild the Nerva CI cloud-agent snapshot and delete old ones (decision O6)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/nerva-ci/nerva-autoscaler-image.sh build
+ExecStartPost=/usr/local/lib/nerva-ci/nerva-autoscaler-image.sh prune
+# The autoscaler reads the snapshot id when it starts: servers created after this restart use the new one.
+ExecStartPost=/usr/bin/systemctl restart nerva-autoscaler.service
+TimeoutStartSec=2h

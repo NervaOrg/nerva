@@ -1,0 +1,27 @@
+#cloud-config
+# The user data of a cloud agent (decision O6): a text/template of woodpecker-ci/autoscaler, where .Image
+# is the agent image and .Environment holds WOODPECKER_SERVER, the agent's own token and its labels.
+# The server boots from the snapshot (nerva-autoscaler-image.sh), which already holds Docker with the
+# io_uring seccomp profile, the images and the warm cache: nothing is installed here.
+write_files:
+- path: /root/docker-compose.yml
+  permissions: '0600'
+  content: |
+    services:
+      woodpecker-agent:
+        image: {{ .Image }}
+        restart: always
+        volumes:
+          - /var/run/docker.sock:/var/run/docker.sock
+        environment:
+          {{- range $key, $value := .Environment }}
+          - {{ $key }}={{ $value }}
+          {{- end }}
+runcmd:
+  {{- range .PreExec }}
+  - {{ . }}
+  {{- end }}
+  - docker compose -f /root/docker-compose.yml up -d
+  {{- range .PostExec }}
+  - {{ . }}
+  {{- end }}
