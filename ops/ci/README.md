@@ -321,13 +321,19 @@ set:
    `nerva-woodpecker.sh host` creates the cache directories:
 
    ```bash
-   install -d -m 0755 -o 1001 -g 1001 /var/cache/nerva-ci /var/cache/nerva-ci/{main,branches,jepsen}
+   install -d -m 0755 -o 0 -g 0 /var/cache/nerva-ci /var/cache/nerva-ci/{main,branches,jepsen}
+   setfacl -b -k /var/cache/nerva-ci/{main,branches,jepsen}
    install -d -m 0700 -o 0 -g 0 /var/cache/nerva-ci/locks
    ```
 
+   The mount roots are root's, 0755, with no ACL, and nothing in them: the step makes the
+   directories the jobs (uid 1001) own, `main/zig`, `main/zig-local`, `main/tools`,
+   `branches/b-<key>` and `jepsen/tools`, itself, with `chown`, and repairs a root that is not so
+   (NRV-W1203). A job cannot write a root, so it cannot swap, rename or give an ACL to what is directly in it.
+
    `locks/` is root's and mounted into every step (`/cache/locks`, writable): the lock files are in it, not in the directories the jobs (uid 1001) own. A step refuses one with any group or other permission bit (NRV-E1226): a job that could list it could open a 0644 lock read only, and `flock -x` works on that.
 
-   **Upgrading a box** that ran an earlier version of these scripts: run `bash ci/nerva-woodpecker.sh host` again before the next pipeline. Docker makes a missing mount source `/var/cache/nerva-ci/locks` as root 0755, which the step now refuses (NRV-E1226); `host` makes it root 0700. Lock files made under an older version in a 0755 directory are mode 0644 and are tightened to 0600 on first use.
+   **Upgrading a box** that ran an earlier version of these scripts: run `bash ci/nerva-woodpecker.sh host` again before the next pipeline. It makes `main/`, `branches/` and `jepsen/` root-owned 0755 with no ACL (they were `ci`'s; a step also does it, with NRV-W1203, if you forget), and installs `acl` if `setfacl` is missing (a step installs it in its own container; NRV-E1233 if it cannot). The directories inside them stay `ci`'s. Docker makes a missing mount source `/var/cache/nerva-ci/locks` as root 0755, which the step now refuses (NRV-E1226); `host` makes it root 0700. Lock files made under an older version in a 0755 directory are mode 0644 and are tightened to 0600 on first use.
 
    `main/` holds the pinned Zig's archive (`tools/<sha256>.tar.xz`, checked on every use), Zig's
    global cache and a `.zig-cache` copy, written only by a push to `main` (its steps mount it
@@ -344,35 +350,43 @@ set:
    old `.lock` there is unused and can be deleted.) The step refuses a `locks/` that is a link or
    that another user can write or list (NRV-E1226), and never follows a link at a lock path.
 
-   Root never creates, chowns, chmods or writes anything inside `main/`, `branches/` or `jepsen/`: a
-   job can plant a symlink anywhere in them, and a root `chown`, `install -d`, `mkdir` or
-   redirection would follow it (to `/cache/locks`, or `/etc/passwd`, which would make the job root
-   in the next step's container). The one root operation on them is `install -d -o ci /cache/jepsen`,
-   on the mount's own root, which a job cannot swap for a link. Whether `main/` and `branches/` are
+   Root never writes, chowns, chmods or creates *through a job-writable path*. The mount roots
+   (`main/`, `branches/`, `jepsen/`) are root-owned, mode 0755, with no ACL, and no job can write,
+   rename or give an ACL to one, so nothing directly in a root can be swapped by a job between
+   root's test and root's use; a job can plant a symlink anywhere below its own directories, and a
+   root `chown`, `install -d`, `mkdir` or redirection there would follow it (to `/cache/locks`, or
+   `/etc/passwd`, which would make the job root in the next step's container). **The root operations
+   are these, and no others** (`ci/cache.sh` lists them at its top; `ci_test.sh` checks the list):
+
+   1. `mkdir -m 0755` and `chown -h` of a direct child of a mount root (`ci_child_make`: a branch's
+      directory, main's `zig`, `zig-local` and `tools`, jepsen's `tools`), the one name, never through a link.
+   2. `mktemp -d` of a branch's seed directory `<key>.partial.XXXXXX` in `branches/` (O_EXCL, a name no
+      job can predict), `chown -h` of it to the job, and `mv -T` of it to the branch's name. The seed
+      itself (`cp -a` of main's `zig/p`, the `mkdir`s inside) is the job's user's, never root's.
+   3. `rm -rf --one-file-system` of a direct child of a mount root that the job's own uid owns and
+      cannot use (`ci_child_reset`: a file, a FIFO, a socket, or a directory the job's normalization
+      could not make usable), under the lock that keeps other jobs out, NRV-W1204; and the prune's
+      `rm -rf` of a direct child, which is the same operation.
+   4. `chown`, `chmod 0755` and `setfacl -b -k` of a mount root itself, when it is not root-owned
+      0755 with no ACL (`ci_mount_root`, NRV-W1203): a link is never touched (NRV-E1229).
+
+   Everything below a direct child is the job's user's: before the job runs, the step normalizes the
+   job's own tree **as the job** (`ci_normalize`: every directory gets `u+rwx`, so a `chmod 0000`
+   one is opened and searched; a FIFO or socket is removed; every directory loses its ACL, a
+   default ACL included), so a job's `chmod`, `setfacl`, FIFO or socket deep in its tree costs
+   nothing, and no root operation follows it. A direct child that the job owns and cannot use,
+   whatever its type, is reset by root (3); one another user owns is NRV-E1228 and never touched,
+   and so is one that other jobs hold the lock of. Whether `main/` and `branches/` are
    mounted read-write is asked of root (`test -w`, which reports a read-only mount and ignores
-   the owner and the mode, so a job that chmods its own mount root changes nothing), not probed by
-   creating a file; whether the job's user can write the root it makes its directories in is a
-   second question, asked of the job's user: writable AND searchable (`test -w` and `test -x`, run as
-   the job: `ci_job_usable`), as `test -w` alone ignores the search bit and a job's `chmod 0600`
-   would pass it. If the job's own uid owns the root and only its mode
-   stops the job (a job's `chmod 0555`, `0600`, `0666` or `0200`), the step sets it back to `0755` and warns (NRV-W1203): one
-   job cannot fail every later pipeline. That `chmod` is the one root does inside these paths
-   besides `install -d -o ci /cache/jepsen`; it is on a mount's own root (no link, no rename), is
-   never done to a link, and never to a directory another user owns, which is NRV-E1229
-   (`nerva-woodpecker.sh host` again, or `chown` and `chmod 0755` it on the host); a root `rm -rf` is only on a path whose parent is a mount root, and anything
-   deeper is unlinked by the job's user. The step makes what a job needs there as the job's user (`ci_as_job`), replaces a
-   symlink it finds (`rm` unlinks and never follows) and refuses what is not a plain directory the
-   job can write (NRV-E1228: `rm -rf` it on the host; it is only a cache). One repair, which is
-   an unlink and nothing else: a job's `chmod 0555` of a direct child of a mount root (a branch's
-   own `branches/b-<key>`, or main's `zig`, `zig-local` or `tools`) that its own uid owns would
-   fail every later pipeline for that directory, so root removes it (`rm -rf --one-file-system`,
-   the prune's own operation on a direct child, never through a link) under the lock that keeps the
-   other jobs out (the branch's own lock held exclusively; main's lock, waiting `CI_PRUNE_WAIT`),
-   warns (NRV-W1204) and the job's user makes it again. If other jobs hold that lock, a directory
-   another user owns, or a branch's own `zig` or `zig-local`, it is NRV-E1228 as before. Main's deeper
-   paths (`main/zig/p`, `main/zig/z`) are not checked at all: removing one would mean root walking
-   `main/zig`, which a job can swap for a link, so a job's `chmod` there fails inside the job (in
-   Zig), not in the preamble; an operator clears it with `rm -rf` on the host.
+   the owner and the mode), not probed by creating a file; whether the job can use a directory is
+   asked of the job's user: writable AND searchable (`test -w` and `test -x`, run as the job:
+   `ci_job_usable`), as `test -w` alone ignores the search bit. The step makes what a job needs below
+   its children as the job's user (`ci_as_job`), replaces a symlink it finds (`rm` unlinks and never
+   follows) and refuses what is not a directory the job can use (NRV-E1228: `rm -rf` it on the
+   host; it is only a cache). Main's deeper paths in a branch's pipeline are not repaired there:
+   main is mounted `:ro`, so damage below `main/zig` is repaired by the next pipeline for main.
+   The normalization is bounded by `CI_NORMALIZE_SECONDS` (default 600 s); a tree it cannot get
+   through in that time is removed with NRV-W1204 and starts empty.
    A lock that stays busy is never waited on for good: the branch caches' lock and a prune warn
    (NRV-W1202) and the job runs; a branch's own cache lock waits `CI_LOCK_WAIT` (300 s) and then
    fails NRV-E1225 (another step's prune of that cache, or a process on the host, holds it);

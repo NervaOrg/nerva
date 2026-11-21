@@ -11,36 +11,46 @@
 #                         replaced by a job (a symlink in its place would make a root step chown
 #                         and chmod the target); here a job cannot create, unlink or open anything.
 #
-# The step runs as root and the job as `ci`, so every path a job can write (all of main/ and
-# branches/, and /cache/jepsen) is the job's to redirect: a symlink planted there would make a
-# root chown, chmod, install, mkdir or cp, or a root redirection, act on its target. Root therefore
-# never creates, chowns, chmods or writes anything there (the exceptions, both on a mount's own
-# root, which a job cannot swap for a link: `install -d -o ci /cache/jepsen` in the step, and the
-# `chmod 0755` of ci_cache_job_writable, only when the job's own uid owns it). What the job needs made there is made by
-# the job user itself (ci_as_job, `mkdir`, `mktemp`, `cp`, `mv`, `touch`), which can only touch what
-# the job could touch anyway; root only tests (never acts on the result of a test, so a swap after
-# it changes nothing) and unlinks (rm -rf of a path whose parent is a mount root, which never
-# follows a link in its last component). A path with any other job-writable component (a
-# partial directory's zig/p, a branch's zig link) is unlinked by the job user.
-# What is then not a plain directory the job can write is refused: NRV-E1228. One repair, by an
-# unlink and no more: a DIRECT child of a mount root (a branch's own directory, main's zig,
-# zig-local or tools) that is a real directory the job's own uid owns and the job cannot use (not writable or not
-# searchable: its `chmod 0555`, `0600`, `0666` or `0200`) is removed with rm -rf --one-file-system, as the prune removes one, under the lock
-# that keeps the other jobs out (the key's lock for a branch, main's exclusive one for main), and
-# made again by the job's user: NRV-W1204. A directory another user owns, and anything deeper (a
-# branch's own zig), stays NRV-E1228.
+# The step runs as root and the job as `ci`, so everything a job can write is the job's to
+# redirect: a symlink planted there would make a root chown, chmod, install, mkdir or cp, or a root
+# redirection, act on its target. Review rounds 1 to 17 closed that one case at a time (a chmod 0555
+# of a cache directory, then 0600, 0666 and 0200, a default ACL, a file or a FIFO at a child, deeper
+# paths): each fix left the next way to leave a directory the job could not use. The eighteenth
+# round ends the class (decision O4, worklog/O4.md) with three rules:
+#
+#  1. A MOUNT ROOT IS NEVER THE JOB'S (/cache/main in main's role, /cache/branches in a branch's,
+#     /cache/jepsen): root-owned, a real directory, mode 0755, no ACL (ci_mount_root, on every step;
+#     `host` makes them so). A job cannot chmod, chown, ACL, rename or unlink anything at that
+#     level, and cannot create a name in it. Root makes the direct children the job needs (a
+#     branch's b-<key>, main's zig, zig-local and tools, jepsen's tools and each run's directory)
+#     with mkdir and chown (ci_child_make): safe, as the parent is root's and a job cannot swap it.
+#  2. A DIRECT CHILD THE JOB OWNS BUT CANNOT USE IS RESET BY ROOT, WHATEVER ITS TYPE (a directory
+#     that is not usable, a file, a FIFO, a socket; a link is unlinked): rm -rf --one-file-system of
+#     one name directly in a root-owned directory, which never follows a link, then a fresh
+#     mkdir and chown, NRV-W1204 (ci_child_reset, under the lock that keeps the other jobs out: the
+#     key's lock for a branch, main's exclusive one for main, the Jepsen lock for jepsen). A child
+#     another uid owns is never touched: NRV-E1228.
+#  3. THE JOB'S OWN TREE IS NORMALIZED BY THE JOB (ci_normalize, before each use): as the job,
+#     every directory under the child gets u+rwx and loses its ACLs (access and default), a file
+#     without u+r gets it, a FIFO or a socket is removed. The job acting on its own files cannot
+#     escalate, so this walks deep paths (main/zig/o/x, a branch's zig/p, jepsen/tools) that root
+#     never walks. If it fails (or the child still has an ACL or is not usable), rule 2 applies.
+#
+# What root does inside a mount root, in all: mkdir, chown (-h), mktemp -d, mv -T of a partial
+# directory, rm -rf --one-file-system and rm -f of a name that is a DIRECT child, and, on a mount
+# root itself (a mount's own root, which a job cannot swap for a link or rename: EBUSY), chown,
+# chmod 0755 and setfacl -b -k. It never acts on a deeper path, and everything below a child is made,
+# changed and removed by the job's user (ci_as_job: `mkdir`, `cp`, `touch`, `rm`, `find`, `chmod`).
+# What is then not a directory the job can use, and cannot be reset, is refused: NRV-E1228.
 #
 # A branch's pipeline mounts main/ read-only (.woodpecker/*.yaml) and branches/ writable; main's
 # mounts main/ writable and not branches/. ci_cache_check refuses a mount that is the wrong way
 # round (NRV-E1202: root's access(2) test, which only a read-only mount changes, never the owner or
-# the mode of the mount root), and a mount root the job's user cannot write (the job's own test: if
-# the job owns it and only its mode, from a job's chmod, stops it, it is set back to 0755 with
-# NRV-W1203; if another user owns it, NRV-E1229 with the owner and mode in the message). "Can write"
-# is ci_job_usable everywhere: writable AND searchable, asked as the job, so a `chmod 0600`, `0666` or
-# `0200` is caught as a `chmod 0555` is. Deeper paths (main/zig/p, a branch's zig) are not checked:
-# root cannot remove them without walking a job-writable parent (a link planted there would be
-# followed), so a job's chmod there fails inside the job, not in the preamble. The mounts are
-# what enforce the rule: this script only notices a wrong one.
+# the mode of the mount root), and ci_mount_root a mount root that is not root-owned 0755 with no ACL
+# (repaired with NRV-W1203 when root or the job's uid owns it, as an earlier layout and a job's own
+# chmod leave it; NRV-E1229 when another uid does, or it is a link, or its ACL cannot be removed).
+# In a branch's pipeline main/ is read-only: a main job's damage in it is repaired by the next
+# pipeline for main, the only one that can write it.
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 # ci_branch_key BRANCH: a directory name for a branch that is safe to use as one and different for
@@ -61,76 +71,185 @@ ci_cache_writable() {
     test -w "$1"
 }
 
+# ci_job_uid: the job's user's uid ($CI_JOB_USER, default: this user).
+ci_job_uid() {
+    id -u "${CI_JOB_USER:-$(id -un)}"
+}
+
 # ci_job_usable DIR: whether the job's user can use DIR as a directory it makes things in: writable
 # AND searchable, asked as the job (access(2) for it). `test -w` alone ignores the search bit: a
 # job's `chmod 0600`, `0666` or `0200` of its own directory leaves it writable by the mode and yet
 # nothing can be made inside it (review 6001444818). The one question every check of a job's
-# directory (ci_cache_job_writable, ci_child_unwritable, ci_job_dir) asks.
+# directory (ci_child_probe, ci_job_dir) asks.
 ci_job_usable() {
     ci_as_job sh -c 'test -w "$1" && test -x "$1"' _ "$1"
 }
 
-# ci_cache_job_writable DIR: the ownership question, apart from the mount's: whether the job's user
-# can write DIR (the mount root a job makes its directories in), whoever owns it and whatever its
-# mode: Docker makes a missing mount source root 0755, and an owner (a job) can chmod it.
-#  - If the job's own uid owns DIR and only the mode stops it (a job's `chmod 0555`), this sets it
-#    back to 0755 and warns (NRV-W1203): otherwise one job could fail every later pipeline until an
-#    operator acted. Safe, as DIR is a mount's own root, which a job cannot swap for a link or
-#    rename (EBUSY) and whose parent, /cache, is root's; a link at DIR is still refused, never
-#    followed.
-#  - If anyone else owns it, NRV-E1229 names the owner and the mode: root never chowns a host
-#    directory it was not given.
-ci_cache_job_writable() {
-    local d="$1" job_uid was
-    ci_job_usable "$d" && return 0
-    job_uid=$(id -u "${CI_JOB_USER:-$(id -un)}")
-    if [ ! -L "$d" ] && [ "$(stat -c %u "$d")" = "$job_uid" ]; then
-        was=$(stat -c %a "$d")
-        if chmod 0755 -- "$d" 2>/dev/null && ci_job_usable "$d"; then
-            ci_warning "NRV-W1203: $d, owned by the job's user (${CI_JOB_USER:-$(id -un)}), had mode $was and was not writable: set it back to 0755 (a job's chmod); on the host, run bash ci/nerva-woodpecker.sh host again if this keeps happening"
-            return 0
-        fi
-    fi
+# ci_has_acl PATH: whether PATH carries an ACL beyond its mode, a default one included (a directory
+# with `setfacl -d` makes everything created in it come out with that ACL, mode 0 if it says so).
+# `ls -l` marks both with a `+` after the mode, so nothing needs the acl package to ask. Only a test.
+ci_has_acl() {
+    local m
+    m=$(ls -ldn -- "$1" 2>/dev/null) || return 1
+    [[ "${m%% *}" == *+ ]]
+}
+
+# ci_acl_strip PATH: removes every ACL entry of PATH, the default ACL too (setfacl -b -k). NRV-E1233
+# if setfacl is not there (the acl package: ci/woodpecker_step.sh installs it).
+ci_acl_strip() {
+    command -v setfacl >/dev/null || {
+        ci_error "NRV-E1233: setfacl is not installed, so an ACL cannot be removed from $1 (the acl package: apt-get install acl; on the host, the same before running nerva-woodpecker.sh host)"
+        return 1
+    }
+    setfacl -b -k -- "$1" 2>/dev/null
+}
+
+# ci_mount_root DIR: rule 1 (see the top): DIR, a mount root a job writes in (main/ in main's role,
+# branches/ in a branch's, jepsen/), must be a real directory owned by this user (root, in a step),
+# mode 0755, no ACL.
+#  - Docker makes a missing mount source root 0755, and `host` makes it so: nothing to do.
+#  - Owned by the job's uid (an earlier layout, where the jobs' own directory was the mount root, or
+#    a job's own chmod or ACL while it still owned it), or by this user with another mode or an ACL:
+#    repaired, chown first (a job cannot then change it again), then chmod 0755 and the ACL's removal,
+#    NRV-W1203. Safe: DIR is a mount's own root, which a job cannot swap for a link or rename
+#    (EBUSY) and whose parent, /cache, is root's; a link at DIR is never followed.
+#  - Anyone else's, a link, not a directory, or an ACL that cannot be removed: NRV-E1229 with what
+#    it is; root never chowns a host directory that is no job's.
+ci_mount_root() {
+    local d="$1" me job_uid owner mode acl=no was
+    me=$(id -u)
+    job_uid=$(ci_job_uid)
     if [ -L "$d" ]; then
         # The link's own mode is always 777 and says nothing; it is never followed.
-        ci_error "NRV-E1229: $d is mounted read-write but the job's user (${CI_JOB_USER:-$(id -un)}) cannot write it (it is a link, not a directory; it is never followed): on the host, run bash ci/nerva-woodpecker.sh host again, or remove the link and make the directory the job's user's, mode 0755"
-    else
-        ci_error "NRV-E1229: $d is mounted read-write but the job's user (${CI_JOB_USER:-$(id -un)}) cannot write it (owner $(stat -c '%U, uid %u' "$d"), mode $(stat -c %a "$d")): on the host, run bash ci/nerva-woodpecker.sh host again, or chown it to that user and chmod 0755 it"
+        ci_error "NRV-E1229: $d is mounted read-write but is a link, not a directory (it is never followed), and a job's mount root must be root-owned, mode 0755: on the host, remove the link and run bash ci/nerva-woodpecker.sh host again"
+        return 1
     fi
+    if [ ! -d "$d" ]; then
+        ci_error "NRV-E1229: $d is not a directory: on the host, remove it and run bash ci/nerva-woodpecker.sh host again"
+        return 1
+    fi
+    owner=$(stat -c %u "$d")
+    mode=$(stat -c %a "$d")
+    ! ci_has_acl "$d" || acl=yes
+    if [ "$owner" = "$me" ] && [ "$mode" = 755 ] && [ "$acl" = no ]; then return 0; fi
+    if [ "$owner" != "$me" ] && [ "$owner" != "$job_uid" ]; then
+        ci_error "NRV-E1229: $d is mounted read-write but is owned by neither this step's user nor the job's (${CI_JOB_USER:-$(id -un)}): owner $(stat -c '%U, uid %u' "$d"), mode $mode; on the host, run bash ci/nerva-woodpecker.sh host again, or chown it to root and chmod 0755 it"
+        return 1
+    fi
+    was="owner $(stat -c %U "$d"), mode $mode"
+    [ "$acl" = no ] || was="$was, with an ACL"
+    if chown -h "$me:$(id -g)" -- "$d" 2>/dev/null && chmod 0755 -- "$d" 2>/dev/null &&
+        { [ "$acl" = no ] || ci_acl_strip "$d"; } &&
+        [ "$(stat -c '%u %a' "$d")" = "$me 755" ] && ! ci_has_acl "$d"; then
+        ci_warning "NRV-W1203: $d, a mount root, was not root-owned 0755 with no ACL ($was): set to it (the job's own doing, or an earlier layout; a job cannot change it now); on the host, run bash ci/nerva-woodpecker.sh host again"
+        return 0
+    fi
+    ci_error "NRV-E1229: $d is mounted read-write but could not be made root-owned, mode 0755, with no ACL ($was; removing an ACL needs the acl package's setfacl): on the host, run bash ci/nerva-woodpecker.sh host again"
     return 1
 }
 
-# ci_child_unwritable PATH: whether PATH is a real directory (never a link) that the job's own uid
-# owns and the job cannot use (ci_job_usable: not writable or not searchable): what a job's
-# `chmod 0555`, `0600`, `0666` or `0200` of a cache directory leaves. Only a test.
-ci_child_unwritable() {
-    local p="$1"
-    [ ! -L "$p" ] && [ -d "$p" ] || return 1
-    [ "$(stat -c %u "$p")" = "$(id -u "${CI_JOB_USER:-$(id -un)}")" ] || return 1
-    ! ci_job_usable "$p"
+# ci_normalize DIR: rule 3. As the job's user, over DIR, a directory of its own (never a link; the
+# caller tests that): every directory gets u+rwx (find acts on a directory before it enters it, so
+# a chmod 0000 one is opened up and then searched), a file without u+r gets it, a FIFO or socket is
+# removed, and every directory loses its ACL entries, default ones included (setfacl -b -k, many
+# directories per call; "not supported" on a file system without ACLs is no failure, and the check
+# after it is on DIR itself). Bounded by CI_NORMALIZE_SECONDS (default 600): a tree it cannot get
+# through in that time counts as failed, and is reset by the caller. NRV-E1233 without setfacl.
+ci_normalize() {
+    local d="$1"
+    command -v setfacl >/dev/null || {
+        ci_error "NRV-E1233: setfacl is not installed, so the ACLs of $d cannot be removed (the acl package: ci/woodpecker_step.sh installs it)"
+        return 1
+    }
+    ci_as_job timeout "${CI_NORMALIZE_SECONDS:-600}" sh -c '
+        find "$1" -xdev \( -type d ! -perm -u=rwx -exec chmod u+rwx -- {} \; \) -o \
+            \( -type f ! -perm -u=r -exec chmod u+r -- {} \; \) -o \
+            \( \( -type p -o -type s \) -exec rm -f -- {} \; \) || exit 1
+        find "$1" -xdev -type d -exec setfacl -b -k -- {} + 2>/dev/null || true
+    ' _ "$d" 2>/dev/null
 }
 
-# ci_child_reset PATH MOUNT: removes PATH, a DIRECT child of MOUNT (a mount's own root, which a job
-# cannot swap for a link), if ci_child_unwritable: a job's chmod of it would otherwise fail every
-# later pipeline with NRV-E1228 until an operator acted. The same operation the prune does on a
-# direct child (rm -rf of one name, never following a link, one file system); the caller holds the
-# lock that keeps every other job out of it, and ci_job_dir makes it again. Foreign-owned
-# directories and deeper paths are left (return 1), and NRV-E1228 says so. NRV-W1204.
+# ci_child_probe PATH: the state of PATH, a DIRECT child of a mount root that the job's user is
+# to own (a branch's directory, main's zig, zig-local or tools, jepsen's tools), as the return code:
+#   0   a directory the job owns and can use, after ci_normalize and with no ACL: nothing to do
+#   10  nothing there (a link was: it is the job's doing, unlinked, never followed, no lock needed)
+#   11  the job owns it and it cannot be used: not a directory (a file, a FIFO, a socket), a
+#       directory that is not usable or has an ACL or could not be normalized: ci_child_reset
+#   12  another uid owns it (root never touches it), or a link that could not be unlinked
+# Waits a moment on a directory this user owns (root's, just made by a concurrent step's ci_child_make:
+# its mkdir and its chown are two calls), never on a real owner's.
+ci_child_probe() {
+    local p="$1" job_uid owner
+    job_uid=$(ci_job_uid)
+    if [ -L "$p" ]; then rm -f -- "$p" 2>/dev/null || true; fi
+    if [ -L "$p" ]; then return 12; fi
+    [ -e "$p" ] || return 10
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        owner=$(stat -c %u -- "$p" 2>/dev/null) || return 10
+        { [ "$owner" = "$(id -u)" ] && [ "$owner" != "$job_uid" ] && [ -d "$p" ]; } || break
+        sleep 0.2
+    done
+    [ "$owner" = "$job_uid" ] || return 12
+    [ -d "$p" ] || return 11
+    ci_normalize "$p" || return 11
+    ! ci_has_acl "$p" || return 11
+    ci_job_usable "$p" || return 11
+    return 0
+}
+
+# ci_child_make PATH: makes PATH, a DIRECT child of a root-owned mount root, a directory the job's
+# user owns: mkdir, then chown -h of the name (rule 1: nobody but root can have made or swapped it).
+# A directory a concurrent step made first is fine. Return 1 if there is no such directory after.
+ci_child_make() {
+    local p="$1" job_uid
+    job_uid=$(ci_job_uid)
+    if mkdir -m 0755 -- "$p" 2>/dev/null; then
+        chown -h "$job_uid:$(id -g "${CI_JOB_USER:-$(id -un)}")" -- "$p" 2>/dev/null || { rmdir -- "$p" 2>/dev/null || true; return 1; }
+    fi
+    [ -d "$p" ] && [ ! -L "$p" ] && [ "$(stat -c %u -- "$p")" = "$job_uid" ]
+}
+
+# ci_child_reset PATH MOUNT: rule 2. Removes PATH, a DIRECT child of MOUNT (a mount's own root,
+# root's), whatever it is, if the job's own uid owns it: the prune's own operation (rm -rf of one
+# name, never following a link, one file system). The caller holds the lock that keeps every other
+# job out of it, and makes it again (ci_child_make). Another uid's, a deeper path, a link (probe
+# unlinks those) and a name that is still there after the rm (a mount inside it) are left: return 1.
+# NRV-W1204.
 ci_child_reset() {
     local p="$1" mount="$2" was
     [ "$(dirname -- "$p")" = "${mount%/}" ] || return 1
-    ci_child_unwritable "$p" || return 1
-    was=$(stat -c %a "$p")
+    [ ! -L "$p" ] && [ -e "$p" ] || return 1
+    [ "$(stat -c %u -- "$p")" = "$(ci_job_uid)" ] || return 1
+    was=$(stat -c '%F, mode %a' -- "$p")
+    ! ci_has_acl "$p" || was="$was, with an ACL"
     rm -rf --one-file-system -- "$p" 2>/dev/null || true
     [ ! -e "$p" ] || return 1
-    ci_warning "NRV-W1204: $p, owned by the job's user (${CI_JOB_USER:-$(id -un)}), had mode $was and was not writable for it: removed, to be made again (it is only a cache; a job's chmod); if this keeps happening, look for the script that does it"
+    ci_warning "NRV-W1204: $p, owned by the job's user (${CI_JOB_USER:-$(id -un)}), was not a usable directory for it (writable and searchable; was: $was): removed, to be made again (it is only a cache; a job's chmod, ACL or file); if this keeps happening, look for the script that does it"
+}
+
+# ci_child_ensure PATH MOUNT [LOCKCMD...]: PATH, a direct child of MOUNT, made a directory the job
+# can use: probed, reset if it is the job's and unusable (after LOCKCMD, which takes the exclusive
+# access that keeps other jobs out and must succeed; none when the caller already holds it), made
+# if it is not there. NRV-E1228 if it still is not one.
+ci_child_ensure() {
+    local p="$1" mount="$2" rc=0
+    shift 2
+    ci_child_probe "$p" || rc=$?
+    if [ "$rc" = 11 ] && { [ $# -eq 0 ] || "$@"; } && ci_child_reset "$p" "$mount"; then rc=10; fi
+    if [ "$rc" = 10 ] && ci_child_make "$p"; then rc=0; fi
+    [ "$rc" = 0 ] || { ci_child_refused "$p"; return 1; }
+}
+
+# ci_child_refused PATH: NRV-E1228 for a direct child of a mount root.
+ci_child_refused() {
+    ci_error "NRV-E1228: $1 is not a directory that the job's user (${CI_JOB_USER:-$(id -un)}) can use, and the step could not make it one (another user's, or other jobs hold the lock a reset needs): on the host, rm -rf it (it is only a cache) and start the pipeline again"
 }
 
 # ci_cache_check ROLE ROOT: ROLE is main or branch. NRV-E1202 if ROOT is not laid out as above, or
 # main's directory is writable where it must not be (a branch) or not where it must be (main), or
 # branches/ is not writable in a branch's pipeline: the mount's, by root's test, whoever owns the
-# directory. Then NRV-E1229 if the directory the job writes (main/ in main's role, branches/ in a
-# branch's) is a mount the job's user cannot write.
+# directory. Then ci_mount_root (NRV-W1203, NRV-E1229) on the directory the job's caches are made in
+# (main/ in main's role, branches/ in a branch's).
 ci_cache_check() {
     local role="$1" root="$2"
     if [ ! -d "$root/main" ] || { [ "$role" = branch ] && [ ! -d "$root/branches" ]; }; then
@@ -151,7 +270,7 @@ ci_cache_check() {
         return 1
     fi
     ci_locks_check "$root" || return 1
-    if [ "$role" = main ]; then ci_cache_job_writable "$root/main"; else ci_cache_job_writable "$root/branches"; fi
+    if [ "$role" = main ]; then ci_mount_root "$root/main"; else ci_mount_root "$root/branches"; fi
 }
 
 # ci_locks_check ROOT: NRV-E1202 if ROOT/locks is not there (not mounted), NRV-E1226 if it is not a
@@ -243,17 +362,27 @@ ci_as_job() {
     fi
 }
 
-# ci_job_dir PATH...: makes each PATH (parents first) a plain directory the job user can write, as
-# the job user, never as root (see the top). A symlink there is unlinked and replaced (it is the
-# job's own doing); anything else that is not a directory the job can write (a file, a directory
-# of another user, a link planted again after the unlink) is refused: NRV-E1228.
+# ci_job_dir PATH...: makes each PATH (parents first) a directory the job user can use, as the job
+# user, never as root: PATH is below a direct child of a mount root (a branch's zig and zig-local),
+# which is all the job's own tree, so whatever is at PATH that is no usable directory (a link, a
+# file, a FIFO, a directory it cannot use) is the job's own doing: the job removes it
+# (rm -rf --one-file-system, never following a link) and makes the directory again, NRV-W1204. A
+# directory the job cannot remove or make (another user's: root makes none of these) is NRV-E1228.
 ci_job_dir() {
-    local p
+    local p was
     for p in "$@"; do
-        if [ -L "$p" ]; then ci_as_job rm -f -- "$p" 2>/dev/null || true; fi
+        if [ -e "$p" ] || [ -L "$p" ]; then
+            if [ -L "$p" ] || [ ! -d "$p" ] || ! ci_job_usable "$p"; then
+                was=$(stat -c '%F, mode %a' -- "$p" 2>/dev/null || echo unknown)
+                ci_as_job rm -rf --one-file-system -- "$p" 2>/dev/null || true
+                if [ ! -e "$p" ] && [ ! -L "$p" ]; then
+                    ci_warning "NRV-W1204: $p, owned by the job's user (${CI_JOB_USER:-$(id -un)}), was not a usable directory for it (writable and searchable; was: $was): removed, to be made again (it is only a cache; a job's chmod, ACL, file or link)"
+                fi
+            fi
+        fi
         if [ ! -e "$p" ] && [ ! -L "$p" ]; then ci_as_job mkdir -- "$p" 2>/dev/null || true; fi
         if [ -L "$p" ] || [ ! -d "$p" ] || ! ci_job_usable "$p"; then
-            ci_error "NRV-E1228: $p is not a plain directory that the job's user (${CI_JOB_USER:-$(id -un)}) can write (a link, a file, or another user's directory): on the host, rm -rf it (it is only a cache) and start the pipeline again"
+            ci_error "NRV-E1228: $p is not a directory that the job's user (${CI_JOB_USER:-$(id -un)}) can use, and could not be made one (another user's directory): on the host, rm -rf it (it is only a cache) and start the pipeline again"
             return 1
         fi
     done
@@ -322,7 +451,7 @@ ci_branch_own_lock() {
 # nobody is using goes. The lock on fd 7 (locks/branches.lock) serialises seeding and pruning; fd 6 is
 # taken before it is released, so no prune falls between.
 ci_branch_prepare() {
-    local root="$1" key b dir locks maxn maxdays maxgib seedgib partial err last locked=no
+    local root="$1" key b dir locks maxn maxdays maxgib seedgib partial err last rc locked=no
     key=$(ci_branch_key "$2")
     b="$root/branches"
     dir="$b/$key"
@@ -358,22 +487,30 @@ ci_branch_prepare() {
         return 1
     fi
     ci_branch_own_lock "$key" "$locked" || return 1
-    # A job's `chmod 0555` of this branch's directory: removed, and made again below (NRV-W1204),
-    # under the key's lock held exclusively, as a prune holds it: ours is let go first (a second
-    # descriptor's exclusive lock would wait for it), and taken again after. If another job of the
-    # branch holds it, nothing is removed and NRV-E1228 says so below.
-    if ci_child_unwritable "$dir"; then
+    # This branch's directory (rules 2 and 3 at the top): probed, its tree normalized by the job
+    # (ci_child_probe). One the job owns and cannot use, whatever it is (a directory with a chmod,
+    # an ACL or a tree that cannot be normalized; a file, a FIFO, a socket), is removed and made
+    # again (NRV-W1204) under the key's lock held exclusively, as a prune holds it: ours is let go
+    # first (a second descriptor's exclusive lock would wait for it), and taken again after. If
+    # another job of the branch holds it, nothing is removed and NRV-E1228 (or E1214) says so below.
+    rc=0
+    ci_child_probe "$dir" || rc=$?
+    if [ "$rc" = 11 ]; then
         flock -u 6
         ( { exec 5>>"$locks/$key.lock"; } 2>/dev/null && flock -x -n 5 && ci_child_reset "$dir" "$b" ) || true
         ci_branch_own_lock "$key" "$locked" || return 1
+        rc=0
+        ci_child_probe "$dir" || rc=$?
     fi
-    # A link at $dir is the job's own doing: unlinked (never followed), then made again below.
-    if [ -L "$dir" ]; then rm -f -- "$dir" 2>/dev/null || true; fi
-    if [ ! -e "$dir" ]; then
-        # Everything under $b is made by the job's user (ci_as_job), never by root: nothing root
-        # does can then follow a link there. The partial directory has a name of mktemp's, made
-        # with O_EXCL, so a link planted at a guessed name is not used.
-        if [ "$locked" = yes ] && partial=$(ci_as_job mktemp -d "$b/$key.partial.XXXXXX" 2>/dev/null); then
+    if [ "$rc" = 10 ]; then
+        # Root makes the direct children of $b (rule 1: it is root's, so nothing root does there can
+        # follow a link); what is below them is made by the job's user (ci_as_job). The partial
+        # directory has a name of mktemp's, made with O_EXCL, and is the job's from the start.
+        partial=
+        if [ "$locked" = yes ] && partial=$(mktemp -d "$b/$key.partial.XXXXXX" 2>/dev/null); then
+            chown -h "$(ci_job_uid):$(id -g "${CI_JOB_USER:-$(id -un)}")" -- "$partial" 2>/dev/null || { rmdir -- "$partial" 2>/dev/null || true; partial=; }
+        fi
+        if [ -n "$partial" ]; then
             # Only zig/p, the fetched packages, is copied: they are content-addressed and written
             # once. Main's other global-cache files and its zig-local are rewritten by main's jobs,
             # which hold main's lock shared, as this job does (the shared flock in the step script):
@@ -396,28 +533,34 @@ ci_branch_prepare() {
             fi
             ci_as_job mkdir -p "$partial/zig" "$partial/zig-local"
             # -T: if a job without the lock filled $dir meanwhile, keep its directory and drop the seed.
-            ci_as_job mv -T "$partial" "$dir" 2>/dev/null || rm -rf "$partial"
+            # Root renames one name in its own directory: nothing inside $partial is followed.
+            mv -T "$partial" "$dir" 2>/dev/null || rm -rf --one-file-system -- "$partial"
         else
             # No lock on the branches' directory (or no partial directory could be made): no
-            # shared partial directory a prune could remove.
-            ci_as_job mkdir -p "$dir/zig" "$dir/zig-local" 2>/dev/null || true
+            # shared partial directory a prune could remove. It starts empty.
+            ci_child_make "$dir" || true
         fi
     fi
     # The branches' lock is let go before anything can return: seeding is done, or never started.
     [ "$locked" != yes ] || flock -u 7
-    # Whichever way $dir was made (or not), it must be a directory now (a file there is the box's damage).
-    if [ ! -d "$dir" ]; then
+    # Whichever way $dir was made (or not), it must be a directory now.
+    if [ -L "$dir" ] || [ ! -d "$dir" ]; then
         if [ -e "$dir" ] || [ -L "$dir" ]; then
-            ci_error "NRV-E1214: $dir is not a directory: remove it"
+            ci_error "NRV-E1214: $dir is not a directory: remove it (another user's, or other jobs of this branch hold the lock that removing it needs)"
         else
-            ci_error "NRV-E1214: $dir could not be made by the job's user (${CI_JOB_USER:-$(id -un)}) in $b (a full disk, or $b not usable by it; NRV-W1203 repairs that when the job's own uid owns it): free space or check $b on the host"
+            ci_error "NRV-E1214: $dir could not be made in $b (a full disk, or $b not root-owned and writable by the step; NRV-W1203 repairs that): free space or check $b on the host"
         fi
         return 1
     fi
-    # The job's own directories, as the job user: a missing one is made, a link is replaced, and
-    # one the job cannot write (a file, another user's) is refused (NRV-E1228). No chown: root
-    # touches nothing in $dir.
-    ci_job_dir "$dir" "$dir/zig" "$dir/zig-local" || return 1
+    # Another user's directory, or one the job cannot use that other jobs hold the lock of: NRV-E1228.
+    # (rc 11 here: the job's own tree could not be normalized and could not be reset either.)
+    if [ "$rc" = 11 ] || [ "$(stat -c %u -- "$dir")" != "$(ci_job_uid)" ] || ! ci_job_usable "$dir"; then
+        ci_child_refused "$dir"
+        return 1
+    fi
+    # The job's own directories below it, as the job user: a missing one is made, a link, a file or
+    # an unusable one is replaced (NRV-W1204). Nothing in $dir is root's to touch.
+    ci_job_dir "$dir/zig" "$dir/zig-local" || return 1
     ci_as_job touch "$dir"
     # shellcheck disable=SC2034 # read by ci/woodpecker_step.sh
     CI_BRANCH_DIR="$dir" # not printed: a command substitution would drop the lock with its shell
@@ -445,21 +588,19 @@ ci_main_prune() {
 
 # ci_main_prepare ROOT USER LOW MIN_GIB: the main role's cache set-up, run as root, in this order:
 # the lock file (ours, 0600) and its fd 9, the prune (when LOW is yes), and only then main's
-# directories, made by USER itself (ci_job_dir): root chowns and installs nothing in main/, which a
-# job writes, so a link a job planted at main/zig, zig-local or tools is replaced or refused
-# (NRV-E1228), never followed. The prune removes main/zig and main/zig-local, so the directories
-# come after it. A directory of main's that a job's chmod made unwritable for it is removed first
-# (ci_child_reset, NRV-W1204). The caller takes its shared lock (flock -s 9) after this returns.
+# directories (zig, zig-local, tools), direct children of main/, which is root's (rule 1): made and
+# chowned to USER by root, or reset by root if USER's and unusable (ci_child_ensure). The prune
+# removes main/zig and main/zig-local, so the directories come after it. The caller takes its
+# shared lock (flock -s 9) after this returns.
 ci_main_prepare() {
     local root="$1" CI_JOB_USER="$2" low="$3" min="$4" p
     ci_main_lock_open "$root" || return 1 # root's, in the lock directory a job cannot write
     [ "$low" = no ] || { echo "Below $min GiB free"; ci_main_prune "$root" "$min"; }
-    # A job's `chmod 0555` of one of main's directories: removed under main's exclusive lock (what
-    # the prune takes; held already if it ran), and made again below (NRV-W1204). Waits as the prune does.
+    # Rule 2 for main's direct children: one the job owns and cannot use, of any type, is removed
+    # under main's exclusive lock (what the prune takes; held already if it ran; waits as the prune
+    # does) and made again by root with a chown (NRV-W1204); one that is missing is made; another
+    # user's is refused (NRV-E1228). The job's tree below them is normalized by ci_child_probe.
     for p in zig zig-local tools; do
-        if ci_child_unwritable "$root/main/$p" && flock -x -w "${CI_PRUNE_WAIT:-5}" 9; then
-            ci_child_reset "$root/main/$p" "$root/main" || true
-        fi
+        ci_child_ensure "$root/main/$p" "$root/main" flock -x -w "${CI_PRUNE_WAIT:-5}" 9 || return 1
     done
-    ci_job_dir "$root/main/zig" "$root/main/zig-local" "$root/main/tools"
 }

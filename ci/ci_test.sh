@@ -400,35 +400,91 @@ d6=$(cat "$tmp/dir6")
 is "a seed does not nest in an existing cache" "" "$(find "$d6" -name '*.partial.*')"
 is "no seed directory is left behind" "" "$(find "$c/branches" -maxdepth 1 -name '*.partial.*')"
 
-# NRV-E1214: a branch's cache path that is a regular file is refused, not used, and the branches'
-# lock is not kept (a caller that went on would hold every branch job up).
+# NRV-E1214: a branch's cache path that is not a directory, and cannot be reset because another job
+# of the branch holds its lock (a job's own file there is otherwise removed and made again, NRV-W1204),
+# is refused, not used, and the branches' lock is not kept (a caller that went on would hold every
+# branch job up). The message says what is wrong, not that the directory "could not be made".
 branch_file() {
     . ci/cache.sh
     ci_branch_prepare "$c" feature/seven
 }
 seven=$(. ci/cache.sh; ci_branch_key feature/seven)
 : >"$c/branches/$seven"
-refuses NRV-E1214 "branch cache path is a file" branch_file
+: >"$c/locks/$seven.lock"
+setsid flock -o -s "$c/locks/$seven.lock" sleep 20 &
+holder=$!
+sleep 0.3
+out=$(branch_file 2>&1) && { echo "FAIL branch cache path is a file: it succeeded, want NRV-E1214" >&2; fail=1; }
+grep -q "NRV-E1214: .*is not a directory: remove it" <<<"$out" || { echo "FAIL branch cache path is a file: no 'is not a directory: remove it' in: $out" >&2; fail=1; }
+if grep -q 'could not be made' <<<"$out"; then echo "FAIL branch cache path is a file: says 'could not be made': $out" >&2; fail=1; fi
 is "the branches' lock is released after NRV-E1214" free "$(
     . ci/cache.sh
     ci_branch_prepare "$c" feature/seven >/dev/null 2>&1 || true
     flock -x -n "$c/locks/branches.lock" true && echo free || echo held
 )"
-rm -f "$c/branches/$seven"
-# The same on the NRV-W1202 path: the lock stays busy, $dir is a file.
+is "a file that cannot be reset is left alone" yes "$([ -f "$c/branches/$seven" ] && echo yes)"
+kill -- -"$holder" 2>/dev/null || true
+wait "$holder" 2>/dev/null || true
+# Nobody holds the lock now: the job's own file is removed and the directory made again, NRV-W1204.
+out=$(branch_file 2>&1) || { echo "FAIL a job's file at the branch's path is reset: $out" >&2; fail=1; }
+grep -q 'NRV-W1204' <<<"$out" || { echo "FAIL a job's file at the branch's path: no NRV-W1204 in: $out" >&2; fail=1; }
+is "the file was replaced by a directory" yes "$([ -d "$c/branches/$seven/zig-local" ] && echo yes)"
+rm -rf "${c:?}/branches/$seven"
+# The same on the NRV-W1202 path: the branches' lock stays busy, $dir is a file whose lock is held.
 eight=$(. ci/cache.sh; ci_branch_key feature/eight)
 : >"$c/branches/$eight"
+: >"$c/locks/$eight.lock"
 setsid flock -o -x "$c/locks/branches.lock" sleep 20 &
 holder=$!
+setsid flock -o -s "$c/locks/$eight.lock" sleep 20 &
+holder2=$!
 sleep 0.3
 branch_file_unlocked() {
     . ci/cache.sh
     CI_LOCK_WAIT=1 ci_branch_prepare "$c" feature/eight
 }
-refuses NRV-E1214 "branch cache path is a file, branches' lock busy" branch_file_unlocked
+out=$(branch_file_unlocked 2>&1) && { echo "FAIL branch cache path is a file, branches' lock busy: it succeeded, want NRV-E1214" >&2; fail=1; }
+grep -q "NRV-E1214: .*is not a directory: remove it" <<<"$out" || { echo "FAIL branch cache path is a file, branches' lock busy: no 'is not a directory: remove it' in: $out" >&2; fail=1; }
+if grep -q 'could not be made' <<<"$out"; then echo "FAIL branch cache path is a file, branches' lock busy: says 'could not be made': $out" >&2; fail=1; fi
 kill -- -"$holder" 2>/dev/null || true
-wait "$holder" 2>/dev/null || true
-rm -f "$c/branches/$eight"
+kill -- -"$holder2" 2>/dev/null || true
+wait "$holder" "$holder2" 2>/dev/null || true
+rm -rf "${c:?}/branches/$eight"
+# A job that takes the key's lock exclusively while the reset is done: the re-take of the shared lock
+# after it must wait for it and fail NRV-E1225, not be skipped. The reset is wrapped to start such
+# a holder right after it has run.
+rst=$(. ci/cache.sh; ci_branch_key feature/reset)
+: >"$c/branches/$rst"
+reset_then_hold() {
+    . ci/cache.sh
+    eval "orig_$(declare -f ci_child_reset)"
+    ci_child_reset() {
+        orig_ci_child_reset "$@" || return 1
+        setsid flock -o -x "$c/locks/$rst.lock" sleep 20 5>&- 6>&- 7>&- &
+        echo $! >"$tmp/rst.pid"
+        sleep 0.3
+    }
+    CI_LOCK_WAIT=1 ci_branch_prepare "$c" feature/reset
+}
+out=$(reset_then_hold 2>&1) && { echo "FAIL a lock taken after the reset: it succeeded, want NRV-E1225" >&2; fail=1; }
+grep -q 'NRV-E1225' <<<"$out" || { echo "FAIL a lock taken after the reset: no NRV-E1225 in: $out" >&2; fail=1; }
+kill -- -"$(cat "$tmp/rst.pid")" 2>/dev/null || true
+wait 2>/dev/null || true
+rm -rf "${c:?}/branches/$rst"
+# ci_child_reset reports success only if the name is gone: a failing rm (a stub) is rc 1, no NRV-W1204.
+mkdir -p "$tmp/badrm" "$c/branches/b-rmfail-00000001"
+printf '#!/bin/sh\nexit 1\n' >"$tmp/badrm/rm"
+chmod +x "$tmp/badrm/rm"
+out=$(
+    . ci/cache.sh
+    PATH="$tmp/badrm:$PATH"
+    rc=0
+    ci_child_reset "$c/branches/b-rmfail-00000001" "$c/branches" 2>&1 || rc=$?
+    echo "rc=$rc"
+)
+grep -q 'rc=1' <<<"$out" || { echo "FAIL a reset that removed nothing: want rc=1: $out" >&2; fail=1; }
+if grep -q 'NRV-W1204' <<<"$out"; then echo "FAIL a reset that removed nothing warns it removed it: $out" >&2; fail=1; fi
+rm -rf "${c:?}/branches/b-rmfail-00000001"
 
 # NRV-E1225: a branch's own cache lock held exclusively does not hold a step up for good, and the
 # branches' lock is not kept. Lock files are the step's own, 0600.
@@ -714,6 +770,17 @@ mkdir "$tmp/hostcache/zig"
 out=$(nw FAKE_DOCKER=ok -- host 2>&1) || { echo "FAIL host run again: $out" >&2; fail=1; }
 grep -q 'old layout (zig )' <<<"$out" || { echo "FAIL host run again: the old layout is not noted in: $out" >&2; fail=1; }
 grep -q 'nerva-woodpecker: OK host' <<<"$out" || { echo "FAIL host run again: no OK line in: $out" >&2; fail=1; }
+is "host makes the mount roots 0755 and makes none of their directories" "755 755 755 yes" "$(stat -c %a "$tmp/hostcache/main") $(stat -c %a "$tmp/hostcache/branches") $(stat -c %a "$tmp/hostcache/jepsen") $([ -z "$(find "$tmp/hostcache/main" "$tmp/hostcache/branches" "$tmp/hostcache/jepsen" -mindepth 1)" ] && echo yes)"
+# A box that ran the earlier layout: the roots the job's, one with an ACL: run again, they are root's 0755 with no ACL.
+if [ "$(id -u)" = 0 ] && command -v setfacl >/dev/null && id nobody >/dev/null 2>&1; then
+    chown nobody "$tmp/hostcache/main" "$tmp/hostcache/branches"
+    chmod 0555 "$tmp/hostcache/main"
+    setfacl -d -m u::---,g::---,o::--- "$tmp/hostcache/branches" 2>/dev/null || true
+    out=$(nw FAKE_DOCKER=ok -- host 2>&1) || { echo "FAIL host on job-owned roots: $out" >&2; fail=1; }
+    # (The install stub above drops -o and -g, so the owner is checked statically below.)
+    is "host sets job-owned mount roots to 0755 and removes their ACL" "755 no" "$(stat -c %a "$tmp/hostcache/main") $(m=$(ls -ld "$tmp/hostcache/branches"); [[ "${m%% *}" == *+ ]] && echo yes || echo no)"
+fi
+is "host installs the mount roots root-owned (static)" 1 "$(grep -c 'install -d -m 0755 -o 0 -g 0 "\$root" "\$root/main" "\$root/branches" "\$root/jepsen"' ops/ci/nerva-woodpecker.sh || true)"
 refuses NRV-E1216 "host: docker is down" nw FAKE_DOCKER=down -- host
 refuses NRV-E1216 "host: no agent container" nw FAKE_DOCKER=noagent -- host
 nodocker="$tmp/nodocker"
@@ -797,17 +864,23 @@ wait "$holder" 2>/dev/null || true
 ok "the shared lock is taken once it is free" lock_wait
 
 # The step script prepares main through ci_main_prepare and makes nothing in a cache a job writes
-# as root: no install -d, chown or mkdir on the caches' paths, no fd opened by a bare exec.
+# as root, itself: no install -d, chown or mkdir on the caches' paths, no fd opened by a bare exec.
+# The root operations are in ci/cache.sh, listed at its top (ci_mount_root, ci_child_make,
+# ci_child_reset and the branch's partial directory), where the spies below watch them run.
 grep -q '^    ci_main_prepare .* || exit 1$' ci/woodpecker_step.sh || { echo "FAIL woodpecker_step.sh does not call ci_main_prepare or ignores its failure" >&2; fail=1; }
 grep -q '^    ci_branch_prepare .* || exit 1$' ci/woodpecker_step.sh || { echo "FAIL woodpecker_step.sh ignores a failure of ci_branch_prepare" >&2; fail=1; }
-if grep -n 'install -d .*\(cache/main\|base\|JEPSEN_OUT\|cache/jepsen/\)\|chown .*\(cache\|base\)\|mkdir .*\(cache\|base\|JEPSEN_OUT\)' ci/woodpecker_step.sh; then
-    echo "FAIL woodpecker_step.sh makes or chowns something in a cache a job writes as root: use ci_job_dir" >&2
+if grep -n 'install -d .*\(cache/main\|base\|JEPSEN_OUT\|cache/jepsen\)\|chown .*\(cache\|base\)\|mkdir .*\(cache\|base\|JEPSEN_OUT\)' ci/woodpecker_step.sh; then
+    echo "FAIL woodpecker_step.sh makes or chowns something in a cache a job writes as root: use ci_mount_root, ci_child_ensure or ci_child_make" >&2
     fail=1
 fi
-if grep -n '^ *chown\|install -d\|mkdir\|chmod' ci/cache.sh | grep -v '^[0-9]*: *#' | grep -v 'chown -h\|chmod 600\|ci_error\|ci_warning\|ci_as_job\|mkdir -- "\$p"\|chmod 0755 -- "\$d"'; then
-    echo "FAIL ci/cache.sh makes or chowns something as root outside the lock files" >&2
+if grep -n -E '(^|[ (;&|])(chown|install -d|mkdir|chmod|mktemp|mv|touch|cp|ln) ' ci/cache.sh | grep -v '^[0-9]*: *#' |
+    grep -v -E 'ci_error|ci_warning|ci_as_job|command -v|chown -h "|chmod 0755 -- "\$d"|chmod 600|mkdir -m 0755 -- "\$p"|mktemp -d "\$b/\$key.partial|mv -T "\$partial" "\$dir"|-exec chmod u\+r'; then
+    echo "FAIL ci/cache.sh makes, chowns, chmods or moves something as root outside the operations listed at its top" >&2
     fail=1
 fi
+is "ci_mount_root's chmod and chown are on the mount root, nothing else (static)" 1 "$(grep -c 'chmod 0755 -- "\$d"' ci/cache.sh || true)"
+is "the jepsen root is made by ci_mount_root, its children by ci_child_ensure and ci_child_make (static)" "1 1 1" "$(grep -c 'ci_mount_root "\$cache/jepsen"' ci/woodpecker_step.sh) $(grep -c 'ci_child_ensure "\$cache/jepsen/tools"' ci/woodpecker_step.sh) $(grep -c 'ci_child_make "\$JEPSEN_OUT"' ci/woodpecker_step.sh)"
+is "the acl package is installed by the step (static)" 1 "$(grep -c 'util-linux acl >/dev/null' ci/woodpecker_step.sh || true)"
 # Only ci_main_lock_open opens main's lock (fd 9), which is what gives E1226 and E1227; the jepsen
 # lock opens read-only with its mode named, so its reason is the real one.
 is "only ci_main_lock_open opens fd 9" 1 "$(grep -c 'exec 9<' ci/cache.sh ci/woodpecker_step.sh | awk -F: '{n += $2} END {print n}')"
@@ -817,10 +890,10 @@ is "ci.yml runs ci_test.sh through sudo (static)" 1 "$(grep -c 'run: sudo env "P
 is "the jepsen lock's E1227 probes a read open" 1 "$(grep -c "ci_lock_open_failed \"\$cache/locks/jepsen.lock\" '<'" ci/woodpecker_step.sh || true)"
 
 # The step's own sequence (ci_main_prepare: lock, prune, then the directories): after a prune
-# main's directories are made again by the job's user. As root the user is `nobody`.
+# main's directories are made again, by root, and handed to the job's user. As root the user is `nobody`.
 chmod 711 "$tmp"
 if [ "$(id -u)" = 0 ]; then ou=nobody; else ou=$(id -un); fi
-chown -R "$ou" "$c/main" 2>/dev/null || true
+chown "$ou" "$c/main/zig" "$c/main/zig-local" "$c/main/tools" 2>/dev/null || true
 echo x >"$c/main/zig-local/entry"
 (
     . ci/cache.sh
@@ -831,12 +904,16 @@ is "prepare: locks/main.lock is the step's own, 0600" "$(id -un) 600" "$(stat -c
 is "prepare: zig owned by the job's user after a prune" "$ou" "$(stat -c %U "$c/main/zig")"
 is "prepare: zig-local owned by the job's user after a prune" "$ou" "$(stat -c %U "$c/main/zig-local")"
 is "prepare: tools owned by the job's user" "$ou" "$(stat -c %U "$c/main/tools")"
+is "prepare: main/ itself is the step's, not the job's" "$(id -un)" "$(stat -c %U "$c/main")"
 
-# --- A job plants a link where the root step prepares its caches (review 6000214760): nothing
-# root does follows it. The job's user is `nobody` as root, else this user. For each path in each
-# role, a link to a directory and to a file (both root's, 0700 and 0600, in a directory the job
-# cannot write) is planted; the step's prepare code then runs, and must leave the target's owner,
-# mode and content alone and the path a plain directory (the link replaced) or refuse it (E1228).
+# --- What a job leaves where the root step prepares its caches (review 6000214760): nothing root
+# does follows a link. The job's user is `nobody` as root, else this user. The mount roots are
+# root's (rule 1 of ci/cache.sh): a job cannot make or swap a name directly in one, so what is left
+# there is what an earlier layout or an earlier root-made child became (planted below by root and
+# handed to the job's uid, which is how it would have been the job's), and what the job does below
+# it. For each path in each role, a link to a directory and to a file (both root's, 0700 and 0600,
+# in a directory the job cannot write) is planted; the step's prepare code then runs, and must leave
+# the target's owner, mode and content alone and the path a plain directory (the link replaced).
 jobuser=$ou
 sd="$tmp/sentinel-dir"
 sf="$tmp/sentinel-file"
@@ -848,26 +925,39 @@ reset_sentinels() {
     chmod 600 "$sf"
 }
 ci_as() { if [ "$(id -u)" = 0 ]; then setpriv --reuid "$(id -u "$jobuser")" --regid "$(id -g "$jobuser")" --init-groups "$@"; else "$@"; fi; }
+plant() { # plant KIND PATH [TARGET]: root makes it, directly in a mount root, and hands it to the job's uid
+    case "$1" in
+        dir) mkdir "$2" ;;
+        file) : >"$2" ;;
+        fifo) mkfifo "$2" ;;
+        link) ln -s "$3" "$2" ;;
+    esac
+    chown -h "$jobuser" "$2" 2>/dev/null || true
+}
+mk_branch() { # mk_branch DIR: a branch's directory as the step leaves it, zig and zig-local the job's own
+    plant dir "$1"
+    ci_as mkdir "$1/zig" "$1/zig-local"
+}
 reset_sentinels
 want_state=$(sentinel_state)
-attack_tree() { # attack_tree NAME: a fresh cache root, as the host lays it out, the caches the job's
+attack_tree() { # attack_tree NAME: a fresh cache root, as the host lays it out: roots root's, 0755; main's children the job's
     local r="$tmp/atk-$1"
     rm -rf "$r"
     mkdir -p "$r/main/zig" "$r/main/zig-local" "$r/main/tools" "$r/branches"
     mkdir -m 0700 "$r/locks"
-    chown -R "$jobuser" "$r/main" "$r/branches" 2>/dev/null || true
+    chown "$jobuser" "$r/main/zig" "$r/main/zig-local" "$r/main/tools" 2>/dev/null || true
     echo "$r"
 }
+usable() { ci_as sh -c 'test -w "$1" && test -x "$1"' _ "$1"; }
 branch_key=$(. ci/cache.sh; ci_branch_key feature/atk)
 for target in "$sd" "$sf"; do
     for path in "" zig zig-local; do
         r=$(attack_tree b)
         d="$r/branches/$branch_key"
-        ci_as mkdir -p "$d/zig" "$d/zig-local"
         if [ -z "$path" ]; then
-            ci_as rm -rf "$d"
-            ci_as ln -s "$target" "$d"
+            plant link "$d" "$target"
         else
+            mk_branch "$d"
             ci_as rm -rf "${d:?}/$path"
             ci_as ln -s "$target" "$d/$path"
         fi
@@ -876,7 +966,7 @@ for target in "$sd" "$sf"; do
             CI_JOB_USER=$jobuser ci_branch_prepare "$r" feature/atk >/dev/null 2>&1
         ) || true
         is "branch: link at '${path:-the branch directory}' to $(basename "$target") leaves the target alone" "$want_state" "$(sentinel_state)"
-        is "branch: link at '${path:-the branch directory}' replaced by a plain directory the job can write" yes "$([ -d "$d/${path}" ] && [ ! -L "$d/${path}" ] && ci_as test -w "$d/${path}" && echo yes)"
+        is "branch: link at '${path:-the branch directory}' replaced by a plain directory the job can write" yes "$([ -d "$d/${path}" ] && [ ! -L "$d/${path}" ] && usable "$d/${path}" && echo yes)"
         reset_sentinels
     done
 done
@@ -884,49 +974,70 @@ for target in "$sd" "$sf"; do
     for path in zig zig-local tools; do
         for low in no yes; do
             r=$(attack_tree m)
-            ci_as rm -rf "${r:?}/main/$path"
-            ci_as ln -s "$target" "$r/main/$path"
+            rm -rf "${r:?}/main/$path"
+            plant link "$r/main/$path" "$target"
             (
                 . ci/cache.sh
                 CI_PRUNE_WAIT=1 ci_main_prepare "$r" "$jobuser" "$low" 99999999 >/dev/null 2>&1
             ) || true
             is "main (low=$low): link at $path to $(basename "$target") leaves the target alone" "$want_state" "$(sentinel_state)"
-            is "main (low=$low): link at $path replaced by a plain directory the job can write" yes "$([ -d "$r/main/$path" ] && [ ! -L "$r/main/$path" ] && ci_as test -w "$r/main/$path" && echo yes)"
+            is "main (low=$low): link at $path replaced by a plain directory the job can write" yes "$([ -d "$r/main/$path" ] && [ ! -L "$r/main/$path" ] && usable "$r/main/$path" && echo yes)"
             reset_sentinels
         done
     done
 done
-# A path that is a file, or a directory the job cannot write, is refused with its code, in both roles.
-r=$(attack_tree f)
-ci_as rm -rf "$r/main/zig"
-: >"$r/main/zig"
-refuses NRV-E1228 "main: a file at main/zig" bash -c '. ci/cache.sh; CI_JOB_USER=$2 ci_main_prepare "$1" "$2" no 0' _ "$r" "$jobuser"
-is "a file at main/zig is left alone" yes "$([ -f "$r/main/zig" ] && echo yes)"
-r=$(attack_tree f2)
-chmod a-w "$r/main/zig-local"
-chown 0 "$r/main/zig-local" 2>/dev/null || true
-[ "$(id -u)" != 0 ] || chmod 755 "$r/main/zig-local"
+# A name that is not a directory, the job's: a file, a FIFO. It is removed by root and made again
+# (NRV-W1204), both roles; a directory the job could use afterwards, and one it makes in it comes out usable.
+for kind in file fifo; do
+    r=$(attack_tree "k-$kind")
+    rm -rf "${r:?}/main/zig"
+    plant "$kind" "$r/main/zig"
+    out=$(bash -c '. ci/cache.sh; CI_PRUNE_WAIT=1 ci_main_prepare "$1" "$2" no 0 2>&1 && echo RC0' _ "$r" "$jobuser" || true)
+    grep -q "NRV-W1204: $r/main/zig, .*was: $([ "$kind" = file ] && echo 'regular empty file' || echo fifo)" <<<"$out" || { echo "FAIL main: a $kind at main/zig: no NRV-W1204 in: $out" >&2; fail=1; }
+    grep -q RC0 <<<"$out" || { echo "FAIL main: a $kind at main/zig is refused: $out" >&2; fail=1; }
+    is "main: a $kind at main/zig: made again, a directory the job can use and make a usable directory in" "yes yes" "$([ -d "$r/main/zig" ] && usable "$r/main/zig" && echo yes) $(ci_as mkdir "$r/main/zig/new" && usable "$r/main/zig/new" && echo yes)"
+    r=$(attack_tree "kb-$kind")
+    plant "$kind" "$r/branches/$branch_key"
+    out=$( (. ci/cache.sh; CI_JOB_USER=$jobuser ci_branch_prepare "$r" feature/atk 2>&1 && echo RC0) || true)
+    grep -q "NRV-W1204: $r/branches/$branch_key, " <<<"$out" || { echo "FAIL branch: a $kind at the branch directory: no NRV-W1204 in: $out" >&2; fail=1; }
+    grep -q RC0 <<<"$out" || { echo "FAIL branch: a $kind at the branch directory is refused: $out" >&2; fail=1; }
+    is "branch: a $kind at the branch directory: made again, a directory the job can use and make a usable directory in" "yes yes" "$([ -d "$r/branches/$branch_key/zig" ] && usable "$r/branches/$branch_key" && echo yes) $(ci_as mkdir "$r/branches/$branch_key/zig/new" && usable "$r/branches/$branch_key/zig/new" && echo yes)"
+done
+# A path that is not the job's is refused with its code, never touched (root only: a second user).
 if [ "$(id -u)" = 0 ]; then
-    refuses NRV-E1228 "main: a directory the job cannot write" bash -c '. ci/cache.sh; ci_main_prepare "$1" "$2" no 0' _ "$r" "$jobuser"
+    r=$(attack_tree f)
+    rm -rf "${r:?}/main/zig"
+    : >"$r/main/zig" # root's
+    refuses NRV-E1228 "main: a root-owned file at main/zig" bash -c '. ci/cache.sh; CI_JOB_USER=$2 ci_main_prepare "$1" "$2" no 0' _ "$r" "$jobuser"
+    is "a root-owned file at main/zig is left alone" yes "$([ -f "$r/main/zig" ] && [ "$(stat -c %u "$r/main/zig")" = 0 ] && echo yes)"
+    r=$(attack_tree f2)
+    chown 0 "$r/main/zig-local" # root's directory, 0755: the job cannot write it
+    refuses NRV-E1228 "main: a directory the job cannot write, root's" bash -c '. ci/cache.sh; ci_main_prepare "$1" "$2" no 0' _ "$r" "$jobuser"
+    r=$(attack_tree f3)
+    d="$r/branches/$branch_key"
+    : >"$d" # root's file
+    refuses NRV-E1214 "branch: a root-owned file at the branch directory (not the job's: removing it is not root's)" bash -c '. ci/cache.sh; CI_JOB_USER=$2 ci_branch_prepare "$1" feature/atk' _ "$r" "$jobuser"
+    is "a root-owned file at the branch directory is left alone" yes "$([ -f "$d" ] && echo yes)"
 else
-    # Not root: the directory cannot be made another user's, so it is the job's own 0555, which is
-    # repaired (NRV-W1204, below) and not refused.
-    out=$(bash -c '. ci/cache.sh; ci_main_prepare "$1" "$2" no 0' _ "$r" "$jobuser" 2>&1 || true)
-    grep -q "NRV-W1204" <<<"$out" || { echo "FAIL main: the job's own unwritable zig-local (not root): $out" >&2; fail=1; }
-    skip_note "the E1228 for a directory another user owns"
+    skip_note "the NRV-E1228 for a path another user owns"
 fi
-r=$(attack_tree f3)
+# A file at zig-local, deeper than the direct child, is the job's own to replace (NRV-W1204 as the job).
+r=$(attack_tree f4)
 d="$r/branches/$branch_key"
-ci_as mkdir -p "$d"
-: >"$d/zig-local"
-chown "$jobuser" "$d/zig-local" 2>/dev/null || true
-refuses NRV-E1228 "branch: a file at zig-local" bash -c '. ci/cache.sh; CI_JOB_USER=$2 ci_branch_prepare "$1" feature/atk' _ "$r" "$jobuser"
+mk_branch "$d"
+ci_as rm -rf "${d:?}/zig-local"
+ci_as touch "$d/zig-local"
+out=$( (. ci/cache.sh; CI_JOB_USER=$jobuser ci_branch_prepare "$r" feature/atk 2>&1 && echo RC0) || true)
+{ grep -q 'NRV-W1204' <<<"$out" && grep -q RC0 <<<"$out"; } || { echo "FAIL branch: a file at zig-local: want NRV-W1204 and success: $out" >&2; fail=1; }
+is "branch: a file at zig-local is replaced by a directory the job can use" yes "$([ -d "$d/zig-local" ] && usable "$d/zig-local" && echo yes)"
 # The prune does not take a directory name for a path: a name with a newline in it (a job can make
 # one) used to be read as a second name, here `victim`, relative to the step's directory.
 r=$(attack_tree n)
 mkdir "$tmp/cwd" "$tmp/cwd/victim"
 echo keep >"$tmp/cwd/victim/f"
-ci_as mkdir -p "$r/branches/$(printf 'b-evil\nvictim')" "$r/branches/b-old-00000001" "$r/branches/b-old-00000002"
+plant dir "$r/branches/$(printf 'b-evil\nvictim')"
+plant dir "$r/branches/b-old-00000001"
+plant dir "$r/branches/b-old-00000002"
 touch -d "2 days ago" "$r/branches/b-old-00000001"
 touch -d "3 days ago" "$r/branches/b-old-00000002"
 (
@@ -938,8 +1049,8 @@ is "a directory name with a newline does not make the prune remove a path" keep 
 is "a name that is no branch key is removed, and so are the old caches over the bound" "no no" "$([ -e "$r/branches/$(printf 'b-evil\nvictim')" ] && echo yes || echo no) $([ -e "$r/branches/b-old-00000002" ] && echo yes || echo no)"
 # A link named like a branch cache is unlinked by the prune, never followed.
 r=$(attack_tree l)
-ci_as ln -s "$sd" "$r/branches/b-link-00000003"
-ci_as ln -s "$sd" "$r/branches/b-link-00000003.partial.1"
+plant link "$r/branches/b-link-00000003" "$sd"
+plant link "$r/branches/b-link-00000003.partial.1" "$sd"
 (
     . ci/cache.sh
     CI_JOB_USER=$jobuser ci_branch_prepare "$r" feature/atk >/dev/null 2>&1
@@ -960,21 +1071,21 @@ echo pkg >"$r/main/zig/p/pkg/f"
 sd2="$r/branches/$branch_key"
 is "seed: the branch directory, zig/p and its package are the job's user's" "$jobuser $jobuser $jobuser $jobuser" "$(stat -c %U "$sd2" "$sd2/zig/p" "$sd2/zig/p/pkg/f" "$sd2/zig-local" | tr '\n' ' ' | sed 's/ $//')"
 is "seed: the copy has main's package" pkg "$(cat "$sd2/zig/p/pkg/f" 2>/dev/null)"
-is "seed: cp, mv, touch, the partial's cleanup and ci_job_dir's unlink run as the job (static, a supplement to the spy and swap tests below)" 5 "$(grep -c -E 'ci_as_job (cp -a|mv -T "\$partial"|touch "\$dir"|rm -rf "\$partial/zig/p"|rm -f -- "\$p")' ci/cache.sh || true)"
+is "seed: cp, touch, the partial's cleanup and ci_job_dir's removal run as the job (static, a supplement to the spy and swap tests below)" 4 "$(grep -c -E 'ci_as_job (cp -a|touch "\$dir"|rm -rf "\$partial/zig/p"|rm -rf --one-file-system -- "\$p")' ci/cache.sh || true)"
 is "ci_cache_writable is root's own test -w and creates nothing (static, a supplement to the mount tests below)" 1 "$(grep -c '^    test -w "\$1"$' ci/cache.sh || true)"
-
-# Which user does what below a branch's directory (review 6000627166; behavioural, so a reformatted
-# line cannot hide it): `cp`, `mv`, `touch`, `mkdir`, `mktemp` and `rm` are spies that log the uid
-# that ran them and then run the real one. Root may run none of the first five on anything in
-# branches/, and no `rm` on a path deeper than a direct child of branches/ (a direct child's last
-# component is unlinked and never followed; a deeper path is the job's to swap for a link). The job's
-# own calls are in the log too, so a spy that logged nothing is a failure.
+# Which user does what in a branch's cache (review 6000627166; behavioural, so a reformatted line
+# cannot hide it): `cp`, `mv`, `touch`, `mkdir`, `mktemp`, `rm` and `chown` are spies that log the uid
+# that ran them and then run the real one. Root may run no `cp` or `touch` on anything in branches/,
+# and `mkdir`, `mktemp`, `mv`, `rm` and `chown` only on a DIRECT child of branches/ (rule 1 and 2 of
+# ci/cache.sh: root's own directory, nothing a job can swap for a link; a direct child's last
+# component is unlinked and never followed), never on a path below one. The job's own calls are in
+# the log too, so a spy that logged nothing is a failure.
 spy="$tmp/spy"
 mkdir -p "$spy"
 chmod 755 "$spy"
 : >"$tmp/spy.log"
 chmod 666 "$tmp/spy.log"
-for n in cp mv touch mkdir mktemp rm; do
+for n in cp mv touch mkdir mktemp rm chown; do
     printf '#!/bin/bash\necho "$(id -u) %s $*" >>"$SPY_LOG"\nexec %s "$@"\n' "$n" "$(command -v "$n")" >"$spy/$n"
     chmod 755 "$spy/$n"
 done
@@ -991,12 +1102,14 @@ spy_verdict() { # spy_verdict NAME: root's calls in the log, and that the job's 
     # Only as root is there a root's call to look for: as anyone else, no line of the log starts
     # with 0, and these two would pass whatever the code did.
     if [ "$(id -u)" = 0 ]; then
-        is "$1: root ran no cp, mv, touch, mkdir or mktemp in branches/" 0 "$(grep -c -E '^0 (cp|mv|touch|mkdir|mktemp) .*/branches/' "$tmp/spy.log" || true)"
-        is "$1: root ran no rm below a branch's directory" 0 "$(grep -c -E '^0 rm .*/branches/[^/ ]+/' "$tmp/spy.log" || true)"
+        is "$1: root ran no cp or touch in branches/" 0 "$(grep -c -E '^0 (cp|touch) .*/branches/' "$tmp/spy.log" || true)"
+        # Root makes, hands over, renames and removes the DIRECT children of branches/ (rule 1 and 2
+        # of ci/cache.sh), and nothing deeper: no path of any of its calls goes below one.
+        is "$1: no call of root's names a path below a branch's directory" 0 "$(grep -c -E '^0 (mkdir|mktemp|mv|rm|chown) .*/branches/[^/ ]+/' "$tmp/spy.log" || true)"
     else
         skip_note "the uid spies' verdict on root ($1)"
     fi
-    is "$1: the spies saw the job's calls" yes "$(grep -q -E "^$jobuid (mkdir|mktemp|rm) " "$tmp/spy.log" && echo yes)"
+    is "$1: the spies saw the job's calls" yes "$(grep -q -E "^$jobuid (mkdir|cp) " "$tmp/spy.log" && echo yes)"
 }
 # A seed that succeeds, then links planted at the branch's zig and zig-local (a job's doing).
 r=$(attack_tree y)
@@ -1004,6 +1117,9 @@ mkdir -p "$r/main/zig/p/pkg"
 echo pkg >"$r/main/zig/p/pkg/f"
 spy_branch "$r"
 spy_verdict "spy, a fresh seed"
+if [ "$(id -u)" = 0 ]; then
+    is "spy, a fresh seed: root did make the partial directory, hand it over and rename it (the spy is live)" "yes yes yes" "$(grep -q -E '^0 mktemp .*/branches/' "$tmp/spy.log" && echo yes) $(grep -q -E '^0 chown .*/branches/' "$tmp/spy.log" && echo yes) $(grep -q -E '^0 mv .*/branches/' "$tmp/spy.log" && echo yes)"
+fi
 d="$r/branches/$branch_key"
 ci_as rm -rf "$d/zig" "$d/zig-local"
 ci_as ln -s "$sd" "$d/zig"
@@ -1047,65 +1163,101 @@ else
     skip_note "the failed seed's cleanup under a swapped link"
 fi
 
-# The mount question and the ownership question are two (review 6000627166). Both need root and
-# another user as the job's.
+has_acl() { local m; m=$(ls -ldn -- "$1" 2>/dev/null) || return 1; [[ "${m%% *}" == *+ ]]; } # as ci_has_acl of ci/cache.sh
+# The mount roots (rule 1 of ci/cache.sh): root's, mode 0755, no ACL, never the job's. The mount
+# question and the ownership question are two (review 6000627166). Both need root and another user
+# as the job's.
+acl_ok=no # whether this file system keeps ACLs (and setfacl is there): the ACL tests say so when skipped
+if command -v setfacl >/dev/null; then
+    mkdir "$tmp/aclprobe"
+    if setfacl -d -m o::--- "$tmp/aclprobe" 2>/dev/null && has_acl "$tmp/aclprobe"; then acl_ok=yes; fi
+fi
 if [ "$(id -u)" = 0 ]; then
-    mk_roots() { # mk_roots DIR: main/ (root's, 0755: what Docker makes of a missing source) with
-        # the job's caches in it, and the job's branches/
+    third=
+    for u in daemon bin sys; do
+        if id "$u" >/dev/null 2>&1 && [ "$u" != "$jobuser" ]; then third=$u; break; fi
+    done
+    mk_roots() { # mk_roots DIR: the roots root's, 0755 (what `host` makes, and Docker of a missing source), main's caches the job's
         rm -rf "$1"
         mkdir -p "$1/main/zig" "$1/main/tools" "$1/branches"
         mkdir -m 0700 "$1/locks"
-        chown "$jobuser" "$1/main/zig" "$1/main/tools" "$1/branches"
+        chown "$jobuser" "$1/main/zig" "$1/main/tools"
     }
     chk() { # chk ROLE ROOT
         bash -c '. ci/cache.sh; CI_JOB_USER=$3 ci_cache_check "$1" "$2"' _ "$1" "$2" "$jobuser" 2>&1
     }
-    # A main/ mounted read-write that is root's: a branch pipeline must still be refused (E1202): the
-    # job's own test of it fails, but main's zig and tools are the job's, so it writes main's caches.
+    # A main/ mounted read-write that is root's: a branch pipeline must still be refused (E1202): root
+    # writes it whatever its mode, and the job's own caches in it are writable.
     mk_roots "$tmp/rwroot"
     out=$(chk branch "$tmp/rwroot" 2>&1 || true)
     grep -q "NRV-E1202: main's cache is writable in a pipeline for a branch" <<<"$out" || { echo "FAIL a root-owned read-write main/ in a branch's pipeline: $out" >&2; fail=1; }
-    # Main's role: main/ root-owned (Docker's own 0755 root) is mounted read-write and the job cannot
-    # write it: NRV-E1229 with the owner and the mode, never E1202, and root does not chown it.
+    # Main's role: main/ root-owned 0755 with no ACL (what `host` makes) is the right state: no message.
     mk_roots "$tmp/e1229-root-owned"
-    out=$(chk main "$tmp/e1229-root-owned" || true)
-    grep -q "NRV-E1229: .*main is mounted read-write but the job's user ($jobuser) cannot write it (owner root, uid 0, mode 755).*nerva-woodpecker.sh host.*chmod 0755" <<<"$out" || { echo "FAIL main's role, root-owned main/: $out" >&2; fail=1; }
-    ! grep -q "NRV-E1202" <<<"$out" || { echo "FAIL main's role, root-owned main/ is called a mount error: $out" >&2; fail=1; }
+    out=$(chk main "$tmp/e1229-root-owned" && echo RC0) || true
+    is "main's role, root-owned main/: accepted, nothing said" "RC0" "$out"
     is "main's role, root-owned main/: the host's directory keeps its owner and mode" "0 755" "$(stat -c '%u %a' "$tmp/e1229-root-owned/main")"
-    # A job that chmods its own mount root 0555 (NRV-W1203, review 6000930445): the job's uid owns it
-    # and only the mode stops it, so the step sets it back to 0755 and warns; every later pipeline
-    # would otherwise fail until an operator acted. Both roles; the role's own ci_cache_job_writable
-    # call is what is under test, so the branch's mount question is stood in for (as a real read-only
-    # main/ and a read-write branches/ would answer it), and a mutant that drops the call (`:`) is
-    # caught without a mount.
+    # A job cannot change a root: not its mode, not its ACL, not its owner.
+    is "a job cannot chmod, chown or set an ACL on a mount root (root-owned 0755)" "no no no" "$(ci_as chmod 0777 "$tmp/e1229-root-owned/main" 2>/dev/null && echo yes || echo no) $(ci_as chown "$jobuser" "$tmp/e1229-root-owned/main" 2>/dev/null && echo yes || echo no) $(ci_as setfacl -d -m o::--- "$tmp/e1229-root-owned/main" 2>/dev/null && echo yes || echo no)"
+    is "a job cannot make or remove a name directly in a mount root" "no no" "$(ci_as mkdir "$tmp/e1229-root-owned/main/x" 2>/dev/null && echo yes || echo no) $(ci_as rm -rf "$tmp/e1229-root-owned/main/tools" 2>/dev/null; [ -d "$tmp/e1229-root-owned/main/tools" ] && echo no || echo yes)"
+    # What an earlier layout, or a job while it owned the root, left: repaired to root-owned 0755 with
+    # no ACL, NRV-W1203; both roles; the role's own ci_mount_root call is what is under test, so the
+    # branch's mount question is stood in for (as a real read-only main/ and a read-write branches/
+    # would answer it), and a mutant that drops the call (`:`) is caught without a mount.
     chk_stub() { # chk_stub ROLE ROOT: the mount question answered as a branch's mounts would
         bash -c '. ci/cache.sh; r=$2; ci_cache_writable() { [ "$1" != "$r/main" ]; }; CI_JOB_USER=$3 ci_cache_check "$1" "$2"' _ "$1" "$2" "$jobuser" 2>&1
     }
     for role in main branch; do
         if [ "$role" = main ]; then sub=main; else sub=branches; fi
-        for mode in 0555 0000 0500 0600 0666 0200; do
+        for mode in 0755 0555 0000 0500 0600 0666 0200; do
             mk_roots "$tmp/w1203-$role-$mode"
             chown "$jobuser" "$tmp/w1203-$role-$mode/$sub"
             ci_as chmod "$mode" "$tmp/w1203-$role-$mode/$sub"
             if [ "$role" = main ]; then out=$(chk main "$tmp/w1203-$role-$mode" && echo RC0); else out=$(chk_stub branch "$tmp/w1203-$role-$mode" && echo RC0); fi || true
-            grep -q "NRV-W1203: .*$sub, owned by the job's user ($jobuser), had mode $(printf '%o' $((8#$mode))) and was not writable" <<<"$out" || { echo "FAIL $role's role, $sub/ chmod $mode by the job: no NRV-W1203: $out" >&2; fail=1; }
-            grep -q RC0 <<<"$out" || { echo "FAIL $role's role, $sub/ chmod $mode by the job is refused: $out" >&2; fail=1; }
-            ! grep -q "NRV-E12" <<<"$out" || { echo "FAIL $role's role, $sub/ chmod $mode by the job gives an error: $out" >&2; fail=1; }
-            is "$role's role, $sub/ chmod $mode by the job: set back to the job's, 0755" "$jobuser 755" "$(stat -c '%U %a' "$tmp/w1203-$role-$mode/$sub")"
-            ci_as sh -c 'test -w "$1" && test -x "$1"' _ "$tmp/w1203-$role-$mode/$sub" || { echo "FAIL $role's role, $sub/ is still not the job's to write after the repair" >&2; fail=1; }
+            grep -q "NRV-W1203: .*$sub, a mount root, was not root-owned 0755 with no ACL (owner $jobuser, mode $(printf '%o' $((8#$mode)))): set to it" <<<"$out" || { echo "FAIL $role's role, $sub/ owned by the job, mode $mode: no NRV-W1203: $out" >&2; fail=1; }
+            grep -q RC0 <<<"$out" || { echo "FAIL $role's role, $sub/ owned by the job, mode $mode is refused: $out" >&2; fail=1; }
+            ! grep -q "NRV-E12" <<<"$out" || { echo "FAIL $role's role, $sub/ owned by the job, mode $mode gives an error: $out" >&2; fail=1; }
+            is "$role's role, $sub/ owned by the job, mode $mode: made root's, 0755" "0 755" "$(stat -c '%u %a' "$tmp/w1203-$role-$mode/$sub")"
+            is "$role's role, $sub/ made root's: the job cannot write it" no "$(usable "$tmp/w1203-$role-$mode/$sub" && ci_as touch "$tmp/w1203-$role-$mode/$sub/x" 2>/dev/null && echo yes || echo no)"
         done
-        # Not the job's: root does not chown or chmod what it was not given. E1229 as before.
-        mk_roots "$tmp/foreign-$role"
-        chown root "$tmp/foreign-$role/$sub"
-        chmod 0555 "$tmp/foreign-$role/$sub"
-        if [ "$role" = main ]; then out=$(chk main "$tmp/foreign-$role" || true); else out=$(chk_stub branch "$tmp/foreign-$role" || true); fi
-        grep -q "NRV-E1229: .*$sub is mounted read-write but the job's user ($jobuser) cannot write it (owner root, uid 0, mode 555)" <<<"$out" || { echo "FAIL $role's role, root-owned 0555 $sub/: $out" >&2; fail=1; }
-        ! grep -q "NRV-W1203" <<<"$out" || { echo "FAIL $role's role, root-owned $sub/ is 'repaired': $out" >&2; fail=1; }
-        is "$role's role, root-owned 0555 $sub/: owner and mode untouched" "0 555" "$(stat -c '%u %a' "$tmp/foreign-$role/$sub")"
+        # Root's own, with another mode (a host's chmod): back to 0755, the same warning.
+        mk_roots "$tmp/w1203-rootmode-$role"
+        chmod 0777 "$tmp/w1203-rootmode-$role/$sub"
+        if [ "$role" = main ]; then out=$(chk main "$tmp/w1203-rootmode-$role" && echo RC0); else out=$(chk_stub branch "$tmp/w1203-rootmode-$role" && echo RC0); fi || true
+        { grep -q "NRV-W1203: .*$sub, a mount root, was not root-owned 0755 with no ACL (owner root, mode 777)" <<<"$out" && grep -q RC0 <<<"$out"; } || { echo "FAIL $role's role, root-owned $sub/ mode 0777: $out" >&2; fail=1; }
+        is "$role's role, root-owned $sub/ mode 0777: set to 0755" "0 755" "$(stat -c '%u %a' "$tmp/w1203-rootmode-$role/$sub")"
+        # Not the step's and not the job's: nobody's to chown. E1229, untouched.
+        if [ -n "$third" ]; then
+            mk_roots "$tmp/foreign-$role"
+            chown "$third" "$tmp/foreign-$role/$sub"
+            chmod 0555 "$tmp/foreign-$role/$sub"
+            if [ "$role" = main ]; then out=$(chk main "$tmp/foreign-$role" || true); else out=$(chk_stub branch "$tmp/foreign-$role" || true); fi
+            grep -q "NRV-E1229: .*$sub is mounted read-write but is owned by neither this step's user nor the job's ($jobuser): owner $third, uid $(id -u "$third"), mode 555" <<<"$out" || { echo "FAIL $role's role, $sub/ owned by $third: $out" >&2; fail=1; }
+            ! grep -q "NRV-W1203" <<<"$out" || { echo "FAIL $role's role, $sub/ owned by $third is 'repaired': $out" >&2; fail=1; }
+            is "$role's role, $sub/ owned by $third: owner and mode untouched" "$(id -u "$third") 555" "$(stat -c '%u %a' "$tmp/foreign-$role/$sub")"
+        else
+            skip_note "a mount root owned by a third user (no daemon, bin or sys user here)"
+        fi
+        # An ACL on the root, a default one included (a job's, while it owned the root): removed with the rest.
+        if [ "$acl_ok" = yes ]; then
+            for owner in job root; do
+                mk_roots "$tmp/acl-$role-$owner"
+                if [ "$owner" = job ]; then chown "$jobuser" "$tmp/acl-$role-$owner/$sub"; fi
+                setfacl -d -m u::---,g::---,o::--- "$tmp/acl-$role-$owner/$sub"
+                setfacl -m u:"$jobuser":rwx "$tmp/acl-$role-$owner/$sub"
+                has_acl "$tmp/acl-$role-$owner/$sub" || { echo "FAIL the ACL test did not set an ACL on $role's $sub/" >&2; fail=1; }
+                if [ "$role" = main ]; then out=$(chk main "$tmp/acl-$role-$owner" && echo RC0); else out=$(chk_stub branch "$tmp/acl-$role-$owner" && echo RC0); fi || true
+                { grep -q "NRV-W1203: .*$sub, a mount root, was not root-owned 0755 with no ACL (owner .*with an ACL): set to it" <<<"$out" && grep -q RC0 <<<"$out"; } || { echo "FAIL $role's role, $sub/ ($owner's) with an ACL: no NRV-W1203 and success: $out" >&2; fail=1; }
+                is "$role's role, $sub/ ($owner's) with a default ACL: no ACL left, root's, 0755" "no 0 755" "$(has_acl "$tmp/acl-$role-$owner/$sub" && echo yes || echo no) $(stat -c '%u %a' "$tmp/acl-$role-$owner/$sub")"
+                mkdir "$tmp/acl-$role-$owner/$sub/probe"
+                is "$role's role, $sub/ ($owner's): a directory made in it afterwards has its mode, not the ACL's" 755 "$(stat -c %a "$tmp/acl-$role-$owner/$sub/probe")"
+            done
+        else
+            echo "note: no ACL support here (setfacl missing, or the file system keeps none): the ACL tests of the mount roots were skipped" >&2
+        fi
     done
     # A link at the mount root is never followed: the target keeps its mode. The link is made BY
     # THE JOB (review 6001089776): it is then owned by the job's uid, so `stat` of it matches the
-    # job's and, without the `! -L` test, root's chmod 0755 would follow it to the job's 0500 target.
+    # job's and, without the `-L` test, root's chmod 0755 would follow it to the job's 0500 target.
     # (A link made by root is owned by root and never reaches that chmod: it proves nothing.)
     mk_roots "$tmp/linkroot"
     mkdir "$tmp/linkroot/target"
@@ -1117,12 +1269,11 @@ if [ "$(id -u)" = 0 ]; then
     chown root "$tmp/linkroot"
     is "(the link is the job's: owner)" "$jobuser" "$(stat -c %U "$tmp/linkroot/main")"
     out=$(chk main "$tmp/linkroot" || true)
-    grep -q "NRV-E1229: .*main is mounted read-write but the job's user ($jobuser) cannot write it (it is a link, not a directory" <<<"$out" || { echo "FAIL a link at main/: $out" >&2; fail=1; }
+    grep -q "NRV-E1229: .*main is mounted read-write but is a link, not a directory (it is never followed)" <<<"$out" || { echo "FAIL a link at main/: $out" >&2; fail=1; }
     ! grep -q "mode 777\|NRV-W1203" <<<"$out" || { echo "FAIL a link at main/ is reported by its own mode, or repaired: $out" >&2; fail=1; }
     is "a link at main/: its target keeps its mode" 500 "$(stat -c %a "$tmp/linkroot/target")"
     mk_roots "$tmp/e1229-ok"
-    chown "$jobuser" "$tmp/e1229-ok/main"
-    ok "main's role, main/ the job's and rw" chk main "$tmp/e1229-ok"
+    ok "main's role, main/ root's and rw" chk main "$tmp/e1229-ok"
     # With a real read-only mount, which is what a branch's pipeline has.
     ro_bind() { mount --bind "$1" "$1" && ro_mounts+=("$1") && mount -o remount,bind,ro "$1"; }
     mkdir -p "$tmp/mnt-probe"
@@ -1135,23 +1286,26 @@ if [ "$(id -u)" = 0 ]; then
     if [ "$can_mount" = yes ]; then
         mk_roots "$tmp/mnt"
         ro_bind "$tmp/mnt/main"
-        ok "branch's role: main/ a read-only mount, branches/ the job's" chk branch "$tmp/mnt"
-        # A job that chmods its own mount root: not "not mounted" (E1202); repaired with W1203, on a
-        # real read-only main/ as well. A root-owned 0555 branches/ is still E1229.
+        out=$(chk branch "$tmp/mnt" && echo RC0)
+        is "branch's role: main/ a read-only mount, branches/ root's: accepted, nothing said" RC0 "$out"
+        # A job-owned branches/ with a chmod: not "not mounted" (E1202); repaired with W1203, on a
+        # real read-only main/ as well.
+        chown "$jobuser" "$tmp/mnt/branches"
         ci_as chmod 0555 "$tmp/mnt/branches"
         out=$(chk branch "$tmp/mnt" && echo RC0)
-        { grep -q "NRV-W1203: .*branches, owned by the job's user ($jobuser), had mode 555" <<<"$out" && grep -q RC0 <<<"$out" && ! grep -q "NRV-E12" <<<"$out"; } || { echo "FAIL branches/ chmod 0555 by the job (read-only main/ mount): $out" >&2; fail=1; }
-        is "branches/ chmod 0555 by the job: repaired" "$jobuser 755" "$(stat -c '%U %a' "$tmp/mnt/branches")"
-        chown root "$tmp/mnt/branches"
-        chmod 0555 "$tmp/mnt/branches"
-        out=$(chk branch "$tmp/mnt" || true)
-        grep -q "NRV-E1229: .*branches is mounted read-write but the job's user ($jobuser) cannot write it (owner root, uid 0, mode 555)" <<<"$out" || { echo "FAIL root-owned 0555 branches/ (read-only main/ mount): $out" >&2; fail=1; }
-        ! grep -q "NRV-E1202" <<<"$out" || { echo "FAIL root-owned 0555 branches/ is called a mount error: $out" >&2; fail=1; }
+        { grep -q "NRV-W1203: .*branches, a mount root, was not root-owned 0755 with no ACL (owner $jobuser, mode 555)" <<<"$out" && grep -q RC0 <<<"$out" && ! grep -q "NRV-E12" <<<"$out"; } || { echo "FAIL branches/ owned by the job, 0555 (read-only main/ mount): $out" >&2; fail=1; }
+        is "branches/ owned by the job, 0555: repaired" "0 755" "$(stat -c '%u %a' "$tmp/mnt/branches")"
+        if [ -n "$third" ]; then
+            chown "$third" "$tmp/mnt/branches"
+            chmod 0555 "$tmp/mnt/branches"
+            out=$(chk branch "$tmp/mnt" || true)
+            grep -q "NRV-E1229: .*branches is mounted read-write but is owned by neither" <<<"$out" || { echo "FAIL third user's 0555 branches/ (read-only main/ mount): $out" >&2; fail=1; }
+            ! grep -q "NRV-E1202" <<<"$out" || { echo "FAIL third user's 0555 branches/ is called a mount error: $out" >&2; fail=1; }
+        fi
         umount "$tmp/mnt/main"
         # Main's role with main/ read-only (root writes through a mode, so only a real mount shows it),
         # and a branch's with branches/ read-only: E1202, never E1229.
         mk_roots "$tmp/mnt2"
-        chown "$jobuser" "$tmp/mnt2/main"
         ro_bind "$tmp/mnt2/main"
         out=$(chk main "$tmp/mnt2" || true)
         grep -q "NRV-E1202: main's cache is not writable in a pipeline for main" <<<"$out" || { echo "FAIL main's role with a read-only main/: $out" >&2; fail=1; }
@@ -1170,16 +1324,21 @@ else
     skip_note "the mount and ownership tests of ci_cache_check (E1202, E1229, W1203)"
 fi
 
-# A job's `chmod 0555` of a DIRECT child of a mount root (review 6001089776): a branch's own
-# directory, or main's zig, zig-local or tools. It used to fail every later pipeline for that
-# directory with NRV-E1228 until an operator acted. Root removes it (rm -rf of the one name: the
-# prune's own operation) under the lock that keeps the other jobs out, warns (NRV-W1204), and the
-# job's user makes it again. A foreign owner and anything deeper stay NRV-E1228. Root only: as the
-# job's own uid, rm -rf cannot empty a 0555 subdirectory, and a second user is needed.
+# What a job leaves in its own caches (rules 2 and 3 of ci/cache.sh). A job owns the direct children
+# of a mount root (a branch's directory, main's zig, zig-local and tools) and everything below them,
+# and is untrusted: whatever it does to them, the next pipeline must prepare them (rc=0) and the job
+# must be able to make a directory in them that comes out usable. Rule 3: the job's own tree is
+# normalized AS THE JOB before the job runs, so a `chmod 0555`, `0600`, `0000`, a default ACL, a FIFO
+# or a socket, at the child or deep in it, costs nothing: no root operation follows it. Rule 2: what
+# the job owns and cannot use whatever the normalization does (a file or a FIFO at the child itself,
+# or a tree the normalization failed in) is removed by root (rm -rf of the one name) under the lock
+# that keeps the other jobs out, with NRV-W1204, and made again. A foreign owner, or other jobs
+# holding the lock a reset needs, is NRV-E1228, and nothing is touched. Root only: a second user.
 if [ "$(id -u)" = 0 ]; then
     w_tree() { # w_tree NAME: a tree with a file, a 0555 subdirectory and a file in it, in each cache directory
         local r q
         r=$(attack_tree "$1")
+        mk_branch "$r/branches/$branch_key"
         for q in main/zig main/zig-local main/tools "branches/$branch_key/zig" "branches/$branch_key/zig-local"; do
             ci_as mkdir -p "$r/$q/sub"
             ci_as touch "$r/$q/keep" "$r/$q/sub/f"
@@ -1189,74 +1348,147 @@ if [ "$(id -u)" = 0 ]; then
     }
     run_branch() { ( . ci/cache.sh; CI_JOB_USER=$jobuser CI_LOCK_WAIT=2 ci_branch_prepare "$1" feature/atk 2>&1 && echo RC0 ) || true; }
     run_main() { bash -c '. ci/cache.sh; CI_PRUNE_WAIT=1 ci_main_prepare "$1" "$2" no 0 2>&1 && echo RC0' _ "$1" "$jobuser" || true; }
-    # A branch's own directory, in each mode that leaves it unusable for the job: not writable (0555) or
-    # not searchable (0600, 0666, 0200: `test -w` alone says writable, review 6001444818).
-    for mode in 0555 0600 0666 0200; do
+    mkok() { # mkok DIR: the job makes a directory in DIR (and a file in that): yes if it comes out usable, no ACL
+        ci_as mkdir "$1/mk" 2>/dev/null && usable "$1/mk" && ! has_acl "$1/mk" && ci_as touch "$1/mk/f" 2>/dev/null && echo yes
+    }
+    quiet() { # quiet OUT: the run succeeded and said no warning and no error
+        grep -q RC0 <<<"$1" && ! grep -q "NRV-[EW]12" <<<"$1" && echo yes
+    }
+    stubdir() { # stubdir NAME BODY: a directory of stubs (a `timeout`, `mkdir`, `mktemp`) for PATH, readable by the job
+        mkdir -p "$tmp/stub-$1"
+        chmod 755 "$tmp/stub-$1"
+        printf '#!/bin/sh\n%s\n' "$2" >"$tmp/stub-$1/${3:-timeout}"
+        chmod 755 "$tmp/stub-$1/${3:-timeout}"
+    }
+    # A direct child with a mode that leaves it unusable to the job: not writable (0555) or not
+    # searchable (0600, 0666, 0200: `test -w` alone says writable, review 6001444818). Normalization
+    # opens it up (find acts on a directory before it enters it), silently, and keeps what is in it.
+    for mode in 0555 0600 0666 0200 0000; do
         r=$(w_tree "wb-$mode")
         d="$r/branches/$branch_key"
         ci_as chmod "$mode" "$d"
-        # In a subshell, to see its descriptors before it exits: the step keeps its shared lock on fd 6
-        # for the job's whole run, so after the reset (which lets go of it, to take the lock exclusively)
-        # it must be taken again, and a prune of another job must not be able to take it.
+        # In a subshell, to see its descriptors before it exits: the step keeps its shared lock on
+        # fd 6 for the job's whole run, and a prune of another job must not be able to take it.
         out=$( (
             . ci/cache.sh
             CI_JOB_USER=$jobuser CI_LOCK_WAIT=2 ci_branch_prepare "$r" feature/atk 2>&1 && echo RC0
             flock -x -n "$r/locks/$branch_key.lock" true && echo LOCKFREE || echo LOCKHELD
         ) ) || true
-        grep -q "NRV-W1204: $d, owned by the job's user ($jobuser), had mode $(printf '%o' $((8#$mode))) and was not writable" <<<"$out" || { echo "FAIL a branch directory chmod $mode by the job: no NRV-W1204: $out" >&2; fail=1; }
-        { grep -q RC0 <<<"$out" && ! grep -q "NRV-E12" <<<"$out"; } || { echo "FAIL a branch directory chmod $mode by the job is refused: $out" >&2; fail=1; }
-        is "branch $mode: the lock on fd 6 is taken again after the reset (a prune cannot take it)" LOCKHELD "$(grep -o 'LOCK[A-Z]*' <<<"$out")"
-        is "branch $mode: the unwritable directory is made again, empty, the job's, usable" "yes yes yes yes no no" "$([ -d "$d/zig" ] && echo yes) $([ -d "$d/zig-local" ] && echo yes) $(ci_as sh -c 'test -w "$1" && test -x "$1"' _ "$d" && echo yes) $(ci_as touch "$d/zig/new" && echo yes) $([ -e "$d/zig/keep" ] && echo yes || echo no) $([ -e "$d/zig/sub" ] && echo yes || echo no)"
+        is "branch directory $mode: prepared with no warning and no error" yes "$(quiet "$out")"
+        is "branch $mode: the lock on fd 6 is held to the end (a prune cannot take it)" LOCKHELD "$(grep -o 'LOCK[A-Z]*' <<<"$out")"
+        is "branch $mode: the job's directory is usable, what was in it is kept, a directory made in it is usable" "yes yes yes yes 755" "$(usable "$d" && echo yes) $(mkok "$d/zig") $([ -e "$d/zig/keep" ] && echo yes) $([ -e "$d/zig/sub/f" ] && echo yes) $(stat -c %a "$d/zig/sub")"
     done
-    # A branches/ the job cannot search, with no check before it (ci_cache_check repairs it, W1203): the
-    # job cannot make the branch's directory in it, and NRV-E1214 must say that, not "not a directory".
-    r=$(attack_tree e1214)
-    ci_as chmod 0600 "$r/branches"
-    out=$(run_branch "$r")
-    { grep -q "NRV-E1214: $r/branches/$branch_key could not be made by the job's user" <<<"$out" && ! grep -q "is not a directory\|RC0" <<<"$out"; } || { echo "FAIL an unsearchable branches/: E1214 does not say the directory could not be made: $out" >&2; fail=1; }
-    ci_as chmod 0755 "$r/branches"
-    # Another job of the branch holds its lock (shared, as a running step does): nothing is removed.
+    for sub in zig zig-local tools; do
+        for mode in 0555 0600 0666 0200 0000; do
+            r=$(w_tree "wm-$sub-$mode")
+            ci_as chmod "$mode" "$r/main/$sub"
+            out=$(run_main "$r")
+            is "main/$sub $mode: prepared with no warning and no error" yes "$(quiet "$out")"
+            is "main/$sub $mode: usable, kept, the job's, a directory made in it is usable" "yes yes yes $jobuser" "$(usable "$r/main/$sub" && echo yes) $(mkok "$r/main/$sub") $([ -e "$r/main/$sub/keep" ] && echo yes) $(stat -c %U "$r/main/$sub")"
+            for other in zig zig-local tools; do
+                [ "$other" = "$sub" ] || is "main/$sub $mode: main/$other is left alone" yes "$([ -e "$r/main/$other/keep" ] && echo yes)"
+            done
+        done
+    done
+    # Deeper than a direct child: normalized the same way (it was NRV-E1228 before the job's tree was
+    # normalized as the job). A branch's own zig and zig-local, main's zig/sub, in each bad mode.
+    for mode in 0555 0600 0666 0200 0000; do
+        r=$(w_tree "wd-$mode")
+        d="$r/branches/$branch_key"
+        ci_as chmod "$mode" "$d/zig" "$d/zig-local"
+        out=$(run_branch "$r")
+        is "branch zig and zig-local $mode: prepared with no warning and no error" yes "$(quiet "$out")"
+        is "branch zig $mode: usable, kept, a directory made in it is usable" "yes yes yes" "$(mkok "$d/zig") $(mkok "$d/zig-local") $([ -e "$d/zig/keep" ] && echo yes)"
+        r=$(w_tree "wd2-$mode")
+        ci_as chmod "$mode" "$r/main/zig/sub"
+        out=$(run_main "$r")
+        is "main/zig/sub $mode: prepared with no warning and no error" yes "$(quiet "$out")"
+        is "main/zig/sub $mode: opened up (u+rwx), kept, usable" "yes yes yes" "$([ -e "$r/main/zig/sub/f" ] && echo yes) $(usable "$r/main/zig/sub" && echo yes) $(mkok "$r/main/zig/sub")"
+    done
+    # A path deep in the job's tree at mode 0000 (main/zig/o/x, a branch's zig/p), with a file in it and a
+    # FIFO beside it: opened up and kept, the FIFO removed, and the job can make a directory in it.
+    for spec in main:zig/o/x branch:zig/p branch:zig-local/q/r; do
+        role=${spec%%:*}
+        rel=${spec#*:}
+        r=$(w_tree "w0-$role")
+        if [ "$role" = main ]; then base="$r/main"; else base="$r/branches/$branch_key"; fi
+        ci_as mkdir -p "$base/$rel"
+        ci_as touch "$base/$rel/data"
+        ci_as mkfifo "$base/${rel%/*}/pipe"
+        ci_as chmod 0000 "$base/$rel"
+        if [ "$role" = main ]; then out=$(run_main "$r"); else out=$(run_branch "$r"); fi
+        is "$role: $rel at mode 0000: prepared with no warning and no error" yes "$(quiet "$out")"
+        is "$role: $rel at mode 0000: usable, its file kept, a directory made in it usable, the FIFO beside it removed" "yes yes yes no" "$(usable "$base/$rel" && echo yes) $(mkok "$base/$rel") $([ -e "$base/$rel/data" ] && echo yes) $([ -e "$base/${rel%/*}/pipe" ] && echo yes || echo no)"
+    done
+    # A default ACL set by the job on a child, or deep in the tree (a directory made in it would come
+    # out with mode 000 and nothing could be made there): stripped as the job, the pipeline prepares,
+    # and a directory made afterwards has its mode, not the ACL's.
+    if [ "$acl_ok" = yes ]; then
+        for spec in main:zig main:tools main:zig/o/x branch: branch:zig branch:zig/p; do
+            role=${spec%%:*}
+            rel=${spec#*:}
+            r=$(w_tree "wacl-$role")
+            if [ "$role" = main ]; then base="$r/main"; else base="$r/branches/$branch_key"; fi
+            t="$base${rel:+/$rel}"
+            ci_as mkdir -p "$t"
+            ci_as setfacl -d -m u::---,g::---,o::--- "$t"
+            has_acl "$t" || { echo "FAIL the ACL test did not set an ACL on $t" >&2; fail=1; }
+            if [ "$role" = main ]; then out=$(run_main "$r"); else out=$(run_branch "$r"); fi
+            is "$role: a default ACL on ${rel:-the branch directory}: prepared with no warning and no error" yes "$(quiet "$out")"
+            is "$role: a default ACL on ${rel:-the branch directory}: no ACL left, usable, a directory made in it is usable with its mode" "no yes 755" "$(has_acl "$t" && echo yes || echo no) $(mkok "$t") $(stat -c %a "$t/mk")"
+        done
+    else
+        echo "note: no ACL support here (setfacl missing, or the file system keeps none): the ACL tests of the job's caches were skipped" >&2
+    fi
+    # A normalization that fails (a stub `timeout` that fails the first time, as one that ran out of
+    # time would): the child is removed by root under the exclusive lock, NRV-W1204, made again empty.
+    # Both roles. The job's tree is not left half-normalized: nothing of it is kept.
+    for role in branch main; do
+        r=$(w_tree "wfail-$role")
+        stubdir fail1 'if mkdir "$STUB_STATE" 2>/dev/null; then exit 1; fi
+exec /usr/bin/timeout "$@"'
+        mkdir -p "$tmp/stubshare"
+        chmod 1777 "$tmp/stubshare"
+        rm -rf "$tmp/stubshare/once-$role"
+        if [ "$role" = branch ]; then
+            d="$r/branches/$branch_key"
+            out=$(PATH="$tmp/stub-fail1:$PATH" STUB_STATE="$tmp/stubshare/once-$role" run_branch "$r")
+        else
+            d="$r/main/zig"
+            out=$(PATH="$tmp/stub-fail1:$PATH" STUB_STATE="$tmp/stubshare/once-$role" run_main "$r")
+        fi
+        grep -q "NRV-W1204: $d, owned by the job's user ($jobuser), was not a usable directory for it (writable and searchable; was: directory, mode 755)" <<<"$out" || { echo "FAIL $role: a normalization that fails: no NRV-W1204: $out" >&2; fail=1; }
+        { grep -q RC0 <<<"$out" && ! grep -q "NRV-E12" <<<"$out"; } || { echo "FAIL $role: a normalization that fails is refused: $out" >&2; fail=1; }
+        is "$role: a normalization that fails: made again, empty, the job's, usable" "yes no $jobuser" "$(usable "$d" && ci_as mkdir "$d/new" && echo yes) $([ -e "$d/keep" ] || [ -e "$d/zig/keep" ] && echo yes || echo no) $(stat -c %U "$d")"
+    done
+    # The same, with other jobs holding the lock a reset needs (shared, as every running step does):
+    # nothing is removed, NRV-E1228 (the normalization that fails always, as a tree it cannot get through).
+    stubdir fail 'exit 1'
     r=$(w_tree wbb)
     d="$r/branches/$branch_key"
-    ci_as chmod 0555 "$d"
     : >"$r/locks/$branch_key.lock"
     chmod 600 "$r/locks/$branch_key.lock"
     flock -s "$r/locks/$branch_key.lock" sleep 30 &
     holder=$!
     for _ in 1 2 3 4 5 6 7 8 9 10; do flock -x -n "$r/locks/$branch_key.lock" true 2>/dev/null || break; sleep 0.2; done
-    out=$(run_branch "$r")
+    out=$(PATH="$tmp/stub-fail:$PATH" run_branch "$r")
     kill "$holder" 2>/dev/null || true
     wait "$holder" 2>/dev/null || true
-    grep -q "NRV-E1228: $d" <<<"$out" || { echo "FAIL a branch directory in use by another job is not E1228: $out" >&2; fail=1; }
-    ! grep -q "NRV-W1204" <<<"$out" || { echo "FAIL a branch directory in use by another job is removed: $out" >&2; fail=1; }
-    is "branch: in use by another job: kept as it was" "yes 555" "$([ -e "$d/zig/keep" ] && echo yes) $(stat -c %a "$d")"
-    # A direct child of main's, each of the three, in each mode that leaves it unusable for the job.
-    for sub in zig zig-local tools; do
-        for mode in 0555 0600 0666 0200; do
-            r=$(w_tree "wm-$sub-$mode")
-            ci_as chmod "$mode" "$r/main/$sub"
-            out=$(run_main "$r")
-            grep -q "NRV-W1204: $r/main/$sub, owned by the job's user ($jobuser), had mode $(printf '%o' $((8#$mode))) and was not writable" <<<"$out" || { echo "FAIL main/$sub chmod $mode by the job: no NRV-W1204: $out" >&2; fail=1; }
-            { grep -q RC0 <<<"$out" && ! grep -q "NRV-E12" <<<"$out"; } || { echo "FAIL main/$sub chmod $mode by the job is refused: $out" >&2; fail=1; }
-            is "main/$sub $mode: made again, empty, the job's, usable (a file can be made in it)" "yes yes no no $jobuser" "$(ci_as sh -c 'test -w "$1" && test -x "$1"' _ "$r/main/$sub" && echo yes) $(ci_as touch "$r/main/$sub/new" && echo yes) $([ -e "$r/main/$sub/keep" ] && echo yes || echo no) $([ -e "$r/main/$sub/sub" ] && echo yes || echo no) $(stat -c %U "$r/main/$sub")"
-            for other in zig zig-local tools; do
-                [ "$other" = "$sub" ] || is "main/$sub reset: main/$other is left alone" yes "$([ -e "$r/main/$other/keep" ] && echo yes)"
-            done
-        done
-    done
-    # Other jobs hold main's lock (shared, as every running step does): nothing is removed, E1228.
+    grep -q "NRV-E1228: $d" <<<"$out" || { echo "FAIL a branch directory in use by another job that cannot be normalized is not E1228: $out" >&2; fail=1; }
+    ! grep -q "NRV-W1204\|RC0" <<<"$out" || { echo "FAIL a branch directory in use by another job is removed: $out" >&2; fail=1; }
+    is "branch: in use by another job: kept as it was" "yes" "$([ -e "$d/zig/keep" ] && echo yes)"
     r=$(w_tree wmb)
-    ci_as chmod 0555 "$r/main/zig"
     : >"$r/locks/main.lock"
     chmod 600 "$r/locks/main.lock"
     flock -s "$r/locks/main.lock" sleep 30 &
     holder=$!
     for _ in 1 2 3 4 5 6 7 8 9 10; do flock -x -n "$r/locks/main.lock" true 2>/dev/null || break; sleep 0.2; done
-    out=$(run_main "$r")
+    out=$(PATH="$tmp/stub-fail:$PATH" run_main "$r")
     kill "$holder" 2>/dev/null || true
     wait "$holder" 2>/dev/null || true
-    grep -q "NRV-E1228: $r/main/zig" <<<"$out" || { echo "FAIL main/zig in use by other jobs is not E1228: $out" >&2; fail=1; }
-    is "main/zig: other jobs hold main's lock: kept as it was" "yes 555" "$([ -e "$r/main/zig/keep" ] && echo yes) $(stat -c %a "$r/main/zig")"
+    grep -q "NRV-E1228: $r/main/zig" <<<"$out" || { echo "FAIL main/zig in use by other jobs that cannot be normalized is not E1228: $out" >&2; fail=1; }
+    ! grep -q "NRV-W1204\|RC0" <<<"$out" || { echo "FAIL main/zig in use by other jobs is removed: $out" >&2; fail=1; }
+    is "main/zig: other jobs hold main's lock: kept as it was" "yes" "$([ -e "$r/main/zig/keep" ] && echo yes)"
     # A foreign owner: root's own 0555 child is NRV-E1228 and is left exactly as it was.
     for sub in zig tools; do
         r=$(w_tree wf-$sub)
@@ -1273,45 +1505,31 @@ if [ "$(id -u)" = 0 ]; then
     out=$(run_branch "$r")
     { grep -q "NRV-E1228: $d" <<<"$out" && ! grep -q "NRV-W1204\|RC0" <<<"$out"; } || { echo "FAIL a root-owned 0555 branch directory: $out" >&2; fail=1; }
     is "branch directory owned by root, 0555: kept as it was" "0 555 yes" "$(stat -c '%u %a' "$d") $([ -e "$d/zig/keep" ] && echo yes)"
-    # Deeper than a direct child: NRV-E1228, never removed. A branch's own zig, and main's zig/p.
-    r=$(w_tree wd)
-    d="$r/branches/$branch_key"
-    ci_as chmod 0555 "$d/zig"
-    out=$(run_branch "$r")
-    { grep -q "NRV-E1228: $d/zig" <<<"$out" && ! grep -q "NRV-W1204\|RC0" <<<"$out"; } || { echo "FAIL a branch's own zig 0555: $out" >&2; fail=1; }
-    is "branch zig 0555 (deeper than a child of branches/): kept as it was" "yes 555" "$([ -e "$d/zig/keep" ] && echo yes) $(stat -c %a "$d/zig")"
-    # The same for a mode that leaves it writable but not searchable (ci_job_dir's own test).
-    for mode in 0600 0666 0200; do
-        r=$(w_tree "wd-$mode")
-        d="$r/branches/$branch_key"
-        ci_as chmod "$mode" "$d/zig"
-        out=$(run_branch "$r")
-        { grep -q "NRV-E1228: $d/zig" <<<"$out" && ! grep -q "NRV-W1204\|RC0" <<<"$out"; } || { echo "FAIL a branch's own zig $mode: $out" >&2; fail=1; }
-        is "branch zig $mode: kept as it was" "yes $(printf '%o' $((8#$mode)))" "$([ -e "$d/zig/keep" ] && echo yes) $(stat -c %a "$d/zig")"
-    done
-    r=$(w_tree wd2)
-    ci_as chmod 0555 "$r/main/zig/sub"
-    out=$(run_main "$r")
-    { grep -q RC0 <<<"$out" && ! grep -q "NRV-W1204\|NRV-E12" <<<"$out"; } || { echo "FAIL main/zig/sub 0555 (not a cache directory the step makes): $out" >&2; fail=1; }
-    is "main/zig/sub 0555: left alone" "yes 555" "$([ -e "$r/main/zig/sub/f" ] && echo yes) $(stat -c %a "$r/main/zig/sub")"
+    # A branch directory that cannot be made (a full disk; here a failing mkdir and mktemp): NRV-E1214
+    # says it could not be made, not that something is in the way.
+    stubdir nomk 'exit 1' mkdir
+    stubdir nomk 'exit 1' mktemp
+    r=$(attack_tree e1214mk)
+    out=$(PATH="$tmp/stub-nomk:$PATH" run_branch "$r")
+    { grep -q "NRV-E1214: $r/branches/$branch_key could not be made in $r/branches" <<<"$out" && ! grep -q "is not a directory\|RC0" <<<"$out"; } || { echo "FAIL a branch directory that cannot be made: E1214 does not say so: $out" >&2; fail=1; }
     # ci_child_reset itself refuses what is not a direct child of the mount, and a link.
     r=$(w_tree wr)
-    ci_as chmod 0555 "$r/main/zig/sub"
     ( . ci/cache.sh; CI_JOB_USER=$jobuser ci_child_reset "$r/main/zig/sub" "$r/main" ) >/dev/null 2>&1 && { echo "FAIL ci_child_reset removed a grandchild" >&2; fail=1; }
     is "ci_child_reset: a grandchild is kept" "yes" "$([ -e "$r/main/zig/sub/f" ] && echo yes)"
     ci_as chmod 0555 "$r/main/zig"
-    ci_as ln -s "$r/main/zig" "$r/branches/zlink"
+    plant link "$r/branches/zlink" "$r/main/zig"
     ( . ci/cache.sh; CI_JOB_USER=$jobuser ci_child_reset "$r/branches/zlink" "$r/branches" ) >/dev/null 2>&1 && { echo "FAIL ci_child_reset followed a link" >&2; fail=1; }
     is "ci_child_reset: a link to an unwritable directory is not followed" "yes" "$([ -e "$r/main/zig/keep" ] && echo yes)"
 else
-    skip_note "the repair of a cache directory the job made unwritable (NRV-W1204, E1228)"
+    skip_note "the repair of a cache directory the job made unusable (NRV-W1204, E1228)"
 fi
 
 # Lock files a prune makes are the step's own, 0600 (they used to be 0644 by root's umask, and a
 # job that could list a 0755 lock directory could take them), and a lock directory with any group
 # or other bit is refused (NRV-E1226): what Docker makes of a missing mount source is root 0755.
 r=$(attack_tree p)
-ci_as mkdir -p "$r/branches/b-pruned-00000004" "$r/branches/b-big-00000005"
+plant dir "$r/branches/b-pruned-00000004"
+plant dir "$r/branches/b-big-00000005"
 touch -d "20 days ago" "$r/branches/b-pruned-00000004"
 (
     umask 000
@@ -1419,7 +1637,9 @@ step_run() { # step_run JOB T_RC J_RC TEST_SECONDS [VAR=value...]: sets step_rc,
         export CI_KILL_AFTER=1
         for kv in "$@"; do export "${kv?}"; done
         exec 9<"$st/tests.sh" # an open lock descriptor, as the step has
+        # shellcheck disable=SC2034 # a nameref array, read by ci_step_run_with_tests
         tests_cmd=(env LOG="$st/log" T_RC="$t_rc" bash "$st/tests.sh")
+        # shellcheck disable=SC2034 # a nameref array, read by ci_step_run_with_tests
         job_cmd=(env LOG="$st/log" J_RC="$j_rc" bash "$st/job.sh")
         ci_step_run_with_tests "$job" "$tsec" 60 tests_cmd job_cmd
     ) 2>"$st/err" || step_rc=$?

@@ -7,7 +7,8 @@
 #     bash ci/nerva-woodpecker.sh host
 #   Checks Docker (and that its daemon carries the io_uring seccomp profile, which
 #   woodpecker-bootstrap.sh installs), /dev/fuse and /dev/kvm, and creates the cache directories
-#   under /var/cache/nerva-ci (main, branches, jepsen and locks: decision O4).
+#   under /var/cache/nerva-ci (main, branches, jepsen and locks: decision O4), all root-owned, mode
+#   0755 (a box from before that, whose roots a job owned, is converted by running it again).
 #
 #   `repo` runs from the repository root, on your laptop (needs curl and jq), with a personal
 #   token from Woodpecker (your avatar, then Personal access token):
@@ -54,13 +55,25 @@ host() {
     # No step is privileged, so io_uring needs the daemon's own profile (ops/ci/docker/README.md).
     msg=$(bash "$probe" 2>&1) || fail "$msg" # the probe's own NRV-E1201, E1211 or E1212
 
-    # The caches the workflows mount (.woodpecker/*.yaml); uid 1001 is the `ci` user the jobs run
-    # as. main/ is written only by pipelines for a push to main, which mount it writable; the others
-    # mount it read-only and write branches/. jepsen/ keeps each Jepsen run's store.
-    install -d -m 0755 -o 1001 -g 1001 "$root" "$root/main" "$root/branches" "$root/jepsen"
+    # The caches the workflows mount (.woodpecker/*.yaml). main/ is written only by pipelines for a
+    # push to main, which mount it writable; the others mount it read-only and write branches/.
+    # jepsen/ keeps each Jepsen run's store. Every mount root is ROOT's, mode 0755, no ACL (rule 1
+    # of ci/cache.sh): the jobs (uid 1001, `ci`) own the directories a step makes directly in a root
+    # and what is below them, never a root, so nothing a job does can make a root unusable for the
+    # next pipeline. The steps make those directories (a link planted at a name would be followed
+    # by `install -d` here), so none is made here. An earlier layout made the roots 1001's: this
+    # converts them (a step does too, NRV-W1203, but only the roots it mounts).
+    install -d -m 0755 -o 0 -g 0 "$root" "$root/main" "$root/branches" "$root/jepsen"
+    # An ACL, a default one included, that a job set on a root while it owned it stays after the
+    # chown: removed (setfacl is the acl package's).
+    if command -v setfacl >/dev/null; then
+        setfacl -b -k -- "$root" "$root/main" "$root/branches" "$root/jepsen" 2>/dev/null || true
+    else
+        say "warning: no setfacl (apt-get install acl): an ACL on a cache root cannot be removed here; steps remove it"
+    fi
     # The lock files (main.lock, branches.lock, b-<key>.lock, jepsen.lock) live in a directory of
-    # their own that the jobs (uid 1001) cannot write: they own the three above, so a lock file
-    # in one could be replaced by a job, and a step running as root would then follow its link.
+    # their own that the jobs (uid 1001) cannot write, so a lock file there cannot be replaced by a
+    # job, and a step running as root would then follow its link.
     # Made root's (and, by install, set right again if a run left it otherwise); a step refuses one
     # a job could write (NRV-E1226).
     install -d -m 0700 -o 0 -g 0 "$root/locks"

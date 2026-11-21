@@ -8,6 +8,8 @@
 #   - The job runs as the user `ci`, not root, as on GitHub's runners: a test that expects
 #     "permission denied" must not pass as root.
 #   - /cache holds the host's /var/cache/nerva-ci, laid out and enforced as ci/cache.sh says:
+#     the roots (main/, branches/, jepsen/) are root's, mode 0755, never the job's; root makes the
+#     directories directly in them and hands them to `ci`, and resets one `ci` cannot use;
 #     main/ is written by pipelines for main only (the YAML mounts it :ro for any other branch);
 #     a branch has its own caches under branches/, zig/p seeded from main's when created, bounded and
 #     pruned. Every job holds a shared lock on locks/main.lock (the lock directory, root's, which a job cannot write); below CI_FREE_MIN_GIB free (default 60),
@@ -47,9 +49,10 @@ test_minutes="${CI_SCRIPTS_TEST_MINUTES:-10}"
 export DEBIAN_FRONTEND=noninteractive
 apt-get -o Acquire::Retries=5 update -qq
 # What GitHub's ubuntu-24.04 runner has and the scripts use (unzip: .github/scripts/mac_zip_check.sh;
-# gnupg2: rpmsign runs /usr/bin/gpg2, which only that package links to gpg).
+# gnupg2: rpmsign runs /usr/bin/gpg2, which only that package links to gpg; acl: setfacl, which
+# ci/cache.sh uses to remove the ACLs a job may have set on its caches).
 apt-get -o Acquire::Retries=5 install -y -qq --no-install-recommends ca-certificates curl git \
-    xz-utils python3 openssl procps iproute2 gnupg gnupg2 unzip zip jq file util-linux >/dev/null
+    xz-utils python3 openssl procps iproute2 gnupg gnupg2 unzip zip jq file util-linux acl >/dev/null
 # Jepsen drives the host's Docker (the socket is mounted; the client is below) with a JDK, gnuplot
 # and ssh-keygen.
 [ "$job" != jepsen ] || apt-get -o Acquire::Retries=5 install -y -qq --no-install-recommends \
@@ -80,8 +83,9 @@ if [ "$job" = jepsen ]; then
     [ -d "$cache/jepsen" ] || { ci_error "NRV-E1202: $cache/jepsen is not mounted: mount /var/cache/nerva-ci/jepsen"; exit 1; }
     sock=/var/run/docker.sock
     [ -S "$sock" ] || { ci_error "NRV-E1203: $sock is not mounted (see .woodpecker/jepsen.yaml)"; exit 1; }
-    # The mount's own root (a link cannot be there), so install -d on it is safe; what is inside is not.
-    install -d -o "$user" -g "$user" "$cache/jepsen"
+    # The mount's root is root's, mode 0755, no ACL (rule 1 of ci/cache.sh): made so if a job's
+    # own doing or an earlier layout left it otherwise (NRV-W1203).
+    ci_mount_root "$cache/jepsen" || exit 1
     ci_lock_file "$cache/locks/jepsen.lock" || exit 1
     { exec 8<"$cache/locks/jepsen.lock"; } 2>/dev/null || { ci_lock_open_failed "$cache/locks/jepsen.lock" '<'; exit 1; }
     echo "jepsen: waiting for any other Jepsen run on this machine"
@@ -98,13 +102,15 @@ if [ "$job" = jepsen ]; then
     # Docker's static client, pinned: its archive is kept in the jepsen cache, checked on every use.
     # The download goes into the cache the job writes, so the job's user fetches it (a link at the
     # partial file's name is then not root's to write through); root only checks and unpacks it.
-    ci_job_dir "$cache/jepsen/tools" || exit 1
+    # tools is a direct child of the jepsen root: made, or reset if unusable, by root (this run holds
+    # the jepsen lock, fd 8, exclusively, which keeps every other run out).
+    ci_child_ensure "$cache/jepsen/tools" "$cache/jepsen" || exit 1
     docker_pin=(29.9.3 3fb5d1f13014c18cc54945bc177c58a9056a482dada031e17d12cf2e6922c973 "$cache/jepsen/tools")
     ci_as_job ci/docker_client.sh "${docker_pin[@]}" fetch
     ci/docker_client.sh "${docker_pin[@]}" install
     stamp=$(date -u +%Y%m%dT%H%M%SZ)
     export JEPSEN_OUT="$cache/jepsen/$stamp-${CI_PIPELINE_NUMBER:-local}"
-    ci_job_dir "$JEPSEN_OUT" || exit 1
+    ci_child_make "$JEPSEN_OUT" || { ci_child_refused "$JEPSEN_OUT"; exit 1; }
     echo "jepsen: the store and memory record go to /var/cache/nerva-ci/${JEPSEN_OUT#"$cache"/} on the host"
 fi
 
@@ -125,7 +131,7 @@ else
     [ "$low" = no ] || { echo "Below $free_min_gib GiB free: emptying the branch caches nobody uses"; export CI_BRANCH_PRUNE_ALL=1; }
     ci_branch_prepare "$cache" "$branch" || exit 1
     flock -u 9 2>/dev/null || true
-    base="$CI_BRANCH_DIR" # made, and its zig and zig-local checked, by the job's user (ci_job_dir)
+    base="$CI_BRANCH_DIR" # made by root and handed to the job; its zig and zig-local by the job's user
     toolchain_write=0
 fi
 df -h "$cache_fs" . | sed 's/^/  /'
@@ -146,7 +152,9 @@ as_ci=(setpriv --reuid "$user" --regid "$user" --init-groups
 # above. Without CAP_SYS_ADMIN (this container's) their mount tests print a skip note. The job then
 # skips its own run of them (CI_SCRIPTS_TESTED), and the step fails if either failed. The tests
 # have a bound of their own, 10 minutes (CI_SCRIPTS_TEST_MINUTES).
+# shellcheck disable=SC2034 # a nameref array: ci_step_run_with_tests reads it by name
 tests_cmd=(bash ci/ci_test.sh)
+# shellcheck disable=SC2034 # a nameref array, as above
 job_cmd=("${as_ci[@]}" ci/job.sh "$job" ${arg:+"$arg"})
 status=0
 # (ci_step_run_with_tests is in ci/lib.sh, with its tests: for check-scripts the tests run first,
