@@ -373,8 +373,16 @@ set:
    Everything below a direct child is the job's user's: before the job runs, the step normalizes the
    job's own tree **as the job** (`ci_normalize`: every directory gets `u+rwx`, so a `chmod 0000`
    one is opened and searched; a FIFO or socket is removed; every directory loses its ACL, a
-   default ACL included), so a job's `chmod`, `setfacl`, FIFO or socket deep in its tree costs
-   nothing, and no root operation follows it. A direct child that the job owns and cannot use,
+   default ACL included; a file without `u+rw` gets it; the top-level names Zig needs, `b h o p tmp z`
+   under `zig` and `zig-local`, are removed if they are a link or not a directory), so a job's `chmod`,
+   `setfacl`, FIFO or socket deep in its tree costs nothing, and no root operation follows it. The
+   result is judged by what the walk leaves, not by `find`'s exit status, which is 1 when another
+   job removes an entry during the walk. **Accepted limit:** damage to the content below those names
+   (a corrupt cache file, a file where Zig expects a cache subdirectory) is the job's own: it fails the
+   builds that read it, never a root operation, and clears with the branch's 7-day prune, or at once with
+   `bash ci/nerva-woodpecker.sh reset-cache main|BRANCH` on the host (takes the same locks; NRV-E1235 if the cache root is not safe or pipelines hold a lock for `NERVA_CI_RESET_WAIT` seconds, default 60). The making of a
+   child by root runs under `<root>-children.lock`, so concurrent steps never refuse each other; a step
+   waits `CI_CHILD_LOCK_WAIT` (30 s) for it, then NRV-E1234. A direct child that the job owns and cannot use,
    whatever its type, is reset by root (3); one another user owns is NRV-E1228 and never touched,
    and so is one that other jobs hold the lock of. Whether `main/` and `branches/` are
    mounted read-write is asked of root (`test -w`, which reports a read-only mount and ignores

@@ -13,12 +13,14 @@ set -eu
 # exports when the box is low on disk, CI_DOCKER_MAX_BYTES, CI_LOCK_WAIT, CI_BRANCH_CACHES, ...), and
 # the step runs this suite as root with the step's environment, pipeline variables included. Every
 # exported CI_* variable is dropped; a test that needs one sets it itself, for its own command.
-# CI_TEST_TMP (a scratch directory) and CI_TEST_NESTED (the guard of the self-test at the end) stay.
+# CI_TEST_TMP (the directory the scratch one is made in; it is never removed) and CI_TEST_NESTED (the guard of the self-test at the end) stay.
 for v in $(compgen -e | grep '^CI_' || true); do
     case "$v" in CI_TEST_TMP | CI_TEST_NESTED) ;; *) unset "$v" ;; esac
 done
 root=$(cd "$(dirname "$0")/.." && pwd)
-tmp=${CI_TEST_TMP:-$(mktemp -d)}
+tmp_base=${CI_TEST_TMP:-${TMPDIR:-/tmp}}
+mkdir -p "$tmp_base"
+tmp=$(mktemp -d "$tmp_base/ci_test.XXXXXX") # a directory of its own: only what the suite made is removed
 ro_mounts=() # bind mounts made by the tests below (root only); unmounted before the scratch directory goes
 cleanup() {
     local m
@@ -1523,6 +1525,264 @@ exec /usr/bin/timeout "$@"'
 else
     skip_note "the repair of a cache directory the job made unusable (NRV-W1204, E1228)"
 fi
+
+# --- Review 6002160899 (the nineteenth round): the normalization under concurrent jobs, the types
+# and modes it fixes, the lock round the mkdir and the chown, and `reset-cache`. The job's user is
+# `nobody` as root, else this user; as anyone else the tests that need a second user are skipped.
+prep_b() { ( . ci/cache.sh; CI_JOB_USER=$jobuser CI_LOCK_WAIT=2 ci_branch_prepare "$1" feature/atk 2>&1 && echo RC0 ) || true; }
+prep_m() { bash -c '. ci/cache.sh; CI_PRUNE_WAIT=1 ci_main_prepare "$1" "$2" no 0 2>&1 && echo RC0' _ "$1" "$jobuser" || true; }
+job_writes() { ci_as sh -c ': >>"$1"' _ "$1" 2>/dev/null && echo yes || echo no; }
+churn_stop="$tmp/churn-stop"
+churn_start() { # churn_start DIR: as the job, what Zig does in a cache (a tmp/<x> renamed into o/, the old ones removed), until churn_end
+    : >"$churn_stop"
+    chmod 644 "$churn_stop"
+    ci_as bash -c 'cd "$1" && mkdir -p tmp o && i=0 && while [ -e "$2" ]; do mkdir tmp/t$i; : >tmp/t$i/f; mv tmp/t$i o/n$i; [ "$i" -lt 50 ] || rm -rf "o/n$((i - 50))"; i=$((i + 1)); done' _ "$1" "$churn_stop" &
+    churn_pid=$!
+}
+churn_end() {
+    rm -f "$churn_stop"
+    wait "$churn_pid" 2>/dev/null || true
+}
+# The walk races other jobs of the same key (a push starts about 14 steps on one key): entries that
+# vanish while find is at them are no failure, and say nothing. find's own exit status was the
+# verdict, and was 1 then (review finding 4649956141): 20 tries, all rc 0 and no output.
+r=$(attack_tree churn)
+churn_start "$r/main/zig"
+churn_bad=
+for i in $(seq 20); do
+    churn_rc=0
+    churn_out=$( (. ci/cache.sh; CI_JOB_USER=$jobuser ci_normalize "$r/main/zig") 2>&1) || churn_rc=$?
+    if [ "$churn_rc" != 0 ] || [ -n "$churn_out" ]; then churn_bad="try $i: rc $churn_rc: $churn_out"; break; fi
+done
+churn_end
+is "normalization of a tree another process churns: rc 0 and silent, 20 times" "" "$churn_bad"
+# The same, made certain: a `find` that exits 1 after an entry "vanished" (what GNU find does, about
+# one walk in fifty under that churn; the option does not stop it) is no failure either.
+mkdir -p "$tmp/stub-find"
+chmod 755 "$tmp/stub-find"
+printf '#!/bin/sh\n%s "$@"\necho "find: ./gone: No such file or directory" >&2\nexit 1\n' "$(command -v find)" >"$tmp/stub-find/find"
+chmod 755 "$tmp/stub-find/find"
+r=$(attack_tree findstub)
+ci_as mkdir "$r/main/zig/sub"
+ci_as chmod 0000 "$r/main/zig/sub"
+churn_rc=0
+churn_out=$( (. ci/cache.sh; PATH="$tmp/stub-find:$PATH" CI_JOB_USER=$jobuser ci_normalize "$r/main/zig") 2>&1) || churn_rc=$?
+is "normalization with a find that exits 1 on a vanished entry: rc 0, silent, and the walk still did its work" "0  yes" "$churn_rc $churn_out $(ci_as test -x "$r/main/zig/sub" && echo yes)"
+# End to end: the branch's lock is held shared by another job (as every running step does) and the
+# tree is churned: a second ci_branch_prepare succeeds. It could not reset the tree (the exclusive
+# lock is not free), so a failed normalization was E1228.
+r=$(attack_tree churn2)
+prep_b "$r" >/dev/null
+d="$r/branches/$branch_key"
+flock -s "$r/locks/$branch_key.lock" sleep 60 &
+holder=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do flock -x -n "$r/locks/$branch_key.lock" true 2>/dev/null || break; sleep 0.2; done
+churn_start "$d/zig"
+churn_bad=
+for i in 1 2 3 4 5; do
+    churn_out=$(prep_b "$r")
+    if ! grep -q RC0 <<<"$churn_out" || grep -q "NRV-[EW]12" <<<"$churn_out"; then churn_bad="try $i: $churn_out"; break; fi
+done
+churn_end
+kill "$holder" 2>/dev/null || true
+wait "$holder" 2>/dev/null || true
+is "branch prepared again while another job holds its lock shared and the tree is churned: 5 times, no E1228" "" "$churn_bad"
+
+# The modes and the types a job leaves in its own caches. A file the job cannot write (a read-only
+# Zig manifest) breaks the next build, a file where Zig makes a directory (h, o, z, p, tmp, b) breaks
+# every build. Normalization gives files u+rw and removes a non-directory at those names, below
+# main's zig and zig-local and a branch's zig and zig-local; a socket is removed. What is deeper
+# than that is the job's own, not chased (the header of ci/cache.sh).
+for role in main branch; do
+    r=$(attack_tree "types-$role")
+    if [ "$role" = main ]; then
+        base="$r/main"
+        sub1=zig-local
+        sub2=zig
+    else
+        base="$r/branches/$branch_key"
+        mk_branch "$base"
+        sub1=zig
+        sub2=zig-local
+    fi
+    ci_as mkdir -p "$base/$sub1/h" "$base/$sub1/o/deep" "$base/$sub2/z"
+    ci_as touch "$base/$sub1/h/manifest" "$base/$sub1/o/deep/f"
+    ci_as chmod 0400 "$base/$sub1/h/manifest" "$base/$sub1/o/deep/f"
+    # A plain file, and a link to a directory of root's, at names Zig makes directories at.
+    ci_as touch "$base/$sub2/p" "$base/$sub2/tmp"
+    ci_as rm -f "$base/$sub2/tmp"
+    ci_as ln -s "$sd" "$base/$sub2/tmp"
+    ci_as touch "$base/$sub2/b"
+    if [ "$role" = main ]; then out=$(prep_m "$r"); else out=$(prep_b "$r"); fi
+    is "$role: a 0400 file in h and in o/deep, a file at p and b, a link at tmp: prepared with no warning and no error" yes "$(grep -q RC0 <<<"$out" && ! grep -q "NRV-[EW]12" <<<"$out" && echo yes)"
+    is "$role: the 0400 files can be written now (h/manifest, o/deep/f)" "yes yes" "$(job_writes "$base/$sub1/h/manifest") $(job_writes "$base/$sub1/o/deep/f")"
+    is "$role: the file at p and b and the link at tmp are gone, and the job can make a directory at each" "yes yes yes" "$(ci_as mkdir "$base/$sub2/p" "$base/$sub2/b" "$base/$sub2/tmp" 2>/dev/null && echo yes) $([ -d "$base/$sub2/tmp" ] && [ ! -L "$base/$sub2/tmp" ] && echo yes) $([ -z "$(ls -A "$sd")" ] && echo yes)"
+    is "$role: the link's target was left alone" "$want_state" "$(sentinel_state)"
+done
+# A plain file at zig-local/h (main) and zig/h (a branch) alone, and nothing else in the tree.
+for spec in main:zig-local branch:zig; do
+    role=${spec%%:*}
+    sub=${spec#*:}
+    r=$(attack_tree "file-h-$role")
+    if [ "$role" = main ]; then base="$r/main"; else base="$r/branches/$branch_key"; mk_branch "$base"; fi
+    ci_as touch "$base/$sub/h"
+    if [ "$role" = main ]; then out=$(prep_m "$r"); else out=$(prep_b "$r"); fi
+    is "$role: a plain file at $sub/h: prepared with no warning and no error, removed, and the job can make the directory" "yes yes" "$(grep -q RC0 <<<"$out" && ! grep -q "NRV-[EW]12" <<<"$out" && echo yes) $(ci_as mkdir "$base/$sub/h" 2>/dev/null && echo yes)"
+done
+# A socket (a mutant that drops `-o -type s` leaves it): made by python, bound in its directory (the
+# path of a socket is short).
+if command -v python3 >/dev/null; then
+    for role in main branch; do
+        r=$(attack_tree "sock-$role")
+        if [ "$role" = main ]; then base="$r/main/zig"; else mk_branch "$r/branches/$branch_key"; base="$r/branches/$branch_key/zig"; fi
+        ci_as mkdir -p "$base/o/x"
+        ci_as sh -c 'cd "$1" && python3 -I -c "import socket; socket.socket(socket.AF_UNIX).bind(\"sock\")"' _ "$base/o/x"
+        [ -S "$base/o/x/sock" ] || { echo "FAIL $role: the test could not make a socket" >&2; fail=1; }
+        if [ "$role" = main ]; then out=$(prep_m "$r"); else out=$(prep_b "$r"); fi
+        is "$role: a socket deep in the tree: prepared with no warning and no error, and the socket is removed" "yes no" "$(grep -q RC0 <<<"$out" && ! grep -q "NRV-[EW]12" <<<"$out" && echo yes) $([ -S "$base/o/x/sock" ] && echo yes || echo no)"
+    done
+else
+    echo "note: no python3: the socket test was skipped" >&2
+fi
+# ci_known_dirs: what the layout fixes (no other child is touched).
+is "ci_known_dirs: main/zig" "b h o p tmp z" "$( . ci/cache.sh; ci_known_dirs /x/main/zig | tr '\n' ' ' | sed 's/ $//')"
+is "ci_known_dirs: tools has none" "" "$( . ci/cache.sh; ci_known_dirs /x/main/tools)"
+is "ci_known_dirs: a branch's directory has the six names under each of zig and zig-local" 12 "$( . ci/cache.sh; ci_known_dirs /x/branches/b-k-12345678 | wc -l | tr -d ' ')"
+
+if [ "$(id -u)" = 0 ]; then
+    # The window between root's mkdir and chown of a child. A fresh main/: 14 steps at once (a push
+    # starts about 14 on one key) each prepare zig, zig-local and tools; none is refused (E1228
+    # was the answer to 171 of 420 of them), 10 rounds.
+    stress_bad=
+    for round in 1 2 3 4 5 6 7 8 9 10; do
+        r=$(attack_tree "stress")
+        rm -rf "${r:?}/main/zig" "${r:?}/main/zig-local" "${r:?}/main/tools"
+        pids=()
+        for i in $(seq 14); do
+            ( prep_m "$r" >"$tmp/stress-$i.out" ) &
+            pids+=($!)
+        done
+        wait "${pids[@]}" 2>/dev/null || true
+        for i in $(seq 14); do
+            if ! grep -q RC0 "$tmp/stress-$i.out" || grep -q "NRV-[EW]12" "$tmp/stress-$i.out"; then
+                stress_bad="round $round, step $i: $(head -3 "$tmp/stress-$i.out")"
+                break 2
+            fi
+        done
+        is "stress round $round: the three directories are the job's" "$jobuser $jobuser $jobuser" "$(stat -c %U "$r/main/zig" "$r/main/zig-local" "$r/main/tools" | tr '\n' ' ' | sed 's/ $//')"
+    done
+    is "14 concurrent prepares of a fresh main, 10 rounds: none refused" "" "$stress_bad"
+    # The two things the stress depends on, each on its own. ci_child_make takes a directory that is
+    # not the job's for somebody else's, and says so (return 1), and makes one that is not there.
+    r=$(attack_tree mk)
+    mkdir "$r/main/rootsdir"
+    ( . ci/cache.sh; CI_JOB_USER=$jobuser ci_child_make "$r/main/rootsdir" ) >/dev/null 2>&1 && { echo "FAIL ci_child_make accepted a directory another uid owns" >&2; fail=1; }
+    ( . ci/cache.sh; CI_JOB_USER=$jobuser ci_child_make "$r/main/zig" ) >/dev/null 2>&1 || { echo "FAIL ci_child_make refused the job's own directory" >&2; fail=1; }
+    ( . ci/cache.sh; CI_JOB_USER=$jobuser ci_child_make "$r/main/fresh" ) >/dev/null 2>&1 || { echo "FAIL ci_child_make did not make a directory" >&2; fail=1; }
+    is "ci_child_make: a new directory is the job's" "$jobuser" "$(stat -c %U "$r/main/fresh")"
+    # A step that finds a root-owned directory (another step is between its mkdir and its chown) waits
+    # for the lock that step holds, then finds it the job's: here a holder that chowns after a second.
+    mkdir "$r/main/half"
+    : >"$r/locks/main-children.lock"
+    chmod 600 "$r/locks/main-children.lock"
+    ( flock -x 4 && sleep 1.5 && chown "$jobuser" "$r/main/half" ) 4>>"$r/locks/main-children.lock" &
+    holder=$!
+    for _ in 1 2 3 4 5 6 7 8 9 10; do flock -x -n "$r/locks/main-children.lock" true 2>/dev/null || break; sleep 0.2; done
+    probe_rc=0
+    ( . ci/cache.sh; CI_JOB_USER=$jobuser ci_child_probe "$r/main/half" ) >/dev/null 2>&1 || probe_rc=$?
+    wait "$holder" 2>/dev/null || true
+    is "ci_child_probe of a root-owned directory waits for the lock of the step that is making it (rc 0)" 0 "$probe_rc"
+    # NRV-E1234: a lock that is not let go does not hold a step up for good. Nothing is made.
+    ( flock -x 4 && sleep 8 ) 4>>"$r/locks/main-children.lock" &
+    holder=$!
+    for _ in 1 2 3 4 5 6 7 8 9 10; do flock -x -n "$r/locks/main-children.lock" true 2>/dev/null || break; sleep 0.2; done
+    out=$( (. ci/cache.sh; CI_JOB_USER=$jobuser CI_CHILD_LOCK_WAIT=1 ci_child_make "$r/main/never") 2>&1) && { echo "FAIL ci_child_make with the lock held went on: $out" >&2; fail=1; }
+    grep -q "NRV-E1234: the lock $r/locks/main-children.lock.* was held for 1 s" <<<"$out" || { echo "FAIL a children lock that is not let go is not E1234: $out" >&2; fail=1; }
+    is "E1234: nothing was made while the lock was held" no "$([ -e "$r/main/never" ] && echo yes || echo no)"
+    kill "$holder" 2>/dev/null || true
+    wait "$holder" 2>/dev/null || true
+else
+    skip_note "the children lock's tests (a second user is the job's: the window between mkdir and chown, NRV-E1234)"
+fi
+
+# `nerva-woodpecker.sh reset-cache`: empties one cache at once, under the lock that keeps pipelines
+# out, as the prune does. Any user (the scratch root is this user's, as root's is on the box).
+rc_run() { env NERVA_CI_CACHE_ROOT="$1" "${@:3}" bash ops/ci/nerva-woodpecker.sh reset-cache "${@:2:1}" 2>&1; }
+rc_tree() { # rc_tree NAME: a cache root with main (zig, zig-local, tools), two branches and the locks, a 0555 directory and a link in each
+    local q="$tmp/rc-$1"
+    rm -rf "$q"
+    mkdir -p "$q/main/zig/o/deep" "$q/main/zig-local" "$q/main/tools" "$q/branches/$branch_key/zig" "$q/branches/b-other-12345678/zig"
+    chmod 0755 "$q" "$q/main" "$q/branches"
+    mkdir -m 0700 "$q/locks"
+    : >"$q/main/zig/o/deep/f"
+    : >"$q/main/tools/archive"
+    : >"$q/branches/$branch_key/zig/f"
+    : >"$q/branches/b-other-12345678/zig/f"
+    ln -s "$sd" "$q/main/zig/o/link"
+    ln -s "$sd" "$q/branches/$branch_key/zig/link"
+    [ "$(id -u)" = 0 ] && chmod 0555 "$q/main/zig/o/deep" "$q/branches/$branch_key/zig"
+    echo "$q"
+}
+q=$(rc_tree m)
+out=$(rc_run "$q" main) || { echo "FAIL reset-cache main: $out" >&2; fail=1; }
+grep -q "nerva-woodpecker: OK reset-cache main" <<<"$out" || { echo "FAIL reset-cache main: no OK line: $out" >&2; fail=1; }
+is "reset-cache main: zig and zig-local gone, tools and the branches kept, the link's target kept" "no no yes yes yes $want_state" "$([ -e "$q/main/zig" ] && echo yes || echo no) $([ -e "$q/main/zig-local" ] && echo yes || echo no) $([ -e "$q/main/tools/archive" ] && echo yes) $([ -e "$q/branches/$branch_key/zig/f" ] && echo yes) $([ -d "$q/main" ] && echo yes) $(sentinel_state)"
+out=$(rc_run "$q" main) || { echo "FAIL reset-cache main again (nothing to remove): $out" >&2; fail=1; }
+q=$(rc_tree b)
+out=$(rc_run "$q" feature/atk) || { echo "FAIL reset-cache BRANCH: $out" >&2; fail=1; }
+is "reset-cache BRANCH: that branch's directory gone, the other branch's and main's kept, the link's target kept" "no yes yes $want_state" "$([ -e "$q/branches/$branch_key" ] && echo yes || echo no) $([ -e "$q/branches/b-other-12345678/zig/f" ] && echo yes) $([ -e "$q/main/zig/o/deep/f" ] && echo yes) $(sentinel_state)"
+reset_sentinels
+refuses NRV-E1221 "reset-cache without an argument" env NERVA_CI_CACHE_ROOT="$q" bash ops/ci/nerva-woodpecker.sh reset-cache
+refuses NRV-E1221 "reset-cache with two arguments" env NERVA_CI_CACHE_ROOT="$q" bash ops/ci/nerva-woodpecker.sh reset-cache main x
+refuses NRV-E1221 "reset-cache with a wait that is not a number" env NERVA_CI_CACHE_ROOT="$q" NERVA_CI_RESET_WAIT=soon bash ops/ci/nerva-woodpecker.sh reset-cache main
+# NRV-E1235: pipelines hold the lock (shared, as every running step does): nothing is removed.
+q=$(rc_tree busy)
+: >"$q/locks/main.lock"
+chmod 600 "$q/locks/main.lock"
+flock -s "$q/locks/main.lock" sleep 20 &
+holder=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do flock -x -n "$q/locks/main.lock" true 2>/dev/null || break; sleep 0.2; done
+out=$(rc_run "$q" main NERVA_CI_RESET_WAIT=1) && { echo "FAIL reset-cache went on with a pipeline running: $out" >&2; fail=1; }
+grep -q "NRV-E1235: main's cache is in use" <<<"$out" || { echo "FAIL reset-cache with a pipeline running is not E1235: $out" >&2; fail=1; }
+kill "$holder" 2>/dev/null || true
+wait "$holder" 2>/dev/null || true
+is "reset-cache with a pipeline running: nothing removed" yes "$([ -e "$q/main/zig/o/deep/f" ] && echo yes)"
+# The children lock too (a step in the middle of making a directory).
+q=$(rc_tree busy2)
+: >"$q/locks/main-children.lock"
+chmod 600 "$q/locks/main-children.lock"
+flock -x "$q/locks/main-children.lock" sleep 20 &
+holder=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do flock -x -n "$q/locks/main-children.lock" true 2>/dev/null || break; sleep 0.2; done
+out=$(rc_run "$q" main NERVA_CI_RESET_WAIT=1) && { echo "FAIL reset-cache went on with the children lock held: $out" >&2; fail=1; }
+grep -q "NRV-E1235" <<<"$out" || { echo "FAIL reset-cache with the children lock held is not E1235: $out" >&2; fail=1; }
+kill "$holder" 2>/dev/null || true
+wait "$holder" 2>/dev/null || true
+is "reset-cache with the children lock held: nothing removed" yes "$([ -e "$q/main/zig/o/deep/f" ] && echo yes)"
+# A mount root another user can write (a job's, as an earlier layout left it) is not acted in.
+q=$(rc_tree open)
+chmod 0777 "$q/main"
+out=$(rc_run "$q" main) && { echo "FAIL reset-cache acted in a mount root others can write: $out" >&2; fail=1; }
+grep -q "NRV-E1235" <<<"$out" || { echo "FAIL reset-cache in a writable mount root is not E1235: $out" >&2; fail=1; }
+chmod 0755 "$q/main"
+chmod 0755 "$q/locks"
+out=$(rc_run "$q" main) && { echo "FAIL reset-cache accepted a lock directory others can use: $out" >&2; fail=1; }
+grep -q "NRV-E1235" <<<"$out" || { echo "FAIL reset-cache with an open lock directory is not E1235: $out" >&2; fail=1; }
+is "reset-cache in an unsafe root or lock directory: nothing removed" yes "$([ -e "$q/main/zig/o/deep/f" ] && echo yes)"
+chmod 0700 "$q/locks"
+rm -rf "$q/main"
+ln -s "$sd" "$q/main"
+out=$(rc_run "$q" main) && { echo "FAIL reset-cache followed a link as the mount root: $out" >&2; fail=1; }
+is "reset-cache with a link as the mount root: refused, the target kept" "$want_state" "$(sentinel_state)"
+# The branch key is ci/cache.sh's, for names with slashes, odd characters and past the length cut.
+for name in feature/atk a/b a_b 'x y' "$(printf 'long-%.0s' $(seq 20))"; do
+    q=$(rc_tree key)
+    k=$(. ci/cache.sh; ci_branch_key "$name")
+    mkdir -p "$q/branches/$k/zig"
+    : >"$q/branches/$k/zig/f"
+    rc_run "$q" "$name" >/dev/null || { echo "FAIL reset-cache '$name'" >&2; fail=1; }
+    is "reset-cache '$name' removes the directory ci_branch_key names" no "$([ -e "$q/branches/$k" ] && echo yes || echo no)"
+done
 
 # Lock files a prune makes are the step's own, 0600 (they used to be 0644 by root's umask, and a
 # job that could list a 0755 lock directory could take them), and a lock directory with any group

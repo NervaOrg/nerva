@@ -5,7 +5,8 @@
 #   <root>/main/            main's: tools/ (the pinned Zig's archive, by sha256), zig/, zig-local/
 #   <root>/branches/<key>/  one branch's own zig/ and zig-local/; zig/p (fetched packages) is seeded
 #                         by a copy of main's
-#   <root>/locks/           the lock files: main.lock, branches.lock, b-<key>.lock, jepsen.lock.
+#   <root>/locks/           the lock files: main.lock, branches.lock, b-<key>.lock, jepsen.lock, and
+#                         <root>-children.lock (main-, branches-, jepsen-) for making a child.
 #                         Owned by the step's user (root), mode 0700, mounted writable in every role.
 #                         The directories above belong to `ci`, so a lock file in one could be
 #                         replaced by a job (a symlink in its place would make a root step chown
@@ -32,9 +33,24 @@
 #     another uid owns is never touched: NRV-E1228.
 #  3. THE JOB'S OWN TREE IS NORMALIZED BY THE JOB (ci_normalize, before each use): as the job,
 #     every directory under the child gets u+rwx and loses its ACLs (access and default), a file
-#     without u+r gets it, a FIFO or a socket is removed. The job acting on its own files cannot
-#     escalate, so this walks deep paths (main/zig/o/x, a branch's zig/p, jepsen/tools) that root
-#     never walks. If it fails (or the child still has an ACL or is not usable), rule 2 applies.
+#     without u+rw gets it, a FIFO or a socket is removed, and each top-level name Zig needs
+#     (ci_known_dirs: b h o p tmp z under zig and zig-local) that is a link or not a directory is
+#     removed. The job acting on its own files cannot escalate, so this walks deep paths
+#     (main/zig/o/x, a branch's zig/p, jepsen/tools) that root never walks. It is judged by what
+#     it leaves, not by find's exit status (GNU find exits 1 on an entry another job removed
+#     during the walk, even with -ignore_readdir_race: about 2 walks in 100 under churn). If the
+#     child still has an ACL, is not usable or a known name is still wrong, rule 2 applies.
+#
+# What the three rules guarantee: no job can make a root operation act through a path it
+# controls, and a job's damage to the directories and the top-level names above is repaired
+# before the next job runs. What they do not (the accepted limit, decision O4, nineteenth
+# review): content damage below those names is the job's own, such as a corrupt cache file or a
+# file a job leaves where a Zig cache subdirectory (zig-local/o/<hash>) is expected. It makes the
+# builds that read it fail, never a root operation, and clears when the cache is removed: for a
+# branch, by the 7-day prune; for any cache, at once, by `nerva-woodpecker.sh reset-cache
+# main|<branch>` on the host (it takes the same locks). Concurrent steps never refuse each
+# other: root's make of a child runs under <root>-children.lock (root-only, in locks/) and a
+# step that finds a root-owned directory waits on it for the owner change (NRV-E1234 on timeout).
 #
 # What root does inside a mount root, in all: mkdir, chown (-h), mktemp -d, mv -T of a partial
 # directory, rm -rf --one-file-system and rm -f of a name that is a DIRECT child, and, on a mount
@@ -148,25 +164,90 @@ ci_mount_root() {
     return 1
 }
 
+# ci_known_dirs PATH: the names, relative to PATH, that Zig's cache layout fixes as directories, one
+# per line, parents first: in a Zig cache directory (main's zig and zig-local) `b`, `h`, `o`, `p`,
+# `tmp` and `z` (a real global cache on this box has exactly these; Zig makes them itself, with
+# makePath, so a file at one of them fails every later build); in a branch's directory, the same under its
+# `zig` and `zig-local` (those two themselves are ci_job_dir's, as the job, with NRV-W1204). Nothing for the other children (tools, jepsen's).
+ci_known_dirs() {
+    local z n
+    case "$(basename -- "$1")" in
+        zig | zig-local) for n in b h o p tmp z; do echo "$n"; done ;;
+        b-*) for z in zig zig-local; do
+            for n in b h o p tmp z; do echo "$z/$n"; done
+        done ;;
+    esac
+}
+
 # ci_normalize DIR: rule 3. As the job's user, over DIR, a directory of its own (never a link; the
-# caller tests that): every directory gets u+rwx (find acts on a directory before it enters it, so
-# a chmod 0000 one is opened up and then searched), a file without u+r gets it, a FIFO or socket is
-# removed, and every directory loses its ACL entries, default ones included (setfacl -b -k, many
-# directories per call; "not supported" on a file system without ACLs is no failure, and the check
-# after it is on DIR itself). Bounded by CI_NORMALIZE_SECONDS (default 600): a tree it cannot get
-# through in that time counts as failed, and is reset by the caller. NRV-E1233 without setfacl.
+# caller tests that), in four steps:
+#  1. the modes: every directory gets u+rwx (find acts on a directory before it enters it, so a
+#     chmod 0000 one is opened up and then searched), a file without u+rw gets it (a read-only
+#     manifest breaks Zig's next write), a FIFO or socket is removed. find runs with
+#     -ignore_readdir_race, and its exit status is never the verdict: other jobs of the same key
+#     churn the tree while this walks it (Zig makes tmp/<x> and renames it into o/ all the time),
+#     and GNU find exits 1 when an entry vanishes mid-walk (the option covers an entry that goes
+#     between the readdir and the stat, not a directory that goes before find opens it: measured,
+#     about 1 walk in 50 under a Zig-like churn either way). A "No such file or directory" from
+#     find, chmod or rm is dropped, any other message is passed on (stderr), and only the checks
+#     below judge the tree.
+#  2. the names of ci_known_dirs: whatever is there that is not a directory (a file, a link, a
+#     FIFO) is removed, so that Zig makes the directory.
+#  3. every directory loses its ACL entries, default ones included (setfacl -b -k, many directories
+#     per call; "not supported" on a file system without ACLs is no failure).
+#  4. the verdict: every known name is a directory (no link) or not there.
+# What it does NOT promise: the content and the type of anything deeper (a file where Zig expects
+# a directory below o/ or z/, a corrupt manifest): that is the job's own damage, cleared by the
+# branch's prune in 7 days or at once by `nerva-woodpecker.sh reset-cache`. Bounded by
+# CI_NORMALIZE_SECONDS (default 600): a tree it cannot get through in that time counts as failed,
+# and is reset by the caller. NRV-E1233 without setfacl.
 ci_normalize() {
-    local d="$1"
+    local d="$1" known=()
     command -v setfacl >/dev/null || {
         ci_error "NRV-E1233: setfacl is not installed, so the ACLs of $d cannot be removed (the acl package: ci/woodpecker_step.sh installs it)"
         return 1
     }
+    mapfile -t known < <(ci_known_dirs "$d")
     ci_as_job timeout "${CI_NORMALIZE_SECONDS:-600}" sh -c '
-        find "$1" -xdev \( -type d ! -perm -u=rwx -exec chmod u+rwx -- {} \; \) -o \
-            \( -type f ! -perm -u=r -exec chmod u+r -- {} \; \) -o \
-            \( \( -type p -o -type s \) -exec rm -f -- {} \; \) || exit 1
-        find "$1" -xdev -type d -exec setfacl -b -k -- {} + 2>/dev/null || true
-    ' _ "$d" 2>/dev/null
+        d=$1
+        shift
+        err=$(find "$d" -ignore_readdir_race -xdev \( -type d ! -perm -u=rwx -exec chmod u+rwx -- {} \; \) -o \
+            \( -type f ! -perm -u=rw -exec chmod u+rw -- {} \; \) -o \
+            \( \( -type p -o -type s \) -exec rm -f -- {} \; \) 2>&1 >/dev/null) || true
+        printf "%s\n" "$err" | grep -v -e "No such file or directory" -e "^$" >&2 || true
+        for p in "$@"; do
+            q=$d/$p
+            if [ -L "$q" ] || { [ -e "$q" ] && [ ! -d "$q" ]; }; then rm -rf --one-file-system -- "$q" || true; fi
+        done
+        find "$d" -ignore_readdir_race -xdev -type d -exec setfacl -b -k -- {} + 2>/dev/null || true
+        for p in "$@"; do
+            q=$d/$p
+            if [ -L "$q" ] || { [ -e "$q" ] && [ ! -d "$q" ]; }; then exit 1; fi
+        done
+        exit 0
+    ' _ "$d" "${known[@]}"
+}
+
+# ci_children_locked PATH CMD...: runs CMD (a command or one of these functions) holding the
+# exclusive "children" lock of the mount root PATH is a direct child of (locks/<root>-children.lock:
+# main-children.lock, branches-children.lock, jepsen-children.lock), waiting at most
+# CI_CHILD_LOCK_WAIT seconds (default 30; the holders only mkdir and chown). Every root-made child
+# is made under it (ci_child_make): a directory is root-owned between its mkdir and its chown, and
+# a step that looked at it then took it for somebody else's (171 of 420 steps in the review's stress
+# run). A step that finds a root-owned child waits for this lock too (ci_child_probe). NRV-E1234.
+ci_children_locked() {
+    local p="$1" f
+    shift
+    f="$(dirname -- "$(dirname -- "$p")")/locks/$(basename -- "$(dirname -- "$p")")-children.lock"
+    (
+        ci_lock_file "$f" || exit 1
+        { exec 4>>"$f"; } 2>/dev/null || { ci_lock_open_failed "$f" '>>'; exit 1; }
+        flock -x -w "${CI_CHILD_LOCK_WAIT:-30}" 4 || {
+            ci_error "NRV-E1234: the lock $f, which covers making a cache directory, was held for ${CI_CHILD_LOCK_WAIT:-30} s: it is held only for a mkdir and a chown, so a process on the host (lslocks shows its pid) holds it; if the box is just overloaded, raise CI_CHILD_LOCK_WAIT"
+            exit 1
+        }
+        "$@"
+    )
 }
 
 # ci_child_probe PATH: the state of PATH, a DIRECT child of a mount root that the job's user is
@@ -176,19 +257,22 @@ ci_normalize() {
 #   11  the job owns it and it cannot be used: not a directory (a file, a FIFO, a socket), a
 #       directory that is not usable or has an ACL or could not be normalized: ci_child_reset
 #   12  another uid owns it (root never touches it), or a link that could not be unlinked
-# Waits a moment on a directory this user owns (root's, just made by a concurrent step's ci_child_make:
-# its mkdir and its chown are two calls), never on a real owner's.
+# On a directory this user owns (root's, perhaps just made by a concurrent step's ci_child_make:
+# its mkdir and its chown are two calls) it waits for the children lock, which that step holds until
+# the chown is done, and looks again; never on a real owner's.
 ci_child_probe() {
     local p="$1" job_uid owner
     job_uid=$(ci_job_uid)
     if [ -L "$p" ]; then rm -f -- "$p" 2>/dev/null || true; fi
     if [ -L "$p" ]; then return 12; fi
     [ -e "$p" ] || return 10
-    for _ in 1 2 3 4 5 6 7 8 9 10; do
+    owner=$(stat -c %u -- "$p" 2>/dev/null) || return 10
+    if [ "$owner" = "$(id -u)" ] && [ "$owner" != "$job_uid" ] && [ -d "$p" ]; then
+        # Root's: a concurrent step's ci_child_make is between its mkdir and its chown, and holds
+        # the children lock until the chown is done. Taking it waits for that, then looks again.
+        ci_children_locked "$p" true || return 12
         owner=$(stat -c %u -- "$p" 2>/dev/null) || return 10
-        { [ "$owner" = "$(id -u)" ] && [ "$owner" != "$job_uid" ] && [ -d "$p" ]; } || break
-        sleep 0.2
-    done
+    fi
     [ "$owner" = "$job_uid" ] || return 12
     [ -d "$p" ] || return 11
     ci_normalize "$p" || return 11
@@ -201,6 +285,13 @@ ci_child_probe() {
 # user owns: mkdir, then chown -h of the name (rule 1: nobody but root can have made or swapped it).
 # A directory a concurrent step made first is fine. Return 1 if there is no such directory after.
 ci_child_make() {
+    ci_children_locked "$1" ci_child_make_locked "$1"
+}
+
+# ci_child_make_locked PATH: ci_child_make's body, run with the children lock held (a concurrent
+# step's mkdir and chown of the same name cannot then be seen half done). A directory that is there
+# already must be the job's: one another uid owns is refused.
+ci_child_make_locked() {
     local p="$1" job_uid
     job_uid=$(ci_job_uid)
     if mkdir -m 0755 -- "$p" 2>/dev/null; then

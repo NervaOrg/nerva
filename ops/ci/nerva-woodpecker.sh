@@ -147,8 +147,66 @@ repo() {
     say "OK repo $name (id $id): pull requests off, approval for forks, 360 min, trusted for volumes and network only"
 }
 
+# reset_cache WHAT: empties one cache at once (the operator's answer to what a step's normalization
+# does not promise: a job's damage to the content or the type of something deep in its own cache,
+# which a branch's prune clears in 7 days and main's only when the disk is low). WHAT is `main`
+# (main's zig and zig-local; never tools, the pinned toolchain) or a branch name (that branch's
+# directory). It is the operation of the prune and of NRV-W1204: `rm -rf --one-file-system` of a
+# DIRECT child of a mount root that this user (root) owns and no one else can write, which never
+# follows a link, under the exclusive lock that keeps the pipelines out (main's lock, or the
+# branch's own; steps hold them shared while they run) and the children lock (so that no step is
+# in the middle of making the directory). The next pipeline makes the directories again.
+reset_cache() {
+    local what="${1:-}" root mount lock key safe sum wait names=() n
+    [ -n "$what" ] && [ $# -le 1 ] || fail "NRV-E1221: usage: bash ci/nerva-woodpecker.sh reset-cache main|BRANCH"
+    root="${NERVA_CI_CACHE_ROOT:-/var/cache/nerva-ci}"
+    wait="${NERVA_CI_RESET_WAIT:-60}"
+    [[ "$wait" =~ ^[0-9]{1,5}$ ]] || fail "NRV-E1221: NERVA_CI_RESET_WAIT='$wait' is not a whole number of seconds"
+    if [ "$what" = main ]; then
+        mount="$root/main"
+        lock="$root/locks/main.lock"
+        names=(zig zig-local)
+    else
+        # The key of ci/cache.sh's ci_branch_key (a test keeps the two equal).
+        safe=$(printf '%s' "$what" | tr -c 'A-Za-z0-9._-' '_' | cut -c1-48)
+        sum=$(printf '%s' "$what" | sha256sum | cut -c1-8)
+        key="b-$safe-$sum"
+        mount="$root/branches"
+        lock="$root/locks/$key.lock"
+        names=("$key")
+    fi
+    # Only a mount root that is this user's and that no one else can write: in it, a name is not
+    # something a job could have swapped for a link between the test and the rm.
+    if [ -L "$mount" ] || [ ! -d "$mount" ] || [ "$(stat -c %u "$mount")" != "$(id -u)" ] || [ -n "$(find "$mount" -maxdepth 0 -perm /022)" ] ||
+        [ -L "$root/locks" ] || [ ! -d "$root/locks" ] || [ "$(stat -c %u "$root/locks")" != "$(id -u)" ] || [ -n "$(find "$root/locks" -maxdepth 0 -perm /077)" ]; then
+        fail "NRV-E1235: $mount and $root/locks must be real directories owned by $(id -un), not writable by anyone else (the locks one mode 0700): run bash ci/nerva-woodpecker.sh host first"
+    fi
+    local f
+    for f in "$lock" "$root/locks/$(basename "$mount")-children.lock"; do
+        if [ -L "$f" ] || { [ -e "$f" ] && [ ! -f "$f" ]; }; then fail "NRV-E1235: $f is not a regular file: remove it"; fi
+        [ -e "$f" ] || (umask 077 && set -C && : >"$f") 2>/dev/null || true
+    done
+    (
+        exec 8>>"$lock" 4>>"$root/locks/$(basename "$mount")-children.lock" || exit 4
+        flock -x -w "$wait" 8 || exit 3
+        flock -x -w "$wait" 4 || exit 3
+        for n in "${names[@]}"; do
+            [ -e "$mount/$n" ] || [ -L "$mount/$n" ] || continue
+            rm -rf --one-file-system -- "${mount:?}/$n" || exit 5
+            { [ ! -e "$mount/$n" ] && [ ! -L "$mount/$n" ]; } || exit 5
+            echo "nerva-woodpecker: removed $mount/$n"
+        done
+    ) || case "$?" in
+        3) fail "NRV-E1235: $what's cache is in use: pipelines hold its lock (shared, while a step runs) and none let go in $wait s: wait for them, or stop them in Woodpecker, then run this again (NERVA_CI_RESET_WAIT raises the wait)" ;;
+        5) fail "NRV-E1235: a cache directory of $what under $mount could not be removed (a mount inside it?): look at it with ls -la and remove what is in the way" ;;
+        *) fail "NRV-E1235: the lock files under $root/locks could not be opened" ;;
+    esac
+    say "OK reset-cache $what: the next pipeline makes its cache directories again"
+}
+
 case "${1:-}" in
 host) host ;;
 repo) repo "${2:-}" ;;
-*) fail "NRV-E1221: usage: bash ci/nerva-woodpecker.sh host (on the box) | bash ops/ci/nerva-woodpecker.sh repo OWNER/NAME (from the repository root)" ;;
+reset-cache) shift; reset_cache "$@" ;;
+*) fail "NRV-E1221: usage: bash ci/nerva-woodpecker.sh host (on the box) | bash ci/nerva-woodpecker.sh reset-cache main|BRANCH (on the box) | bash ops/ci/nerva-woodpecker.sh repo OWNER/NAME (from the repository root)" ;;
 esac
