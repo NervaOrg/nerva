@@ -18,10 +18,15 @@ write_files:
           - {{ $key }}={{ $value }}
           {{- end }}
 runcmd:
+  # Before any job can run: containers cannot reach the metadata service (the snapshot's unit; the user data
+  # holds the agent token). The unit is enabled in the snapshot; this makes sure it is in place first.
+  - systemctl start nerva-ci-metadata-block.service
   {{- range .PreExec }}
   - {{ . }}
   {{- end }}
   - docker compose -f /root/docker-compose.yml up -d
+  # The token is in the agent container now: delete cloud-init's copies of it (the metadata service keeps its own).
+  - rm -f /root/docker-compose.yml /var/lib/cloud/instance/user-data.txt /var/lib/cloud/instance/user-data.txt.i /var/lib/cloud/instance/cloud-config.txt
   {{- range .PostExec }}
   - {{ . }}
   {{- end }}

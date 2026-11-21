@@ -215,6 +215,14 @@ printf '{"images":[]}\n200' > "$STUB_API/GET__images"
 refuses "latest with no snapshot" NRV-E1243 bash "$img" latest
 refuses "build without a seed" NRV-E1242 env NERVA_CI_CACHE_ROOT="$tmp/noseed" bash "$img" build
 refuses "provision off the build server" NRV-E1242 bash "$as/provision-image.sh"
+# With a keep count of 1 the newest and the one in use (10, here an older one) are still kept.
+: > "$STUB_LOG/curl.calls"
+printf '{"images":[{"id":40,"created":"d"},{"id":30,"created":"c"},{"id":20,"created":"b"},{"id":10,"created":"a"}]}\n200' > "$STUB_API/GET__images"
+ok "prune with a keep count of 1" env NERVA_AS_KEEP=1 bash "$img" prune
+has "keep 1 deleted 30 and 20" "$STUB_LOG/curl.calls" '^DELETE /images/30$'
+hasnt "keep 1 kept the newest" "$STUB_LOG/curl.calls" '^DELETE /images/40$'
+hasnt "keep 1 kept the one in use" "$STUB_LOG/curl.calls" '^DELETE /images/10$'
+printf '{"images":[]}\n200' > "$STUB_API/GET__images"
 refuses "a keep count of 0" NRV-E1238 env NERVA_AS_KEEP=0 bash "$img" prune
 rm -f "$etc/hcloud.token"
 refuses "build without the token file" NRV-E1237 env NERVA_CI_CACHE_ROOT="$tmp/noseed" bash "$img" build
@@ -299,6 +307,26 @@ agent_tag=$(pin AGENT_IMAGE | sed -n 's/.*:\(v[0-9.]*\)@.*/\1/p')
 has "the agent image is the bootstrap's Woodpecker version" ops/ci/woodpecker-bootstrap.sh "^woodpecker_version=$agent_tag\$"
 has "the unit runs the installed script" "$as/nerva-autoscaler.service" 'ExecStart=/usr/local/lib/nerva-ci/ci/autoscaler/nerva-autoscaler.sh run'
 has "the image unit runs the installed script" "$as/nerva-autoscaler-image.service" 'ExecStart=/usr/local/lib/nerva-ci/ci/autoscaler/nerva-autoscaler-image.sh build'
+
+# --- The units and the template: no orphaned container, no restart of a stopped service, no metadata ----
+u="$as/nerva-autoscaler.service"
+has "the service removes a leftover container before it starts" "$u" '^ExecStartPre=-/usr/bin/docker rm -f nerva-autoscaler$'
+has "the service removes the container when it stops" "$u" '^ExecStop=-/usr/bin/docker rm -f nerva-autoscaler$'
+has "the service removes the container however it ended" "$u" '^ExecStopPost=-/usr/bin/docker rm -f nerva-autoscaler$'
+has "the image service only try-restarts the autoscaler" "$as/nerva-autoscaler-image.service" '^ExecStartPost=-/usr/bin/systemctl try-restart nerva-autoscaler.service$'
+hasnt "the image service never plain-restarts it" "$as/nerva-autoscaler-image.service" 'systemctl restart'
+n=$((n + 1))
+[ "$(grep -n '^ExecStartPost=-.*try-restart' "$as/nerva-autoscaler-image.service" | cut -d: -f1)" -lt "$(grep -n '^ExecStartPost=.*image.sh prune' "$as/nerva-autoscaler-image.service" | cut -d: -f1)" ] || bad "the image service prunes before it restarts the autoscaler"
+has "the metadata block drops container traffic to 169.254.169.254" "$as/nerva-ci-metadata-block.service" 'iptables -w -I DOCKER-USER -d 169.254.169.254 -j DROP'
+has "the metadata block is enabled at boot" "$as/nerva-ci-metadata-block.service" '^WantedBy=multi-user.target$'
+has "provision installs the metadata block" "$as/provision-image.sh" 'nerva-ci-metadata-block.service'
+has "provision checks the rule is in place" "$as/provision-image.sh" 'iptables -w -C DOCKER-USER -d 169.254.169.254 -j DROP'
+ci_tmpl="$as/cloud-init.tmpl.yaml"
+n=$((n + 1))
+{ [ "$(grep -n 'systemctl start nerva-ci-metadata-block' "$ci_tmpl" | cut -d: -f1)" -lt "$(grep -n 'docker compose' "$ci_tmpl" | cut -d: -f1)" ]; } || bad "cloud-init does not block the metadata service before it starts the agent"
+n=$((n + 1))
+{ [ "$(grep -n 'docker compose' "$ci_tmpl" | cut -d: -f1)" -lt "$(grep -n 'rm -f /root/docker-compose.yml' "$ci_tmpl" | cut -d: -f1)" ]; } || bad "cloud-init does not delete its copy of the token after it starts the agent"
+has "cloud-init deletes its user data" "$ci_tmpl" 'rm -f .*/var/lib/cloud/instance/user-data.txt'
 
 # --- Workflows: every one has a tier, a cloud one never runs for main, none is privileged ----------
 for f in .woodpecker/*.yaml; do

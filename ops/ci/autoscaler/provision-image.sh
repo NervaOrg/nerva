@@ -6,7 +6,7 @@
 #
 # Makes the snapshot: Docker with the io_uring seccomp profile (ops/ci/docker/, decision O4), the
 # pinned CI and agent images pulled, the pinned Zig toolchain archive verified by sha256 (lib.sh), the
-# cache directories of nerva-woodpecker.sh host, and the seed under /var/cache/nerva-ci/main, which
+# cache directories of nerva-woodpecker.sh host, a firewall rule against the metadata service, and the seed under /var/cache/nerva-ci/main, which
 # no job but a push to main may write (and a cloud agent never runs one: decision O6).
 # shellcheck disable=SC2154,SC2034 # etc, tool and the pins come from lib.sh (not followed: no -x)
 set -euo pipefail
@@ -30,6 +30,15 @@ install -m 0644 "$here/../docker/seccomp-io_uring.json" /etc/docker/seccomp-io_u
 jq -n '{"seccomp-profile": "/etc/docker/seccomp-io_uring.json"}' > /etc/docker/daemon.json
 systemctl enable docker > /dev/null
 systemctl restart docker
+
+# Containers (the jobs) must not reach Hetzner's metadata service, which serves this server's user data
+# with the agent token (cloud-init.tmpl.yaml): a DOCKER-USER drop, made again at every boot and every
+# Docker restart by a unit. It is checked here, so a snapshot without the rule is never made.
+install -m 0644 "$here/nerva-ci-metadata-block.service" /etc/systemd/system/nerva-ci-metadata-block.service
+systemctl daemon-reload
+systemctl enable nerva-ci-metadata-block.service > /dev/null
+systemctl restart nerva-ci-metadata-block.service
+iptables -w -C DOCKER-USER -d 169.254.169.254 -j DROP || fail "NRV-E1242: the image was not built: the DOCKER-USER rule that blocks 169.254.169.254 is not in place"
 
 # The pinned CI image is pulled and the io_uring probe runs in it: a snapshot whose Docker refuses
 # io_uring is never made.
