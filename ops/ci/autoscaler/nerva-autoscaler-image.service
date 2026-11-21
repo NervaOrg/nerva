@@ -7,8 +7,11 @@ Wants=network-online.target
 Type=oneshot
 ExecStart=/usr/local/lib/nerva-ci/ci/autoscaler/nerva-autoscaler-image.sh build
 # The autoscaler reads the snapshot id when it starts: servers created after this restart use the new one.
-# try-restart: only if the owner left it running (a stopped autoscaler stays stopped); the leading - keeps
+# This runs only when the build succeeded (a failed ExecStart skips ExecStartPost), that is, only when there is a new
+# snapshot id (every build makes one) to pick up. try-restart: only if the owner left it running (a stopped autoscaler stays stopped); the leading - keeps
 # a failed restart from failing the build. It comes before the prune, so the old snapshot is not in use.
 ExecStartPost=-/usr/bin/systemctl try-restart nerva-autoscaler.service
 ExecStartPost=/usr/local/lib/nerva-ci/ci/autoscaler/nerva-autoscaler-image.sh prune
+# After a restart, which ends the autoscaler without a goodbye: warn (NRV-W1208, in the journal) of a server it left.
+ExecStartPost=-/usr/local/lib/nerva-ci/ci/autoscaler/nerva-autoscaler.sh check
 TimeoutStartSec=2h

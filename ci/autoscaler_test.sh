@@ -133,7 +133,9 @@ refuses "install without CI_GRPC_HOST (no ci.env)" NRV-E1238 inst
 echo 'CI_GRPC_HOST=' > "$tmp/ci.env"
 refuses "install with an empty CI_GRPC_HOST" NRV-E1238 inst
 echo 'CI_GRPC_HOST=grpc.example.org' > "$tmp/ci.env"
-refuses "the plaintext gRPC port" NRV-E1238 env NERVA_AS_GRPC=grpc.example.org:9000 bash "$as/nerva-autoscaler.sh" install
+for g in grpc.example.org:9000 grpc.example.org:09000 grpc.example.org:8000 grpc.example.org:80 grpc.example.org:4430 grpc.example.org:1443; do
+    refuses "the gRPC address $g is not :443" NRV-E1238 env NERVA_AS_GRPC=$g bash "$as/nerva-autoscaler.sh" install
+done
 # A bad value is refused before it is written, so it is never sourced (here: it would touch a file).
 refuses "a server that runs a command" NRV-E1238 env 'NERVA_AS_SERVER=https://x$(touch '"$tmp"'/pwned)' bash "$as/nerva-autoscaler.sh" install
 n=$((n + 1))
@@ -168,10 +170,22 @@ for f in autoscaler/nerva-autoscaler.sh autoscaler/nerva-autoscaler-image.sh aut
 done
 n=$((n + 1))
 [ -x "$tmp/lib/ci/autoscaler/nerva-autoscaler.sh" ] || bad "the installed nerva-autoscaler.sh is not executable"
-for f in nerva-autoscaler.service nerva-autoscaler-image.service nerva-autoscaler-image.timer; do
+for f in nerva-autoscaler.service nerva-autoscaler-image.service nerva-autoscaler-image.timer nerva-autoscaler-check.service nerva-autoscaler-check.timer; do
     n=$((n + 1))
     [ -f "$tmp/units/$f" ] || bad "install did not write $f"
 done
+# With systemd (a stub that logs), install enables both timers and try-restarts the autoscaler as its last step.
+cat > "$stubs/systemctl" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$STUB_LOG/systemctl.args"
+EOF
+chmod +x "$stubs/systemctl"
+: > "$STUB_LOG/systemctl.args"
+ok "install with systemd" env NERVA_AS_NO_SYSTEMD=0 bash "$as/nerva-autoscaler.sh" install
+has "install enables both timers" "$STUB_LOG/systemctl.args" '^enable --now nerva-autoscaler-image.timer nerva-autoscaler-check.timer$'
+n=$((n + 1))
+[ "$(tail -n 1 "$STUB_LOG/systemctl.args")" = "try-restart nerva-autoscaler.service" ] || bad "install does not end with a try-restart of the autoscaler: $(cat "$STUB_LOG/systemctl.args")"
+hasnt "install never starts a stopped autoscaler" "$STUB_LOG/systemctl.args" '^(restart|start) '
 ok "install again keeps and changes settings" env NERVA_AS_MAX=2 bash "$as/nerva-autoscaler.sh" install
 has "the cap changed" "$etc/autoscaler.conf" '^AS_MAX=2$'
 has "the server was kept" "$etc/autoscaler.conf" '^AS_SERVER=https://ci.example.org$'
@@ -209,6 +223,15 @@ servers '{"id":1},{"id":2},{"id":3}'
 out=$(bash "$as/nerva-autoscaler.sh" check 2>&1)
 n=$((n + 1))
 grep -q NRV-W1208 <<< "$out" || bad "no NRV-W1208 with 3 servers over a cap of 2: $out"
+# A cloud server over 12 hours old was leaked, whatever the count.
+servers '{"id":1,"created":"2020-01-01T00:00:00+00:00"}'
+out=$(bash "$as/nerva-autoscaler.sh" check 2>&1)
+n=$((n + 1))
+grep -q 'NRV-W1208.*over 12 hours' <<< "$out" || bad "no NRV-W1208 for a server over 12 hours old: $out"
+servers '{"id":1,"created":"2099-01-01T00:00:00+00:00"}'
+n=$((n + 1))
+if bash "$as/nerva-autoscaler.sh" check 2>&1 | grep -q 'over 12 hours'; then bad "a young server was called leaked"; fi
+servers '{"id":1},{"id":2},{"id":3}'
 has "the token went to curl on stdin" "$STUB_LOG/curl.stdin" "Bearer $token"
 hasnt "the token is not in curl's argv" "$STUB_LOG/curl.args" "SECRET"
 printf '{"error":{"message":"no"}}\n403' > "$STUB_API/GET__servers"
@@ -374,6 +397,9 @@ u="$as/nerva-autoscaler.service"
 has "the service removes a leftover container before it starts" "$u" '^ExecStartPre=-/usr/bin/docker rm -f nerva-autoscaler$'
 has "the service removes the container when it stops" "$u" '^ExecStop=-/usr/bin/docker rm -f nerva-autoscaler$'
 has "the service removes the container however it ended" "$u" '^ExecStopPost=-/usr/bin/docker rm -f nerva-autoscaler$'
+has "the image service runs the W1208 check after the restart" "$as/nerva-autoscaler-image.service" '^ExecStartPost=-/usr/local/lib/nerva-ci/ci/autoscaler/nerva-autoscaler.sh check$'
+has "the check service runs check" "$as/nerva-autoscaler-check.service" '^ExecStart=/usr/local/lib/nerva-ci/ci/autoscaler/nerva-autoscaler.sh check$'
+has "the check timer is hourly" "$as/nerva-autoscaler-check.timer" '^OnCalendar=hourly$'
 has "the image service only try-restarts the autoscaler" "$as/nerva-autoscaler-image.service" '^ExecStartPost=-/usr/bin/systemctl try-restart nerva-autoscaler.service$'
 hasnt "the image service never plain-restarts it" "$as/nerva-autoscaler-image.service" 'systemctl restart'
 n=$((n + 1))
@@ -431,13 +457,17 @@ shard_table() { # prints "class shard" for each class named in the table
 }
 shards_ok() { # shards_ok TABLE_FILE [TEST_FILE]: NRV-E1244 unless the table partitions the test file's classes
     local classes table c count
-    # Every class with a test* method, whatever its bases (a mixin, unittest.TestCase itself, another class).
-    classes=$(python3 -I -c '
-import ast, sys
-for node in ast.parse(open(sys.argv[1]).read()).body:
-    if isinstance(node, ast.ClassDef) and any(isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef)) and f.name.startswith("test") for f in node.body):
-        print(node.name)
-' "${2:-.github/scripts/test_package_repos.py}" | sort)
+    # Every unittest.TestCase class that unittest's own loader finds tests in, own or inherited, whatever its bases.
+    classes=$(cd "$(dirname "${2:-.github/scripts/test_package_repos.py}")" && python3 -I -c '
+import sys, unittest, importlib.util as u
+sys.path.insert(0, ".")
+spec = u.spec_from_file_location("t", sys.argv[1])
+m = u.module_from_spec(spec)
+spec.loader.exec_module(m)
+for name, c in vars(m).items():
+    if isinstance(c, type) and issubclass(c, unittest.TestCase) and c.__module__ == "t" and unittest.defaultTestLoader.getTestCaseNames(c):
+        print(name)
+' "$(basename "${2:-.github/scripts/test_package_repos.py}")" | sort)
     [ -n "$classes" ] || { echo "NRV-E1244: no test classes found"; return 1; }
     table=$(shard_table "$1")
     for c in $classes; do
@@ -449,10 +479,13 @@ for node in ast.parse(open(sys.argv[1]).read()).body:
     done
 }
 ok "the shards partition the package test classes" shards_ok ci/job.sh
-# A class that is not spelled `class X(Base):` is found too: a copy of the file with one such class added.
+# A class that is not spelled `class X(Base):` is found too, and so is one that only inherits its tests: a copy of the file with both added.
 cp .github/scripts/test_package_repos.py "$tmp/pkg_tests.py"
 printf '\nclass Extra(unittest.TestCase, object):\n    def test_x(self):\n        pass\n' >> "$tmp/pkg_tests.py"
 refuses "a class with other bases that is in no shard" NRV-E1244 shards_ok ci/job.sh "$tmp/pkg_tests.py"
+cp .github/scripts/test_package_repos.py "$tmp/pkg_tests.py"
+printf '\nclass ReadyIPv6(Ready):\n    maxDiff = None\n' >> "$tmp/pkg_tests.py"
+refuses "a subclass that only inherits its tests, in no shard" NRV-E1244 shards_ok ci/job.sh "$tmp/pkg_tests.py"
 sed 's/^package_shards_3="Bucket Publish"/package_shards_3="Bucket"/' ci/job.sh > "$tmp/job_missing.sh"
 refuses "a class in no shard" NRV-E1244 shards_ok "$tmp/job_missing.sh"
 sed 's/^package_shards_3="Bucket Publish"/package_shards_3="Bucket Publish Happy"/' ci/job.sh > "$tmp/job_twice.sh"

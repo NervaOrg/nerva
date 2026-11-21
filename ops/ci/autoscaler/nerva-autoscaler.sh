@@ -59,11 +59,18 @@ count_servers() { # the autoscaler's servers (label nerva-ci-pool=cloud), by the
     hcloud GET "/servers?label_selector=$POOL_LABEL%3Dcloud&per_page=50" | jq -r '.servers | length'
 }
 
+# check_cap: NRV-W1208 for more cloud servers than the cap, and for any older than 12 hours: a server is deleted
+# after AS_IDLE (at most 60m) once its workflow ends, so one that old was leaked (a killed autoscaler, a lost reply).
+# nerva-autoscaler-check.timer runs it hourly; the warning goes to the journal.
 check_cap() {
-    local n
+    local n old
     n=$(count_servers)
     if [ "$n" -gt "$AS_MAX" ]; then
         echo "$tool: warning: NRV-W1208: $n servers carry the label $POOL_LABEL=cloud but the cap is $AS_MAX: delete the extra ones in the Hetzner console (a server left behind is billed by the hour)" >&2
+    fi
+    old=$(hcloud GET "/servers?label_selector=$POOL_LABEL%3Dcloud&per_page=50" | jq -r '[.servers[] | select(.created != null and ((.created | sub("(\\.[0-9]+)?(\\+00:00|Z)$"; "Z") | fromdateiso8601) < (now - 43200)))] | length')
+    if [ "$old" -gt 0 ]; then
+        echo "$tool: warning: NRV-W1208: $old servers carry the label $POOL_LABEL=cloud and are over 12 hours old: a cloud server is deleted when idle (at most 60 minutes), so these were leaked: delete them in the Hetzner console" >&2
     fi
     say "$n of at most $AS_MAX cloud servers exist"
 }
@@ -140,14 +147,17 @@ install_all() {
     for k in $keys; do printf '%s=%s\n' "$k" "${!k}" >> "$conf.new"; done
     mv "$conf.new" "$conf"
     install_tree
-    for f in nerva-autoscaler.service nerva-autoscaler-image.service nerva-autoscaler-image.timer; do
+    for f in nerva-autoscaler.service nerva-autoscaler-image.service nerva-autoscaler-image.timer nerva-autoscaler-check.service nerva-autoscaler-check.timer; do
         install -m 0644 "$here/$f" "$units/$f"
     done
     secrets_ok
     help_check
     if [ "${NERVA_AS_NO_SYSTEMD:-}" != 1 ]; then
         systemctl daemon-reload
-        systemctl enable --now nerva-autoscaler-image.timer
+        systemctl enable --now nerva-autoscaler-image.timer nerva-autoscaler-check.timer
+        # A running autoscaler keeps the settings and the template it started with: restart it, so that a lowered
+        # cap holds now (try-restart: a service the owner stopped stays stopped).
+        systemctl try-restart nerva-autoscaler.service
     fi
     say "OK installed (cap $AS_MAX x $AS_SERVER_TYPE in $AS_LOCATION, idle $AS_IDLE); next: nerva-autoscaler-image.sh build, then systemctl enable --now nerva-autoscaler.service"
 }

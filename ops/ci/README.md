@@ -540,10 +540,10 @@ when this was written.
    labels the workflows**, or no agent takes them.
 4. The cloud agents reach the server like any remote agent (section 4): at `CI_GRPC_HOST:443`, with TLS,
    through Caddy. Set `CI_GRPC_HOST` in `/etc/woodpecker/ci.env` (the bootstrap asks for it) if it is
-   empty; `install` reads it, and nothing else needs opening: do not expose port 9000.
+   empty; `install` reads it (and refuses a gRPC address that does not end in `:443`), and nothing else needs opening: do not expose port 9000.
 5. Install: `NERVA_AS_SERVER=https://ci.botpike.com NERVA_AS_LOCATION=fsn1 NERVA_AS_MAX=4 bash ci/autoscaler/nerva-autoscaler.sh install`
    (`NERVA_AS_SERVER_TYPE=ccx43` for bigger servers; `NERVA_AS_MAX` is the hard cap, 1 to 16;
-   `NERVA_AS_IDLE` defaults to 10m). Run it again to change one setting.
+   `NERVA_AS_IDLE` defaults to 10m). Run it again to change one setting: `install` ends by restarting the autoscaler if it is running, so a lowered cap holds at once (one the owner stopped stays stopped).
 6. Build the first snapshot (needs a finished pipeline on main, whose cache is the seed; about 15 minutes):
    `/usr/local/lib/nerva-ci/ci/autoscaler/nerva-autoscaler-image.sh build`. The timer then rebuilds it nightly and keeps two.
 7. `systemctl enable --now nerva-autoscaler.service`. `nerva-autoscaler.sh status` lists the servers.
@@ -551,7 +551,7 @@ when this was written.
    minutes after its last workflow. If `journalctl -u nerva-autoscaler` shows an unknown flag, the pin and
    `run` disagree (NRV-E1240).
 
-To stop all spending: `systemctl disable --now nerva-autoscaler.service nerva-autoscaler-image.timer`, then
+To stop all spending: `systemctl disable --now nerva-autoscaler.service nerva-autoscaler-image.timer nerva-autoscaler-check.timer`, then
 delete any server labelled `nerva-ci-pool` and the snapshots in the console. The box (`tier=*`) takes the
 cloud workflows too, so nothing else changes.
 
@@ -582,7 +582,7 @@ the Woodpecker token and gives each server its own agent token in its user data.
   labels, the autoscaler 2.1.0's settings (NRV-E1240 checks at install that `--help` lists every variable `run` passes;
   `WOODPECKER_FILTER_LABELS`, which keeps box-only work from creating servers, is the one that matters most and
   was not read from its source), that the `DOCKER-USER` drop stops a job reaching 169.254.169.254 on a real
-  server (a host-network step or a `docker.sock` mount still can), and the timings.
+  server (a host-network step, a `docker.sock` mount or a host-path volume mount still can), that a server whose agent start is refused (the block failed) powers itself off, that autoscaler 2.1.0 adopts its servers when restarted, and the timings.
 - Nerva's workflows, after decision O4 (no step privileged; main and branch caches):
   - **Run (in a scratch directory, by `ci/ci_test.sh`, in `check-scripts`):** every refusal of
     the `ci/` scripts but E1203, E1209 and E1210 (E1201 with a stand-in for the kernel's refusal; E1202 for a writable main cache in a branch's role and a

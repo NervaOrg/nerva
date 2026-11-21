@@ -47,7 +47,7 @@ conf_check() {
     done
     [[ "$AS_SERVER" =~ ^https://[A-Za-z0-9.-]+$ ]] || fail "NRV-E1238: AS_SERVER='$AS_SERVER' is not https://HOST"
     [[ "$AS_GRPC" =~ ^[A-Za-z0-9.-]+:[0-9]+$ ]] || fail "NRV-E1238: AS_GRPC='$AS_GRPC' is not HOST:PORT"
-    [[ "$AS_GRPC" != *:9000 ]] || fail "NRV-E1238: AS_GRPC='$AS_GRPC' is the server's plaintext port, which is not published and cannot take TLS: use CI_GRPC_HOST:443, through Caddy"
+    [[ "$AS_GRPC" == *:443 ]] || fail "NRV-E1238: AS_GRPC='$AS_GRPC' does not end in :443: Caddy's 443 is the only gRPC port the bootstrap publishes (the server's 9000 is plaintext and not published): use CI_GRPC_HOST:443"
     [[ "$AS_LOCATION" =~ ^[a-z]{3}[0-9]$ ]] || fail "NRV-E1238: AS_LOCATION='$AS_LOCATION' is not a Hetzner location such as fsn1 (use the box's)"
     [[ "$AS_SERVER_TYPE" =~ ^ccx(33|43)$ ]] || fail "NRV-E1238: AS_SERVER_TYPE='$AS_SERVER_TYPE' is not ccx33 or ccx43 (dedicated vCPUs: shared ones make timings noisy)"
     { [[ "$AS_MAX" =~ ^[0-9]+$ ]] && [ "$AS_MAX" -ge 1 ] && [ "$AS_MAX" -le "$CAP_MAX" ]; } || fail "NRV-E1238: AS_MAX='$AS_MAX' is not a number from 1 to $CAP_MAX (the hard cap on cloud servers)"
