@@ -7,6 +7,7 @@ import io
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -1139,22 +1140,32 @@ class Nightly(unittest.TestCase):
         self.commit(remote, message)
 
     def test_the_lock_is_held_by_the_night_and_not_by_its_children(self):
-        # The lock is held while run.sh runs, and run.sh (a child) has no fd 9, so an orphan
-        # cannot keep it. flock locks belong to the open file description, so a fresh open of the
-        # lock file cannot take it while the night holds it (no inode numbers: overlayfs has none
-        # that match /proc/locks).
+        # The lock is held while run.sh runs, and run.sh (a child) holds no copy of it, so an
+        # orphan cannot keep it. The probe asks three things: does a fresh open of the lock file
+        # fail to take it (flock -n exits 1; any other status is reported as rc<N>); does the
+        # night itself (the pid in nightly.pid) hold a FLOCK, so that it is the night and not some
+        # other process that holds it (fdinfo/*, not fdinfo/9: bash moves its fd 9 while it runs
+        # a command with 9>&-); and does the child have any fd that is the lock file. No inode
+        # numbers are compared: the CI box's lock check by inode did not match, and its cause is
+        # unconfirmed (it did not reproduce on kernel 6.18), so the probe avoids inodes either way.
         probe = Path(self.tmp.name, "probe")
         lock = self.home / "nightly.lock"
+        pid = self.home / "nightly.pid"
         run = ("#!/bin/sh\n"
-               f"if flock -n {lock} true; then lock=free; else lock=held; fi\n"
-               "fd=no; [ -e /proc/$$/fd/9 ] && fd=yes\n"
-               f"echo \"$lock $fd\" > {probe}\nexit 0\n")
+               f"lock={shlex.quote(str(lock))}\n"
+               'flock -n "$lock" true; rc=$?\n'
+               'case $rc in 1) held=held;; 0) held=free;; *) held=rc$rc;; esac\n'
+               "night=no\n"
+               f"grep -qs FLOCK /proc/$(cat {shlex.quote(str(pid))})/fdinfo/* && night=yes\n"
+               "copy=no\n"
+               'for fd in /proc/$$/fd/*; do [ "$(readlink "$fd")" = "$lock" ] && copy=yes; done\n'
+               f'echo "$held $night $copy" > {shlex.quote(str(probe))}\nexit 0\n')
         Path(self.remote, "tests/jepsen/run.sh").write_text(run)
         self.git(self.remote, "add", "-A")
         self.commit(self.remote, "probe")
         done = self.night("--dry-run")
         self.assertEqual(done.returncode, 0, done.stderr)
-        self.assertEqual(probe.read_text().split(), ["held", "no"], probe.read_text())
+        self.assertEqual(probe.read_text().split(), ["held", "yes", "no"], probe.read_text())
 
     def test_a_second_night_cannot_start_while_the_lock_is_held(self):
         self.holding()
