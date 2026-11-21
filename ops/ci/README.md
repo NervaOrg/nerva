@@ -575,10 +575,14 @@ the Woodpecker token and gives each server its own agent token in its user data.
 
   The first run on a new box is the test. A `FAIL` line says what to fix.
 - Cloud agents (decision O6): `ci/autoscaler_test.sh` (in `check-scripts`) runs the scripts against stub
-  `docker` and `curl`: settings, secret files, the container's arguments, the cap warning, snapshot pruning,
-  the pins against `zig/download.sh` and the bootstrap, the tier labels and the package shards.
+  `docker`, `curl`, `ssh` and `rsync`: settings, secret files, the container's arguments, the cap warning, snapshot
+  pruning, the build from the installed tree, its exit trap and sweep, each NRV-E1239 path, the units and
+  the template, the pins against `zig/download.sh` and the bootstrap, the tier labels and the package shards.
   **Not run:** a real Hetzner project, the autoscaler itself, a snapshot build, a pipeline on the new
-  labels, the autoscaler 2.1.0's flags (NRV-E1240 checks them at install), and the timings.
+  labels, the autoscaler 2.1.0's settings (NRV-E1240 checks at install that `--help` lists every variable `run` passes;
+  `WOODPECKER_FILTER_LABELS`, which keeps box-only work from creating servers, is the one that matters most and
+  was not read from its source), that the `DOCKER-USER` drop stops a job reaching 169.254.169.254 on a real
+  server (a host-network step or a `docker.sock` mount still can), and the timings.
 - Nerva's workflows, after decision O4 (no step privileged; main and branch caches):
   - **Run (in a scratch directory, by `ci/ci_test.sh`, in `check-scripts`):** every refusal of
     the `ci/` scripts but E1203, E1209 and E1210 (E1201 with a stand-in for the kernel's refusal; E1202 for a writable main cache in a branch's role and a
