@@ -123,6 +123,16 @@ secret woodpecker.token "wp-SECRET-5678"
 inst() { bash "$as/nerva-autoscaler.sh" install; }
 refuses "install without a server" NRV-E1238 inst
 export NERVA_AS_SERVER=https://ci.example.org
+export NERVA_WP_ENV="$tmp/ci.env"
+refuses "install without CI_GRPC_HOST (no ci.env)" NRV-E1238 inst
+echo 'CI_GRPC_HOST=' > "$tmp/ci.env"
+refuses "install with an empty CI_GRPC_HOST" NRV-E1238 inst
+echo 'CI_GRPC_HOST=grpc.example.org' > "$tmp/ci.env"
+refuses "the plaintext gRPC port" NRV-E1238 env NERVA_AS_GRPC=grpc.example.org:9000 bash "$as/nerva-autoscaler.sh" install
+# A bad value is refused before it is written, so it is never sourced (here: it would touch a file).
+refuses "a server that runs a command" NRV-E1238 env 'NERVA_AS_SERVER=https://x$(touch '"$tmp"'/pwned)' bash "$as/nerva-autoscaler.sh" install
+n=$((n + 1))
+{ [ ! -e "$tmp/pwned" ] && [ ! -e "$etc/autoscaler.conf" ]; } || bad "a refused setting was written to the conf or run"
 refuses "a shared-vCPU server type" NRV-E1238 env NERVA_AS_SERVER_TYPE=cx32 bash "$as/nerva-autoscaler.sh" install
 refuses "a cap of 0" NRV-E1238 env NERVA_AS_MAX=0 bash "$as/nerva-autoscaler.sh" install
 refuses "a cap over the maximum" NRV-E1238 env NERVA_AS_MAX=17 bash "$as/nerva-autoscaler.sh" install
@@ -134,7 +144,7 @@ echo "--max-agents" > "$tmp/nohelp.txt"
 rm -f "$etc/autoscaler.conf"
 ok "install" inst
 has "conf has the server" "$etc/autoscaler.conf" '^AS_SERVER=https://ci.example.org$'
-has "conf derives the gRPC address" "$etc/autoscaler.conf" '^AS_GRPC=ci.example.org:9000$'
+has "conf takes the gRPC address from the bootstrap's CI_GRPC_HOST, on 443" "$etc/autoscaler.conf" '^AS_GRPC=grpc.example.org:443$'
 has "conf has the default cap" "$etc/autoscaler.conf" '^AS_MAX=4$'
 has "conf has the dedicated type" "$etc/autoscaler.conf" '^AS_SERVER_TYPE=ccx33$'
 hasnt "conf holds no secret" "$etc/autoscaler.conf" "SECRET"
@@ -166,6 +176,8 @@ has "run drops every capability" "$a" '--cap-drop ALL'
 has "run has no new privileges" "$a" 'no-new-privileges'
 hasnt "run is not privileged" "$a" '--privileged'
 hasnt "run has no Docker socket" "$a" 'docker.sock'
+has "run reaches the server through Caddy, with TLS" "$a" 'WOODPECKER_GRPC_ADDR=grpc.example.org:443'
+has "run uses TLS" "$a" 'WOODPECKER_GRPC_SECURE=true'
 has "run caps the servers" "$a" 'WOODPECKER_MAX_AGENTS=2'
 has "run names the snapshot" "$a" 'WOODPECKER_HETZNERCLOUD_IMAGE=4242'
 has "run uses a dedicated type in the box's location" "$a" 'WOODPECKER_HETZNERCLOUD_SERVER_TYPE=ccx33:fsn1'

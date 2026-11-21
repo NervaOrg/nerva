@@ -538,8 +538,9 @@ when this was written.
 3. Let the box take every tier: set `CI_EXTRA_LABELS=tier=*` in `/etc/woodpecker/ci.env` and rerun
    `bash ci/woodpecker-bootstrap.sh` when no pipeline runs. **Do this before merging the change that
    labels the workflows**, or no agent takes them.
-4. The cloud agents connect to the server's gRPC port (9000, over TLS through the same Caddy as remote
-   agents: section 4), so it must be reachable from the internet.
+4. The cloud agents reach the server like any remote agent (section 4): at `CI_GRPC_HOST:443`, with TLS,
+   through Caddy. Set `CI_GRPC_HOST` in `/etc/woodpecker/ci.env` (the bootstrap asks for it) if it is
+   empty; `install` reads it, and nothing else needs opening: do not expose port 9000.
 5. Install: `NERVA_AS_SERVER=https://ci.botpike.com NERVA_AS_LOCATION=fsn1 NERVA_AS_MAX=4 bash ci/autoscaler/nerva-autoscaler.sh install`
    (`NERVA_AS_SERVER_TYPE=ccx43` for bigger servers; `NERVA_AS_MAX` is the hard cap, 1 to 16;
    `NERVA_AS_IDLE` defaults to 10m). Run it again to change one setting.

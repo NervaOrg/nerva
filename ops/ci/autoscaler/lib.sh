@@ -30,22 +30,37 @@ secret_file() {
     [ -s "$1" ] || fail "NRV-E1237: $2 ($1) is empty"
 }
 
-# conf_load: reads $etc/autoscaler.conf and checks every setting here and nowhere else (NRV-E1238).
-conf_load() {
+# grpc_default: where remote agents reach the server's gRPC: the bootstrap's CI_GRPC_HOST on 443, through
+# Caddy, with TLS (ops/ci/woodpecker-bootstrap.sh). The server's own port 9000 is plaintext and not published.
+grpc_default() {
+    local h="" env="${NERVA_WP_ENV:-/etc/woodpecker/ci.env}"
+    [ ! -f "$env" ] || h=$(sed -n 's/^CI_GRPC_HOST=//p' "$env" | tail -n 1)
+    [[ "$h" =~ ^[A-Za-z0-9.-]+$ ]] || fail "NRV-E1238: CI_GRPC_HOST is not set in $env: it is the DNS name remote agents use through Caddy (woodpecker-bootstrap.sh asks for it); or give NERVA_AS_GRPC=HOST:443"
+    printf '%s:443\n' "$h"
+}
+
+# conf_check: checks every AS_* setting (variables set in this shell) here and nowhere else (NRV-E1238).
+conf_check() {
     local v
-    [ -f "$etc/autoscaler.conf" ] || fail "NRV-E1238: $etc/autoscaler.conf is missing: run nerva-autoscaler.sh install first"
-    # shellcheck disable=SC1091
-    . "$etc/autoscaler.conf"
     for v in AS_SERVER AS_GRPC AS_LOCATION AS_SERVER_TYPE AS_MAX AS_IDLE AS_TIER; do
         [ -n "${!v:-}" ] || fail "NRV-E1238: $v is not set in $etc/autoscaler.conf"
     done
     [[ "$AS_SERVER" =~ ^https://[A-Za-z0-9.-]+$ ]] || fail "NRV-E1238: AS_SERVER='$AS_SERVER' is not https://HOST"
     [[ "$AS_GRPC" =~ ^[A-Za-z0-9.-]+:[0-9]+$ ]] || fail "NRV-E1238: AS_GRPC='$AS_GRPC' is not HOST:PORT"
+    [[ "$AS_GRPC" != *:9000 ]] || fail "NRV-E1238: AS_GRPC='$AS_GRPC' is the server's plaintext port, which is not published and cannot take TLS: use CI_GRPC_HOST:443, through Caddy"
     [[ "$AS_LOCATION" =~ ^[a-z]{3}[0-9]$ ]] || fail "NRV-E1238: AS_LOCATION='$AS_LOCATION' is not a Hetzner location such as fsn1 (use the box's)"
     [[ "$AS_SERVER_TYPE" =~ ^ccx(33|43)$ ]] || fail "NRV-E1238: AS_SERVER_TYPE='$AS_SERVER_TYPE' is not ccx33 or ccx43 (dedicated vCPUs: shared ones make timings noisy)"
     { [[ "$AS_MAX" =~ ^[0-9]+$ ]] && [ "$AS_MAX" -ge 1 ] && [ "$AS_MAX" -le "$CAP_MAX" ]; } || fail "NRV-E1238: AS_MAX='$AS_MAX' is not a number from 1 to $CAP_MAX (the hard cap on cloud servers)"
     { [[ "$AS_IDLE" =~ ^[0-9]+m$ ]] && [ "${AS_IDLE%m}" -ge 1 ] && [ "${AS_IDLE%m}" -le 60 ]; } || fail "NRV-E1238: AS_IDLE='$AS_IDLE' is not minutes from 1m to 60m"
     [ "$AS_TIER" = cloud ] || fail "NRV-E1238: AS_TIER='$AS_TIER' must be cloud (the label cloud agents carry, decision O6)"
+}
+
+# conf_load: reads $etc/autoscaler.conf, which install wrote only after conf_check accepted its values, and checks it again.
+conf_load() {
+    [ -f "$etc/autoscaler.conf" ] || fail "NRV-E1238: $etc/autoscaler.conf is missing: run nerva-autoscaler.sh install first"
+    # shellcheck disable=SC1091
+    . "$etc/autoscaler.conf"
+    conf_check
 }
 
 # hcloud METHOD PATH [JSON]: one Hetzner Cloud API call. The token is read from its file and handed to

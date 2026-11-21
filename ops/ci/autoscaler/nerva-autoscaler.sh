@@ -11,7 +11,8 @@
 #   an existing line is kept unless its NERVA_AS_* variable is given), installs the systemd units and
 #   enables the nightly snapshot timer. Run it again to change a setting. It checks the two secret
 #   files (below) and that the pinned autoscaler has the flags this script passes (NRV-E1240).
-#   Settings (variables, default): NERVA_AS_SERVER (required), NERVA_AS_GRPC (HOST:9000 of the server),
+#   Settings (variables, default): NERVA_AS_SERVER (required), NERVA_AS_GRPC (CI_GRPC_HOST:443 from
+#   /etc/woodpecker/ci.env: remote agents reach the server through Caddy with TLS, never on port 9000),
 #   NERVA_AS_LOCATION (fsn1: use the box's), NERVA_AS_SERVER_TYPE (ccx33; or ccx43), NERVA_AS_MAX (4,
 #   the hard cap on servers, 1 to 16), NERVA_AS_IDLE (10m).
 #   `check`  validates the settings, the secrets and the snapshot, and counts the servers (NRV-W1208).
@@ -26,7 +27,7 @@
 #
 # Where it looks, for ci/autoscaler_test.sh (which runs it with stubs): NERVA_CI_ETC (/etc/nerva-ci),
 # NERVA_AS_LIB (/usr/local/lib/nerva-ci), NERVA_AS_UNITS (/etc/systemd/system), NERVA_AS_NO_SYSTEMD=1
-# (do not run systemctl) and NERVA_HCLOUD_API.
+# (do not run systemctl), NERVA_WP_ENV (/etc/woodpecker/ci.env) and NERVA_HCLOUD_API.
 # shellcheck disable=SC2154,SC2034 # etc, tool and the pins come from lib.sh (not followed: no -x)
 set -euo pipefail
 
@@ -94,27 +95,30 @@ install_tree() {
 }
 
 install_all() {
-    local conf="$etc/autoscaler.conf" k v f
+    local conf="$etc/autoscaler.conf" k v f keys="AS_SERVER AS_GRPC AS_LOCATION AS_SERVER_TYPE AS_MAX AS_IDLE AS_TIER"
     [ "$(id -u)" = "${NERVA_CI_ROOT_UID:-0}" ] || fail "NRV-E1239: run as root"
     need_tools docker curl jq
     mkdir -p "$etc" "$lib" "$units"
     chmod 0755 "$etc"
-    if [ ! -f "$conf" ]; then : > "$conf"; fi
     declare -A want=(
         [AS_SERVER]="${NERVA_AS_SERVER:-}" [AS_GRPC]="${NERVA_AS_GRPC:-}" [AS_LOCATION]="${NERVA_AS_LOCATION:-}"
         [AS_SERVER_TYPE]="${NERVA_AS_SERVER_TYPE:-}" [AS_MAX]="${NERVA_AS_MAX:-}" [AS_IDLE]="${NERVA_AS_IDLE:-}" [AS_TIER]=""
     )
     declare -A dflt=([AS_LOCATION]=fsn1 [AS_SERVER_TYPE]=ccx33 [AS_MAX]=4 [AS_IDLE]=10m [AS_TIER]=cloud)
-    if [ -n "${NERVA_AS_SERVER:-}" ] && [ -z "${NERVA_AS_GRPC:-}" ]; then want[AS_GRPC]="${NERVA_AS_SERVER#https://}:9000"; fi
-    for k in AS_SERVER AS_GRPC AS_LOCATION AS_SERVER_TYPE AS_MAX AS_IDLE AS_TIER; do
+    # A setting is the variable's value, else the line already in the conf, else its default. All of them
+    # are checked before anything is written: the conf is sourced on every start, so it never holds a
+    # value that was not checked (NRV-E1238).
+    for k in $keys; do
         v="${want[$k]}"
-        if [ -z "$v" ]; then v=$(sed -n "s/^$k=//p" "$conf" | tail -n 1); fi
+        if [ -z "$v" ] && [ -f "$conf" ]; then v=$(sed -n "s/^$k=//p" "$conf" | tail -n 1); fi
         if [ -z "$v" ]; then v="${dflt[$k]:-}"; fi
-        { grep -v "^$k=" "$conf" || true; } > "$conf.new"
-        printf '%s=%s\n' "$k" "$v" >> "$conf.new"
-        mv "$conf.new" "$conf"
+        if [ -z "$v" ] && [ "$k" = AS_GRPC ]; then v=$(grpc_default); fi
+        printf -v "$k" '%s' "$v"
     done
-    conf_load
+    conf_check
+    : > "$conf.new"
+    for k in $keys; do printf '%s=%s\n' "$k" "${!k}" >> "$conf.new"; done
+    mv "$conf.new" "$conf"
     install_tree
     for f in nerva-autoscaler.service nerva-autoscaler-image.service nerva-autoscaler-image.timer; do
         install -m 0644 "$here/$f" "$units/$f"
