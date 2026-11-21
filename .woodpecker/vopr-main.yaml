@@ -1,0 +1,42 @@
+# Woodpecker, on the project's own machine (ops/ci/README.md, "Nerva on Woodpecker"). Pushes to any
+# branch of NervaOrg/nerva but jepsen/**, and manual runs without NERVA_RUN: never a pull request,
+# so never a fork's code (P147e; the repository's "Allow pull requests" is off as well). The
+# commands are ci/job.sh's, the same as ci.yml's job of the same name.
+# main, in ReleaseSafe (N74): the fixed seeds, then four lanes that each search fresh random seeds
+# for 6 minutes (.github/scripts/fuzz_loop.sh). A failing seed stops its lane and prints the
+# command that replays it.
+# Caches (decision O4): a step for a push to main mounts main's cache writable and no branch's; any
+# other step mounts main's read-only and its own branches' directory writable. The two steps are
+# exclusive by `when:`, so a branch's pipeline never gets main's cache writable: the mount, not the
+# script, enforces it. Steps are not privileged; io_uring comes from the host Docker daemon's
+# seccomp profile (ops/ci/docker/README.md).
+
+matrix:
+  LANE: [fixed, random-1, random-2, random-3, random-4]
+
+when:
+  - event: [push, manual]
+    branch: main
+    evaluate: 'CI_PIPELINE_EVENT == "push" || NERVA_RUN == ""'
+
+steps:
+  - name: vopr (main, ${LANE}) (main)
+    image: docker.io/library/ubuntu:24.04@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8
+    commands:
+      - ci/woodpecker_step.sh vopr-main "${LANE}"
+    when:
+      - event: push
+        branch: main
+    volumes:
+      - /var/cache/nerva-ci/main:/cache/main
+      - /var/cache/nerva-ci/locks:/cache/locks
+  - name: vopr (main, ${LANE})
+    image: docker.io/library/ubuntu:24.04@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8
+    commands:
+      - ci/woodpecker_step.sh vopr-main "${LANE}"
+    when:
+      - evaluate: 'CI_PIPELINE_EVENT != "push" || CI_COMMIT_BRANCH != "main"'
+    volumes:
+      - /var/cache/nerva-ci/main:/cache/main:ro
+      - /var/cache/nerva-ci/locks:/cache/locks
+      - /var/cache/nerva-ci/branches:/cache/branches

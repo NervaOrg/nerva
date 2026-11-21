@@ -18,6 +18,12 @@ ExecStart=/var/lib/sim-fleet/nerva/ops/sim-fleet/run.sh
 Restart=always
 RestartSec=30
 Nice=10
+# The fleet takes only the CPU and disk time nothing else wants. Nice orders processes inside one
+# cgroup only; CI's step containers and Jepsen's nodes are cgroups beside this one, so with Nice
+# alone the fleet took an equal share against each and starved a CI replica past its 30 s request
+# timeout. `idle` needs systemd 252 or later (Ubuntu 24.04 has 255); an older one ignores the line.
+CPUWeight=idle
+IOWeight=10
 # The loop has its own deadlines (run.sh); this bounds a hang of the shell itself.
 TimeoutStopSec=60
 # 64 GB host: the fleet may not take the last GBs from sshd and the journal. A seed the kernel

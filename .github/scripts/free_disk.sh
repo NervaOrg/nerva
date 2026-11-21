@@ -13,7 +13,10 @@ set -euo pipefail
 
 free_min_gib=${FREE_MIN_GIB:-6}
 cache="${XDG_CACHE_HOME:-$HOME/.cache}"
-toolchain="zig-$(sha256sum zig/download.sh | cut -c1-16)"
+# The pinned archive is kept as <sha256>.tar.xz (ci/install_zig.sh); its sha256 is in download.sh.
+case "$(uname -m)" in arm64 | aarch64) arch=aarch64 ;; *) arch=x86_64 ;; esac
+pinned=$(grep -E "/zig-$arch-linux-[0-9.]+\.tar\.xz [0-9a-f]{64}\$" zig/download.sh | head -1 | awk '{print $2}' || true)
+toolchain="${pinned:-none}.tar.xz"
 mkdir -p "$cache"
 
 free_gib() {
