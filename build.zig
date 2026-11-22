@@ -123,6 +123,10 @@ pub fn build(b: *std.Build) !void {
         .test_unit_build = b.step("test:unit:build", "Build unit tests"),
         .test_fmt = b.step("test:fmt", "Check formatting"),
         .test_integration = b.step("test:integration", "Run integration tests (real processes)"),
+        .test_integration_build = b.step(
+            "test:integration:build",
+            "Compile what test:integration runs, without running it (CI: O12)",
+        ),
         .test_api = b.step("test:api", "Check nerva api against models (python3)"),
         .test_views = b.step("test:views", "Check declared views against a model (python3)"),
         .test_release = b.step(
@@ -462,6 +466,9 @@ pub fn build(b: *std.Build) !void {
     run_integration_tests.setCwd(b.path("."));
     run_integration_tests.has_side_effects = true; // Never cache: it runs real processes.
     steps.test_integration.dependOn(&run_integration_tests.step);
+    // Compiled into the cache, not run: `test:integration` then compiles nothing (CI, O12).
+    steps.test_integration_build.dependOn(&integration_tests.step);
+    steps.test_integration_build.dependOn(&nerva_keys_off.step);
 
     // The coded failures of every command, from the real binary (R5, P147c).
     const run_errors_test = b.addSystemCommand(&.{ "python3", "tests/errors/commands.py" });

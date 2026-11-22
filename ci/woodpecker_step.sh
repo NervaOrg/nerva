@@ -66,10 +66,9 @@ test_minutes="${CI_SCRIPTS_TEST_MINUTES:-20}"
 
 # The box lock (decision O12, ci_box_lock in ci/cache.sh) is taken far below, around the job's run
 # alone: never around the package install, the seed copy or the tail, and not at all by a Markdown-only
-# run (N68), which exits before it.
+# run (N68), which exits before it (and before ci_locks_check, so that run never looks at locks/).
 . ci/cache.sh
 ci_knobs_check || exit 2
-ci_locks_check "$cache" || exit 1
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get -o Acquire::Retries=5 update -qq
@@ -99,6 +98,7 @@ case "$job" in check | check-scripts | check-packages) ci/install_repo_tools.sh 
 CI_JOB_USER="$user" # ci_as_job: what root would make in a cache the job writes, the job's user makes
 id "$user" >/dev/null 2>&1 || useradd --create-home --uid 1001 --user-group "$user"
 chown -R "$user:$user" "$PWD"
+ci_locks_check "$cache" || exit 1
 ci_cache_check "$role" "$cache" || exit 1
 # What an earlier step left in the trash of the mount this one writes is removed BEFORE the disk is
 # measured: its blocks and inodes are what made the disk look low, and a step that measures first
@@ -215,44 +215,24 @@ if [ "$job" = check-scripts ]; then reserved=$((test_minutes * 60 + ${CI_KILL_AF
 # check-scripts the root tests run first, bounded by CI_SCRIPTS_TEST_MINUTES, not by the job's whole
 # limit; either failing fails the step. A job with no time left is not started, and a shortened one
 # names the repository's Timeout in its NRV-E1215.) The tail below runs whatever the status.
-# The box lock (decision O12; ci_box_lock, ci_box_unlock in ci/cache.sh) covers the job's run alone and
-# is let go before the tail. fuzz-long, vopr-long and jepsen are long jobs: they take no lock, so they
-# never keep integration waiting (and integration's timing can suffer beside them: accepted, O12).
-# integration builds first (a shared run: another integration's test must not run beside a build), then
-# runs its test exclusively, bounded by CI_INTEGRATION_RUN_MINUTES, so what everyone waits for is a test.
-# The shared lock is let go before the exclusive one is taken (never wait for an exclusive lock while
-# holding a shared one: two integration steps would deadlock). A wait that fails (NRV-E1245) fails the
-# step, which goes on to its tail.
+# The box lock (decision O12; ci_step_job_in_box, ci_step_integration in ci/cache.sh, with their tests)
+# covers the job's run alone and is let go before the tail. fuzz-long, vopr-long and jepsen are long
+# jobs: they take no lock, so they never keep integration waiting (and integration's timing can suffer
+# beside them: accepted, O12). integration builds first (`ci/job.sh integration-build` compiles
+# everything its test needs; a shared run, so no compile runs beside another integration's test), then
+# runs its test alone, exclusive, bounded by CI_INTEGRATION_RUN_MINUTES, so what everyone waits for is
+# the test and nothing else. A wait that fails (NRV-E1245) fails the step, which goes on to its tail.
 case "$job" in
     fuzz-long | vopr-long | jepsen) box=none ;;
     integration) box=integration ;;
     *) box=shared ;;
 esac
-# run_in_box MODE NAME MINUTES JOB_ARRAY: ci_step_job for the array's command, inside the box lock when MODE is one.
-run_in_box() {
-    local mode="$1" rc=0
-    if [ "$mode" = none ]; then
-        ci_step_job "$2" "$3" "$reserved" "$((test_minutes * 60))" tests_cmd "$4"
-        return
-    fi
-    ci_box_lock "$mode" "$cache/locks" || return 1
-    ci_step_job "$2" "$3" "$reserved" "$((test_minutes * 60))" tests_cmd "$4" || rc=$?
-    ci_box_unlock
-    return "$rc"
-}
 if [ "$box" = integration ]; then
     # shellcheck disable=SC2034 # a nameref array, read by ci_step_run_with_tests
     build_cmd=("${as_ci[@]}" ci/job.sh integration-build)
-    unset CI_TIMEOUT_KNOB
-    run_in_box shared "integration's build" "$minutes" build_cmd || status=$?
-    if [ "$status" = 0 ]; then
-        run_minutes="${CI_INTEGRATION_RUN_MINUTES:-30}"
-        [ "$run_minutes" -le "$minutes" ] || run_minutes=$minutes
-        export CI_TIMEOUT_KNOB="CI_INTEGRATION_RUN_MINUTES raises it for a run (CI_STEP_MINUTES caps it)"
-        run_in_box exclusive integration "$run_minutes" job_cmd || status=$?
-    fi
+    ci_step_integration "$cache/locks" "$minutes" "$reserved" "$((test_minutes * 60))" tests_cmd build_cmd job_cmd || status=$?
 else
-    run_in_box "$box" "$job" "$minutes" job_cmd || status=$?
+    ci_step_job_in_box "$box" "$cache/locks" "$job" "$minutes" "$reserved" "$((test_minutes * 60))" tests_cmd job_cmd || status=$?
 fi
 # A Jepsen run holds the Jepsen lock exclusively for its whole run, so what is left of what its sweep
 # and its reset of the tools moved aside (both were drained at once, a bounded 20 s each) is removed

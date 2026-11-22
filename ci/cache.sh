@@ -718,6 +718,26 @@ ci_main_lock_open() {
     { exec 9<"$f"; } 2>/dev/null || { ci_lock_open_failed "$f" '<'; return 1; }
 }
 
+# ci_integration_run_minutes: the integration test run's limit, CI_INTEGRATION_RUN_MINUTES (default 20:
+# the run measured about 10 minutes with its build done, O12). One place for the step,
+# ci_box_wait_default and the tests.
+ci_integration_run_minutes() { echo "${CI_INTEGRATION_RUN_MINUTES:-20}"; }
+
+# ci_box_wait_default: CI_BOX_WAIT's default in seconds, derived from the limits that bound what a call
+# can wait behind (decision O12): the longest a SHORT job holds the box lock shared (its step limit,
+# CI_STEP_MINUTES, default 75, then for check-scripts the root tests' limit, CI_SCRIPTS_TEST_MINUTES,
+# default 20, each with CI_KILL_AFTER), plus one integration run (ci_integration_run_minutes with its
+# kill-after: a short job that arrives behind an integration step waits for the drain that step waits
+# for and then for its run), plus 5 minutes. A raised CI_STEP_MINUTES raises it. The values are ones the
+# step has validated (ci_knobs_check, woodpecker_step.sh); anything else counts as the default.
+ci_box_wait_default() {
+    local kill="${CI_KILL_AFTER:-60}" m="${CI_STEP_MINUTES:-}" t="${CI_SCRIPTS_TEST_MINUTES:-}" r
+    [[ "$m" =~ ^[1-9][0-9]*$ ]] || m=75
+    [[ "$t" =~ ^[1-9][0-9]*$ ]] || t=20
+    r=$(ci_integration_run_minutes)
+    echo $(((m * 60 + kill) + (t * 60 + kill) + (r * 60 + kill) + 300))
+}
+
 # ci_box_lock MODE LOCKS: the host-wide reader/writer lock around a SHORT job's run (decision O12).
 # A short job holds LOCKS/box.lock (fd 10) SHARED around its run alone (never its apt-get, its seed
 # copy or its tail), so short jobs run side by side; the integration job holds it EXCLUSIVE around
@@ -725,17 +745,18 @@ ci_main_lock_open() {
 # short job's run beside it (NervaOrg/nerva#11). The long jobs (fuzz-long, vopr-long, Jepsen) take no
 # lock at all and never wait for this one. flock is not fair: shared holders arriving one after another
 # would starve the exclusive waiter for ever. So every call first takes LOCKS/turnstile.lock (fd 11)
-# exclusively: a shared call lets it go as soon as it holds box.lock; the exclusive call HOLDS it (also
-# for the whole run) while it waits for box.lock, so no new short job gets in behind it. The order is
-# always turnstile then box, and a step NEVER waits for the turnstile or an exclusive lock while it
-# holds box.lock shared (two integration steps would deadlock): it calls ci_box_unlock first
-# (CI_BOX_HELD, set here and cleared there, refuses it: NRV-B1203). Both waits are bounded by CI_BOX_WAIT
-# (default 4800 s: the short jobs' own limit, 75 minutes, and five more, so a wait ends early only when
-# a job outlived its own limit): NRV-E1245, never a run without the lock. The wait is part of the step's
-# time like any pre-job time (ci_job_seconds counts from CI_STEP_START, NRV-W1207). The step closes fds
-# 10 and 11 for its children, as 6 to 9. MODE is shared or exclusive.
+# exclusively, and HOLDS it only while it waits for box.lock: it lets it go the moment it holds
+# box.lock, shared or exclusive. The turnstile is therefore never held longer than one wait for
+# box.lock, which that call's own budget bounds. The order is always turnstile then box, and a step
+# NEVER waits for the turnstile or an exclusive lock while it holds box.lock shared (two integration
+# steps would deadlock): it calls ci_box_unlock first (CI_BOX_HELD, set here and cleared there, refuses
+# it: NRV-B1203). The two waits of a call share ONE budget, CI_BOX_WAIT (default ci_box_wait_default,
+# derived from the jobs' limits): NRV-E1245 when flock reports the timeout (status 1), NRV-B1204 for
+# any other flock failure, never a run without the lock. The wait is part of the step's time like any
+# pre-job time (ci_job_seconds counts from CI_STEP_START, NRV-W1207). The step closes fds 10 and 11
+# for its children, as 6 to 9. MODE is shared or exclusive.
 ci_box_lock() {
-    local mode="$1" locks="$2" wait="${CI_BOX_WAIT:-4800}" f
+    local mode="$1" locks="$2" f budget end
     case "$mode" in
     shared | exclusive) ;;
     *)
@@ -748,6 +769,8 @@ ci_box_lock() {
         return 1
     fi
     ci_knobs_check || return 1
+    budget="${CI_BOX_WAIT:-$(ci_box_wait_default)}"
+    end=$((SECONDS + budget))
     for f in turnstile box; do ci_lock_file "$locks/$f.lock" || return 1; done
     # The opens are tested in a group and made bare: bash saves the stderr a group redirects in the
     # first free descriptor from 10 up, so an `exec 10<` INSIDE such a group is closed again when it ends.
@@ -757,13 +780,13 @@ ci_box_lock() {
     exec 11<"$locks/turnstile.lock" 10<"$locks/box.lock"
     # Held from here, so the failure paths below let go of what was taken (a failed step goes on to its tail).
     CI_BOX_HELD=$mode
-    ci_box_lock_wait "$mode" "$wait" 11 -x "$locks/turnstile.lock" || { ci_box_unlock; return 1; }
+    ci_box_lock_wait "$mode" "$budget" "$end" 11 -x "$locks/turnstile.lock" || { ci_box_unlock; return 1; }
     if [ "$mode" = shared ]; then
-        ci_box_lock_wait "$mode" "$wait" 10 -s "$locks/box.lock" || { ci_box_unlock; return 1; }
-        flock -u 11
+        ci_box_lock_wait "$mode" "$budget" "$end" 10 -s "$locks/box.lock" || { ci_box_unlock; return 1; }
     else
-        ci_box_lock_wait "$mode" "$wait" 10 -x "$locks/box.lock" || { ci_box_unlock; return 1; }
+        ci_box_lock_wait "$mode" "$budget" "$end" 10 -x "$locks/box.lock" || { ci_box_unlock; return 1; }
     fi
+    flock -u 11
 }
 
 # ci_box_unlock: lets go of the box lock and the turnstile (whichever are held) and closes fds 10 and
@@ -775,22 +798,62 @@ ci_box_unlock() {
     exec 10<&- 11<&-
 }
 
-# ci_box_lock_wait MODE SECONDS FD FLAG FILE: one bounded wait of ci_box_lock, NRV-E1245. The message
-# names who holds the lock: what a shared step waits for is an integration step (the turnstile or the
-# exclusive lock), what an integration step waits for is the short jobs running (and, at the turnstile,
-# another integration step).
+# ci_box_lock_wait MODE BUDGET END FD FLAG FILE: one wait of ci_box_lock, for what is left of the call's
+# budget (END is the $SECONDS it ends at; at least one second). flock's status 1 is the timeout
+# (NRV-E1245, naming who holds the lock); any other status (64 usage, 65 a bad descriptor: a caller
+# that put a redirection on the call of ci_box_lock, which takes fd 10 for the saved stderr) is no
+# wait at all (NRV-B1204).
 ci_box_lock_wait() {
-    local who
-    flock "$4" -w "$2" "$3" || {
-        case "$5:$1" in
-        */turnstile.lock:shared) who="an integration step holds the turnstile while it waits for the running jobs to end and then runs alone; it ends within CI_BOX_WAIT of its own start" ;;
-        */turnstile.lock:*) who="another integration step holds the turnstile while it waits for the running jobs to end and then runs alone" ;;
-        */box.lock:shared) who="an integration test run holds it exclusive (CI_INTEGRATION_RUN_MINUTES at most), or a process outside the steps" ;;
-        *) who="short jobs hold it shared while they run (a job past its own limit, or a process outside the steps; lslocks shows the pids); the long jobs hold none" ;;
-        esac
-        ci_error "NRV-E1245: the box lock $5 was not free for the $1 holder within $2 s: $who (decision O12); start this one again, or raise CI_BOX_WAIT"
+    local left=$(($3 - SECONDS)) rc=0 who
+    [ "$left" -ge 1 ] || left=1
+    flock "$5" -w "$left" "$4" || rc=$?
+    [ "$rc" != 0 ] || return 0
+    if [ "$rc" != 1 ]; then
+        ci_error "NRV-B1204: flock on the box lock $6 failed with status $rc, which is not a timeout: a descriptor the step did not open (a redirection on the call of ci_box_lock takes fd 10) or a bad flock command (a bug in the script that called it)"
         return 1
-    }
+    fi
+    case "$6:$1" in
+    */turnstile.lock:*) who="integration steps ahead of this one hold the turnstile one after another, each while it waits for the running jobs to end, and then run alone (CI_INTEGRATION_RUN_MINUTES each), or a process outside the steps does" ;;
+    */box.lock:shared) who="an integration test run holds it exclusive (CI_INTEGRATION_RUN_MINUTES at most), or a process outside the steps" ;;
+    *) who="short jobs hold it shared while they run (a job past its own limit, or a process outside the steps; lslocks shows the pids); the long jobs hold none" ;;
+    esac
+    ci_error "NRV-E1245: the box lock $6 was not free for the $1 holder within $2 s (turnstile and box together): $who (decision O12); start this one again, or raise CI_BOX_WAIT"
+    return 1
+}
+
+# ci_step_job_in_box MODE LOCKS JOB MINUTES RESERVED TEST_SECONDS TESTS_ARRAY JOB_ARRAY: ci_step_job
+# (the same arguments after LOCKS) inside the box lock, MODE shared or exclusive, or with none (MODE
+# none: the long jobs). The lock is let go right after the run, whatever its status, so no tail runs
+# under it. Status 1 and nothing run when the lock cannot be had (NRV-E1245 said so).
+ci_step_job_in_box() {
+    local mode="$1" locks="$2" rc=0
+    shift 2
+    if [ "$mode" = none ]; then
+        ci_step_job "$@"
+        return
+    fi
+    ci_box_lock "$mode" "$locks" || return 1
+    ci_step_job "$@" || rc=$?
+    ci_box_unlock
+    return "$rc"
+}
+
+# ci_step_integration LOCKS MINUTES RESERVED TEST_SECONDS TESTS_ARRAY BUILD_ARRAY JOB_ARRAY: the
+# integration job's run in the step (decision O12). First its build (BUILD_ARRAY, `ci/job.sh
+# integration-build`: everything the test needs, compiled and not run) as a SHARED run, so that no
+# compile runs beside another integration's test; the shared lock is let go; then its test (JOB_ARRAY)
+# EXCLUSIVE, bounded by ci_integration_run_minutes (never more than MINUTES), which waits for the
+# running short jobs to end. A build that fails, or cannot get the lock, skips the test. The test runs
+# only under the exclusive lock, which is let go whatever its status.
+ci_step_integration() {
+    local locks="$1" minutes="$2" run status=0
+    run=$(ci_integration_run_minutes)
+    [ "$run" -le "$minutes" ] || run=$minutes
+    unset CI_TIMEOUT_KNOB
+    ci_step_job_in_box shared "$locks" "integration's build" "$minutes" "$3" "$4" "$5" "$6" || status=$?
+    [ "$status" = 0 ] || return "$status"
+    export CI_TIMEOUT_KNOB="CI_INTEGRATION_RUN_MINUTES raises it for a run (CI_STEP_MINUTES caps it)"
+    ci_step_job_in_box exclusive "$locks" integration "$run" "$3" "$4" "$5" "$7"
 }
 
 # ci_as_job CMD...: runs CMD as the job's user, $CI_JOB_USER (default: this user). Root becomes it
