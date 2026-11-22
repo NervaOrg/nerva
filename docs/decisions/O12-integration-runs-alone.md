@@ -94,8 +94,12 @@ twice that, and a hung one must not stall the box for an hour.
 - **The stall is real, and bounded.** While an integration step waits, no new short job starts (the
   turnstile): until the running short jobs end, in practice at most their limits (75 minutes), and
   123 minutes if one outlives its limit. Then every short job waits for the exclusive test: about 10
-  minutes (607 s measured here), every push that runs integration. The old flaky red became a
-  queue; that is the price of an honest timing test on a shared box.
+  minutes (607 s measured here), every push that runs integration, on every pipeline of the box, not
+  only the pushing one. The stall of a short job is therefore the drain plus the runs of every
+  integration step queued ahead of it: about 25 + k x 10 minutes for k concurrent pushes, which passes
+  the 123-minute budget (and fails NRV-E1245 for the short job, with the holder named) at about
+  k = 10. The old flaky red became a queue; that is the price of an honest timing test on a shared
+  box, and the follow-up above (the `tier` labels) is how to take the box's other load away.
 - **The simulator fleet** (`ops/sim-fleet`, `CPUWeight=idle`) takes no lock. It yields CPU time and
   disk but not cache or memory bandwidth. The 2.0 ms measurement does not say whether the fleet was
   running; it is not verified here.
