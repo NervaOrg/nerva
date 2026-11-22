@@ -718,17 +718,17 @@ ci_main_lock_open() {
     { exec 9<"$f"; } 2>/dev/null || { ci_lock_open_failed "$f" '<'; return 1; }
 }
 
-# ci_integration_run_minutes: the integration test run's limit, CI_INTEGRATION_RUN_MINUTES (default 20:
-# the run measured about 10 minutes with its build done, O12). One place for the step,
-# ci_box_wait_default and the tests.
-ci_integration_run_minutes() { echo "${CI_INTEGRATION_RUN_MINUTES:-20}"; }
+# ci_integration_run_minutes: the limit of the integration job's exclusive run, CI_INTEGRATION_RUN_MINUTES
+# (default 5: the timed scenario alone, a cluster start and 50 lookups, measured about 7 seconds with
+# everything compiled, O12). One place for the step, ci_box_wait_default and the tests.
+ci_integration_run_minutes() { echo "${CI_INTEGRATION_RUN_MINUTES:-5}"; }
 
 # ci_box_wait_default: CI_BOX_WAIT's default in seconds, derived from the limits that bound what a call
 # can wait behind (decision O12): the longest a SHORT job holds the box lock shared (its step limit,
 # CI_STEP_MINUTES, default 75, then for check-scripts the root tests' limit, CI_SCRIPTS_TEST_MINUTES,
-# default 20, each with CI_KILL_AFTER), plus one integration run (ci_integration_run_minutes with its
-# kill-after: a short job that arrives behind an integration step waits for the drain that step waits
-# for and then for its run), plus 5 minutes. A raised CI_STEP_MINUTES raises it. The values are ones the
+# default 20, each with CI_KILL_AFTER), plus one integration exclusive run (ci_integration_run_minutes
+# with its kill-after: a short job that arrives behind an integration step waits for the drain that
+# step waits for and then for its run), plus 5 minutes. A raised CI_STEP_MINUTES raises it. The values are ones the
 # step has validated (ci_knobs_check, woodpecker_step.sh); anything else counts as the default.
 ci_box_wait_default() {
     local kill="${CI_KILL_AFTER:-60}" m="${CI_STEP_MINUTES:-}" t="${CI_SCRIPTS_TEST_MINUTES:-}" r
@@ -838,22 +838,24 @@ ci_step_job_in_box() {
     return "$rc"
 }
 
-# ci_step_integration LOCKS MINUTES RESERVED TEST_SECONDS TESTS_ARRAY BUILD_ARRAY JOB_ARRAY: the
-# integration job's run in the step (decision O12). First its build (BUILD_ARRAY, `ci/job.sh
-# integration-build`: everything the test needs, compiled and not run) as a SHARED run, so that no
-# compile runs beside another integration's test; the shared lock is let go; then its test (JOB_ARRAY)
-# EXCLUSIVE, bounded by ci_integration_run_minutes (never more than MINUTES), which waits for the
-# running short jobs to end. A build that fails, or cannot get the lock, skips the test. The test runs
-# only under the exclusive lock, which is let go whatever its status.
+# ci_step_integration LOCKS MINUTES RESERVED TEST_SECONDS TESTS_ARRAY UNTIMED_ARRAY TIMED_ARRAY: the
+# integration job's run in the step (decision O12). First every scenario but the timed one
+# (UNTIMED_ARRAY, `ci/job.sh integration untimed`: it compiles what the test needs, and it is what
+# takes the minutes) as a SHARED run, beside the other short jobs; the shared lock is let go; then
+# the timed scenario alone (TIMED_ARRAY, `ci/job.sh integration timed`: a cluster start and 50 lookups,
+# nothing left to compile) EXCLUSIVE, bounded by ci_integration_run_minutes (never more than MINUTES),
+# which waits for the running short jobs to end. An untimed run that fails, or cannot get the lock,
+# skips the timed one. The timed scenario runs only under the exclusive lock, which is let go whatever
+# its status.
 ci_step_integration() {
     local locks="$1" minutes="$2" run status=0
     run=$(ci_integration_run_minutes)
     [ "$run" -le "$minutes" ] || run=$minutes
     unset CI_TIMEOUT_KNOB
-    ci_step_job_in_box shared "$locks" "integration's build" "$minutes" "$3" "$4" "$5" "$6" || status=$?
+    ci_step_job_in_box shared "$locks" "integration's untimed scenarios" "$minutes" "$3" "$4" "$5" "$6" || status=$?
     [ "$status" = 0 ] || return "$status"
     export CI_TIMEOUT_KNOB="CI_INTEGRATION_RUN_MINUTES raises it for a run (CI_STEP_MINUTES caps it)"
-    ci_step_job_in_box exclusive "$locks" integration "$run" "$3" "$4" "$5" "$7"
+    ci_step_job_in_box exclusive "$locks" "integration's timed scenario" "$run" "$3" "$4" "$5" "$7"
 }
 
 # ci_as_job CMD...: runs CMD as the job's user, $CI_JOB_USER (default: this user). Root becomes it

@@ -17,7 +17,10 @@ An earlier version of this decision made integration wait for every job on the h
 `fuzz-long` and `vopr-long` searches and Jepsen included. The review (6008872330) showed that this
 turned a flaky red into a certain red with a 90-minute stall for every new job while a long search ran.
 The second version (review 6012650944) held the turnstile for the whole exclusive run, with waits that
-did not add up. This is the third; O12 was not merged before.
+did not add up. The third held the whole of `zig build test:integration` (about 10 minutes, scenarios and
+all) exclusive, behind a build-only step added to `build.zig`; the owner turned that down (a vendored file
+for a scheduling problem, and a 10-minute stall per push). This is the fourth: only the scenario that
+carries the timing bound runs exclusive, and nothing vendored changes. O12 was not merged before.
 
 ## Decision
 
@@ -29,10 +32,10 @@ step limit; about 25 minutes for the longest, `check-packages`).
 (`ci/cache.sh`) take and release `locks/box.lock` (fd 10) around the job's run and nothing else: not
 the `apt-get`, the seed copy, `install_zig`, nor the tail (`ci_step_finish`). A short job holds it
 **shared**, so short jobs run side by side as before (`ci_step_job_in_box`). The `integration` job
-(`ci_step_integration`) builds under the shared lock (`ci/job.sh integration-build`, the new
-`zig build test:integration:build`, see 8), lets it go, then takes the **exclusive** lock for the
-test alone (`ci/job.sh integration`, bounded by `CI_INTEGRATION_RUN_MINUTES`). A failed build skips the
-test. A Markdown-only run (N68) exits before the job and takes no lock. The flow lives in `ci/cache.sh`
+(`ci_step_integration`) runs every scenario but the timed one under the shared lock
+(`ci/job.sh integration untimed`: it compiles everything, and it is the part that takes the minutes),
+lets it go, then takes the **exclusive** lock for the timed scenario alone (`ci/job.sh integration
+timed`, bounded by `CI_INTEGRATION_RUN_MINUTES`, see 8). A failed untimed run skips the timed one. A Markdown-only run (N68) exits before the job and takes no lock. The flow lives in `ci/cache.sh`
 and `ci/ci_test.sh` tests it with stub jobs that report which lock they see and which fds are open.
 
 **3. A turnstile against starvation, held only while waiting.** flock is not fair: shared steps arriving
@@ -44,17 +47,17 @@ then box.
 
 **4. No deadlock on the upgrade.** A step never waits for the turnstile or for an exclusive lock while it
 holds `box.lock` shared: two integration steps would each hold shared and wait for the other. The
-integration step releases the shared lock (build done) before the exclusive call. `ci_box_lock` refuses
+integration step releases the shared lock (untimed run done) before the exclusive call. `ci_box_lock` refuses
 a call made while the step holds the lock (`CI_BOX_HELD`: NRV-B1203).
 
 **5. One budget per call, and it is the longest honest wait.** A call has one budget, `CI_BOX_WAIT`,
 shared by its turnstile wait and its box wait (the second wait gets what the first left). The default
 is derived from the jobs' limits (`ci_box_wait_default`): the longest a holder can legitimately keep
 the box is a short job at its step limit (`CI_STEP_MINUTES`, 75) plus its root tests
-(`CI_SCRIPTS_TEST_MINUTES`, 20) plus the exclusive test (`CI_INTEGRATION_RUN_MINUTES`, 20), each with
-the kill-after (60 s), and 300 s more: 7380 s (123 minutes) with the defaults. It follows a raised
+(`CI_SCRIPTS_TEST_MINUTES`, 20) plus the exclusive run (`CI_INTEGRATION_RUN_MINUTES`, 5), each with
+the kill-after (60 s), and 300 s more: 6480 s (108 minutes) with the defaults. It follows a raised
 `CI_STEP_MINUTES`. A timeout means a holder outlived its own limits. The turnstile is therefore held
-for at most one budget, 123 minutes at the very worst, and in practice until the running short jobs
+for at most one budget, 108 minutes at the very worst, and in practice until the running short jobs
 end (about 25 minutes for the longest). A timeout fails the step with NRV-E1245, whose message names
 who holds what; the test is never run without the lock. Only `flock` status 1 is a timeout; any other
 status (for example fd 10 lost to a redirection) is NRV-B1204, a bug, never a timeout that blames
@@ -62,10 +65,10 @@ another holder. The knobs are validated by `ci_knobs_check` (NRV-E1208).
 
 **6. The waits are accounted like other pre-job time.** They happen between `CI_STEP_START` and the job,
 so `ci_job_seconds` and `ci_tail_seconds` count them as they count the `apt-get` before (NRV-W1207,
-NRV-E1215). A short job waits in one call: at most 7380 s. An integration step waits in two (build,
-then test): 2 x 7380 s = 246 minutes at the very worst, which is a bound, not an expectation: if the
+NRV-E1215). A short job waits in one call: at most 6480 s. An integration step waits in two (untimed,
+then timed): 2 x 6480 s = 216 minutes at the very worst, which is a bound, not an expectation: if the
 waits really used that, the step's remaining time inside the repository's 360-minute limit could not
-cover the build and test, and `ci_job_seconds` shortens or refuses the job (NRV-W1207, NRV-E1215)
+cover the two runs, and `ci_job_seconds` shortens or refuses the job (NRV-W1207, NRV-E1215)
 rather than let the repository's timeout kill it. The long jobs wait for nothing, so a 330-minute
 search is never shortened by this lock.
 
@@ -76,12 +79,39 @@ descriptors are numbered 10 and 11 because 3 to 9 are used by the other locks; t
 bare `exec`, never inside a `{ ...; } 2>/dev/null` group, which uses the first free descriptor from 10 up
 to save stderr and would close them again.
 
-**8. A build-only step in `build.zig` (owner-authorised; CLAUDE.md stop rule 2 waived for exactly this).**
-`zig build test:integration:build` depends on the `test-integration` executable and on `nerva_keys_off`
-and installs and runs nothing. After it, `zig build test:integration` recompiles nothing (checked: every
-compile step reads "cached"), so the exclusive window is the run itself. Recorded in UPSTREAM.md.
-`CI_INTEGRATION_RUN_MINUTES` defaults to 20: the run measured 10 minutes on a 4-core sandbox, so
-twice that, and a hung one must not stall the box for an hour.
+**8. The test binary runs a chosen subset of its scenarios; nothing vendored changes.**
+`src/integration_tests.zig` (Nerva's own: UPSTREAM.md lists TigerBeetle's as dropped) reads
+`NERVA_INTEGRATION_SCENARIOS` in `main` (`zig build test:integration` passes the build's environment on to
+its run step, which is never cached: it has side effects). The value is a comma-separated list of scenario
+names (`cluster`, `peer_auth`, `latency`) or of the groups `untimed` and `timed`; **unset, every scenario
+runs, exactly as before** (GitHub Actions, CLAUDE.md's command, a run by hand). A scenario is *timed* when
+it asserts a wall-clock bound; `Scenario.timed` is an exhaustive `switch`, so a new scenario must say, and
+CI's `untimed` picks up every scenario not marked: none is silently left out of CI. Anything else, an empty
+value or an empty entry included, fails with NRV-E1246 and runs nothing: a typo can never be a green run
+that executed no scenario. The selection is `src/nerva/integration_scenarios.zig`, kept apart so that
+`test:unit` reaches its tests (the executable's own `test` blocks have no root; `src/unit_tests.zig` gains
+its one line from its own quine, a regeneration, not a golden value of anything else). Alternatives
+rejected: a build-only step in `build.zig` (the third version: a vendored patch, and it left the whole
+10-minute run exclusive), command-line arguments (`build.zig` does not pass any on), running the cached
+binary by its path (the path is a hash).
+
+**The latency check is its own small scenario.** The 50 lookups were in the middle of `scenario_cluster`,
+which does much more (a crash, a restart, the change feed, eviction by 64 clients). They moved to
+`scenario_latency`: a cluster start, one put, one lookup (the row is there) and the 50 timed lookups, on
+a cluster of its own. What it asserts is the same (median of 50 lookups under one tick); what
+`scenario_cluster` asserts is the same minus those lookups, which asserted nothing else. The one change
+in coverage: the timed lookups no longer run on a cluster that has already committed, raced and served a
+change feed, but on one that has committed one row; the code path of a lookup is the same, and the median
+measured 1.4 and 1.5 ms (before: 2.0 to 2.3 ms alone), with one client instead of two.
+
+**The Python tests that follow stay out of the exclusive run.** `zig build test:integration` also runs
+`tests/errors/commands.py` and `tests/recover/recover.py` after the executable (build graph: they depend on
+it); they take about 5 minutes and measure nothing against the clock. With `NERVA_INTEGRATION_SCENARIOS`
+exactly `timed` each prints a one-line skip and exits 0, so the exclusive run is the timed scenario alone
+(measured: 7 s in all, `zig build` start-up included, with everything compiled by the untimed run); the
+untimed run, and a run with the variable unset, run them as before. The cost: those two scripts know one
+value of the variable. `CI_INTEGRATION_RUN_MINUTES` defaults to 5: forty times the measured run, and a
+hung cluster must not stall the box for more.
 
 ## Accepted: what the lock does not cover
 
@@ -92,14 +122,15 @@ twice that, and a hung one must not stall the box for an hour.
   search is run again when it ends. Moving the long jobs off the box with #9's `tier` labels would
   remove this and is the follow-up.
 - **The stall is real, and bounded.** While an integration step waits, no new short job starts (the
-  turnstile): until the running short jobs end, in practice at most their limits (75 minutes), and
-  123 minutes if one outlives its limit. Then every short job waits for the exclusive test: about 10
-  minutes (607 s measured here), every push that runs integration, on every pipeline of the box, not
-  only the pushing one. The stall of a short job is therefore the drain plus the runs of every
-  integration step queued ahead of it: about 25 + k x 10 minutes for k concurrent pushes, which passes
-  the 123-minute budget (and fails NRV-E1245 for the short job, with the holder named) at about
-  k = 10. The old flaky red became a queue; that is the price of an honest timing test on a shared
-  box, and the follow-up above (the `tier` labels) is how to take the box's other load away.
+  turnstile): until the running short jobs end, which is the longest of them, about 25 minutes if
+  `check-packages` has just started, less for the others, and at most their limits (75 minutes; 108
+  minutes if one outlives its limit). Then the exclusive run takes seconds (7 s measured here), so the
+  queue behind it is a drain plus about 10 s per integration step queued ahead: it passes the 108-minute
+  budget (NRV-E1245 for the short job, with the holder named) only if a short job is stuck. The previous
+  version held every push's short jobs for the drain plus about 10 minutes (the whole `test:integration`
+  run, 607 s measured here); that is gone, the drain is not. The old flaky red became a short, rare
+  queue, which is the price of an honest timing test on a shared box; the follow-up above (the `tier`
+  labels) is how to take the box's other load away.
 - **The simulator fleet** (`ops/sim-fleet`, `CPUWeight=idle`) takes no lock. It yields CPU time and
   disk but not cache or memory bandwidth. The 2.0 ms measurement does not say whether the fleet was
   running; it is not verified here.
@@ -114,13 +145,17 @@ twice that, and a hung one must not stall the box for an hour.
 
 The cheapest fix that keeps the test honest: the bound stays at one tick and the test stays the same,
 while the short jobs, which finish in minutes, stop running beside it. The long jobs cannot be waited
-for. The lock covers only runs, and the build-only step makes the exclusive window the test run alone,
-not a compile, an `apt-get`, a cache copy or a trash walk.
+for. The lock covers only runs, and only the timed scenario runs exclusive: the exclusive window is a
+cluster start and 50 lookups (seconds), not the 10 minutes of the whole suite, a compile, an `apt-get`,
+a cache copy or a trash walk. The scheduling problem is solved where it is (CI's order of runs) and in
+Nerva's own test file, not in a vendored one.
 
 ## What it costs
 
 - Integration waits for the short jobs already running, and they wait behind it while it waits and
-  runs (see "Accepted").
-- A vendored patch to `build.zig` (one step, additive; UPSTREAM.md).
-- `ci/job.sh integration-build` (one line; open PR #9 changes other lines of the file).
+  runs (see "Accepted"); the run itself is seconds.
+- `src/integration_tests.zig` and its selection module are a little larger (one new scenario, one
+  environment variable, one code, NRV-E1246), and two Python tests know one value of the variable.
+- The latency check no longer runs on a cluster that has done everything else first (see 8).
+- `ci/job.sh integration` takes an argument (open PR #9 changes other lines of the file).
 - A red integration beside a long job, as above.

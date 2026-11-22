@@ -2,6 +2,7 @@
 //! driven through the client library.
 //!
 //! Run with `zig build test:integration`. Needs about 3.5 GiB of disk and 3 GiB of memory.
+//! `NERVA_INTEGRATION_SCENARIOS` runs only some scenarios (`nerva/integration_scenarios.zig`, O12).
 //!
 //! An executable rather than a `zig test` binary: test binaries use the `test_min` configuration,
 //! but the client must share the production configuration of the `nerva` binary it talks to.
@@ -18,6 +19,7 @@ const nerva = @import("nerva.zig");
 const Client = @import("nerva/client.zig").Client;
 const workload = @import("nerva/workload.zig");
 const peer_auth = @import("nerva/peer_auth.zig");
+const scenarios = @import("nerva/integration_scenarios.zig");
 const Header = vsr.Header;
 
 const Entry = nerva.Entry;
@@ -40,8 +42,36 @@ pub fn main() !void {
     };
     gpa = gpa_instance.allocator();
 
-    try scenario_cluster();
-    try scenario_peer_auth();
+    const requested = std.process.getEnvVarOwned(
+        gpa,
+        scenarios.environment_name,
+    ) catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => return err,
+    };
+    defer if (requested) |owned| gpa.free(owned);
+    const selected = switch (scenarios.select(requested)) {
+        .run => |set| set,
+        .unknown => |entry| {
+            std.debug.print(
+                "error: NRV-E1246: {s} names '{s}', which is not a scenario ({s}); " ++
+                    "unset it to run every scenario\n",
+                .{ scenarios.environment_name, entry, scenarios.names },
+            );
+            std.process.exit(2);
+        },
+    };
+    assert(selected.count() > 0);
+
+    var iterator = selected.iterator();
+    while (iterator.next()) |scenario| {
+        std.debug.print("integration: scenario {s}\n", .{@tagName(scenario)});
+        switch (scenario) {
+            .cluster => try scenario_cluster(),
+            .peer_auth => try scenario_peer_auth(),
+            .latency => try scenario_latency(),
+        }
+    }
     std.debug.print("integration: PASSED\n", .{});
 }
 
@@ -631,21 +661,6 @@ fn scenario_cluster() !void {
     try testing.expect(op_put > 1); // Client registration commits first.
     try testing.expectEqual(null, try daemon_b.row_as_of(1, 1, op_put - 1));
 
-    // Latency: a reply ends the client's wait at once, not at the end of its 10 ms tick, so the
-    // median lookup is well under one tick (it was always at least one, N51).
-    {
-        var durations_ns: [50]u64 = undefined;
-        for (&durations_ns) |*duration_ns| {
-            var timer = try std.time.Timer.start();
-            _ = try lookup(daemon_a, 1, 1);
-            duration_ns.* = timer.read();
-        }
-        std.mem.sortUnstable(u64, &durations_ns, {}, std.sort.asc(u64));
-        const median_ns = durations_ns[durations_ns.len / 2];
-        std.debug.print("integration: lookup median {} us\n", .{median_ns / std.time.ns_per_us});
-        try testing.expect(median_ns < constants.tick_ms * std.time.ns_per_ms);
-    }
-
     // Observability: the replicas send request timings and gauges over statsd, and
     // replica 1 has written commit spans to its trace file.
     try cluster.statsd.expect_metrics(&.{
@@ -706,6 +721,36 @@ fn scenario_cluster() !void {
         try testing.expectError(error.Evicted, lookup(evictee, 1, 1));
         try testing.expectError(error.Evicted, lookup(evictee, 1, 1));
     }
+}
+
+/// A reply ends the client's wait at once, not at the end of its 10 ms tick, so the median lookup is
+/// well under one tick (it was always at least one, N51). A *timed* scenario (`integration_scenarios`):
+/// the bound is wall time, so CI runs it alone on the host (decision O12), on a cluster of its own so
+/// that alone costs a cluster start and the lookups, not the whole of `scenario_cluster`.
+fn scenario_latency() !void {
+    const cluster = try Cluster.init();
+    defer cluster.deinit();
+    errdefer cluster.logs_print();
+
+    const daemon = try cluster.client();
+    defer cluster.client_deinit(daemon);
+
+    const put_results = try commit(daemon, &.{put(1, 0xaa)});
+    defer gpa.free(put_results);
+    try expect_statuses(put_results, &.{.ok});
+    const row = try lookup(daemon, 1, 1);
+    try testing.expect(row.flags.exists);
+
+    var durations_ns: [50]u64 = undefined;
+    for (&durations_ns) |*duration_ns| {
+        var timer = try std.time.Timer.start();
+        _ = try lookup(daemon, 1, 1);
+        duration_ns.* = timer.read();
+    }
+    std.mem.sortUnstable(u64, &durations_ns, {}, std.sort.asc(u64));
+    const median_ns = durations_ns[durations_ns.len / 2];
+    std.debug.print("integration: lookup median {} us\n", .{median_ns / std.time.ns_per_us});
+    try testing.expect(median_ns < constants.tick_ms * std.time.ns_per_ms);
 }
 
 /// Replicas authenticate each other (P102): a peer without the cluster key is refused whatever it

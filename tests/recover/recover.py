@@ -398,6 +398,12 @@ def refusals(tmp, nerva):
 
 
 def main():
+    # `zig build test:integration` runs this after the integration executable. CI runs the timed
+    # scenarios alone on the host (decision O12, src/nerva/integration_scenarios.zig); this test
+    # runs no timed scenario and is minutes long, so it is left to the untimed run.
+    if os.environ.get("NERVA_INTEGRATION_SCENARIOS") == "timed":
+        print("skipped: NERVA_INTEGRATION_SCENARIOS=timed runs the timed scenarios alone", flush=True)
+        return
     nerva = os.path.abspath(sys.argv[1])
     parts = sys.argv[2:] or ["repair", "sync", "refusals"]
     tmp = tempfile.mkdtemp(prefix="nerva-recover-")

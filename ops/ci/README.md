@@ -468,19 +468,21 @@ set:
    **The box lock** (decision O12). The `integration` job asserts a median lookup under one 10 ms
    tick of wall time, which a box running other jobs cannot promise (#11: 6.6 to 17.4 ms under
    load, 2.1 ms alone). So a short job holds `locks/box.lock` shared around its run alone (not its
-   `apt-get`, its seed copy or its tail), and the `integration` job builds (`ci/job.sh integration-build`:
-   `zig build test:integration:build`, which compiles what the test needs and runs none of it) under
-   the shared lock, lets it go, then runs its test exclusive: no other short job's run beside it.
-   flock is not fair, so a call first takes `locks/turnstile.lock` exclusively; it holds it only while
-   it waits for `box.lock` and lets it go once it has it, so the turnstile is never held for a test.
-   The long jobs (`fuzz-long`, `vopr-long`, `jepsen`) take no lock and integration does not wait for
-   them: **integration can still fail on timing while one runs beside it**; run it again when the
-   search ends. A call's waits share one budget, `CI_BOX_WAIT` (7380 s by default: the longest short
-   job's hold, one integration run and five minutes; it follows `CI_STEP_MINUTES`), and fail
-   NRV-E1245; the test run is bounded by `CI_INTEGRATION_RUN_MINUTES` (20); the wait counts in the
-   step's time like any pre-job work (NRV-W1207). A Markdown-only run takes no lock. Every push waits
-   for the running short jobs (about 25 minutes at most in practice) and for the integration runs
-   queued ahead of it, about 10 minutes each.
+   `apt-get`, its seed copy or its tail), and the `integration` job runs every scenario but one under
+   the shared lock (`ci/job.sh integration untimed`, which compiles and takes the minutes), lets it go,
+   then runs the one scenario that carries the timing bound exclusive (`ci/job.sh integration timed`:
+   a cluster start and 50 lookups, about 7 s), no other short job's run beside it. Which scenario that
+   is lives in `src/nerva/integration_scenarios.zig` (`NERVA_INTEGRATION_SCENARIOS`; unset, every scenario
+   runs, as on GitHub). flock is not fair, so a call first takes `locks/turnstile.lock` exclusively; it
+   holds it only while it waits for `box.lock` and lets it go once it has it, so the turnstile is never
+   held for a test. The long jobs (`fuzz-long`, `vopr-long`, `jepsen`) take no lock and integration does
+   not wait for them: **integration can still fail on timing while one runs beside it**; run it again
+   when the search ends. A call's waits share one budget, `CI_BOX_WAIT` (6480 s by default: the longest
+   short job's hold, one exclusive integration run and five minutes; it follows `CI_STEP_MINUTES`), and
+   fail NRV-E1245; the exclusive run is bounded by `CI_INTEGRATION_RUN_MINUTES` (5); the wait counts in
+   the step's time like any pre-job work (NRV-W1207). A Markdown-only run takes no lock. Every push's
+   integration step waits for the running short jobs (the longest, `check-packages`, about 25 minutes;
+   no new short job starts meanwhile), and then holds the box for seconds.
 
    **When the disk fills** (a job fails with "No space left", or NRV-W1202 keeps appearing), with
    no pipeline running: `rm -rf /var/cache/nerva-ci/branches/*` empties every branch cache, and

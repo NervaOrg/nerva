@@ -48,6 +48,7 @@ comptime {
     _ = @import("nerva/http_connection.zig");
     _ = @import("nerva/import.zig");
     _ = @import("nerva/indexes.zig");
+    _ = @import("nerva/integration_scenarios.zig");
     _ = @import("nerva/internal_operations.zig");
     _ = @import("nerva/latency_histogram.zig");
     _ = @import("nerva/ledgers.zig");

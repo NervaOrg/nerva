@@ -24,9 +24,9 @@
 #     repository's timeout: CI_REPO_TIMEOUT_MINUTES); a branch's size is a record its own step writes after its locks, before the job and
 #     after it (CI_BRANCH_DU_SECONDS).
 #   - The short jobs hold a shared lock on locks/box.lock around their run alone, the integration job
-#     an exclusive one around its test run alone (its build is a shared run before), behind a turnstile
-#     (locks/turnstile.lock) so shared jobs cannot starve it: its test runs with no other short job's
-#     run beside it. The long jobs (fuzz-long, vopr-long, jepsen) take no lock and integration does not
+#     an exclusive one around its timed scenario alone (every other scenario is a shared run before),
+#     behind a turnstile (locks/turnstile.lock) so shared jobs cannot starve it: that scenario runs
+#     with no other short job's run beside it. The long jobs (fuzz-long, vopr-long, jepsen) take no lock and integration does not
 #     wait for them (decision O12, ci_box_lock; CI_BOX_WAIT, NRV-E1245).
 #   - Each job has a timeout (75 minutes; 330 for the long searches; CI_STEP_MINUTES replaces it),
 #     see the `case` below; one that runs past it fails NRV-E1215.
@@ -218,19 +218,21 @@ if [ "$job" = check-scripts ]; then reserved=$((test_minutes * 60 + ${CI_KILL_AF
 # The box lock (decision O12; ci_step_job_in_box, ci_step_integration in ci/cache.sh, with their tests)
 # covers the job's run alone and is let go before the tail. fuzz-long, vopr-long and jepsen are long
 # jobs: they take no lock, so they never keep integration waiting (and integration's timing can suffer
-# beside them: accepted, O12). integration builds first (`ci/job.sh integration-build` compiles
-# everything its test needs; a shared run, so no compile runs beside another integration's test), then
-# runs its test alone, exclusive, bounded by CI_INTEGRATION_RUN_MINUTES, so what everyone waits for is
-# the test and nothing else. A wait that fails (NRV-E1245) fails the step, which goes on to its tail.
+# beside them: accepted, O12). integration runs every scenario but the timed one first
+# (`ci/job.sh integration untimed`: a shared run, which also compiles), then the timed scenario alone
+# (`ci/job.sh integration timed`), exclusive, bounded by CI_INTEGRATION_RUN_MINUTES, so what everyone
+# waits for is a cluster start and 50 lookups and nothing else. A wait that fails (NRV-E1245) fails the step, which goes on to its tail.
 case "$job" in
     fuzz-long | vopr-long | jepsen) box=none ;;
     integration) box=integration ;;
     *) box=shared ;;
 esac
 if [ "$box" = integration ]; then
-    # shellcheck disable=SC2034 # a nameref array, read by ci_step_run_with_tests
-    build_cmd=("${as_ci[@]}" ci/job.sh integration-build)
-    ci_step_integration "$cache/locks" "$minutes" "$reserved" "$((test_minutes * 60))" tests_cmd build_cmd job_cmd || status=$?
+    # shellcheck disable=SC2034 # nameref arrays, read by ci_step_run_with_tests
+    untimed_cmd=("${as_ci[@]}" ci/job.sh integration untimed)
+    # shellcheck disable=SC2034 # as above
+    timed_cmd=("${as_ci[@]}" ci/job.sh integration timed)
+    ci_step_integration "$cache/locks" "$minutes" "$reserved" "$((test_minutes * 60))" tests_cmd untimed_cmd timed_cmd || status=$?
 else
     ci_step_job_in_box "$box" "$cache/locks" "$job" "$minutes" "$reserved" "$((test_minutes * 60))" tests_cmd job_cmd || status=$?
 fi

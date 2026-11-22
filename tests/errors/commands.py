@@ -80,6 +80,12 @@ def expect(result, code, status, text, label):
 
 
 def main():
+    # `zig build test:integration` runs this after the integration executable. CI runs the timed
+    # scenarios alone on the host (decision O12, src/nerva/integration_scenarios.zig); this test
+    # runs no timed scenario and is minutes long, so it is left to the untimed run.
+    if os.environ.get("NERVA_INTEGRATION_SCENARIOS") == "timed":
+        print("skipped: NERVA_INTEGRATION_SCENARIOS=timed runs the timed scenarios alone", flush=True)
+        return
     if len(sys.argv) != 3:
         sys.exit("usage: commands.py <nerva> <nerva-keys-off> "
                  "(the second is the -Dtest-commit-keys=off build, for NRV-E0717 and NRV-W0701)")
