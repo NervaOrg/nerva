@@ -465,6 +465,28 @@ set:
    shared, which never blocks another shared holder). `lslocks` on the host shows the pid. A lock
    file that cannot be opened at all is NRV-E1227, with the reason, not a wait.
 
+   **The box lock** (decision O12). The `integration` job asserts a median lookup under one 10 ms
+   tick of wall time, which a box running other jobs cannot promise (#11: 6.6 to 17.4 ms under
+   load, 2.1 ms alone). So a short job holds `locks/box.lock` shared around its run alone (not its
+   `apt-get`, its seed copy or its tail), and the `integration` job runs every scenario but one under
+   the shared lock (`ci/job.sh integration untimed`, which compiles and takes the minutes), lets it go,
+   then runs the one scenario that carries the timing bound exclusive (`ci/job.sh integration timed`:
+   a cluster start and 50 lookups, about 7 s), no other short job's run beside it. Which scenario that
+   is lives in `src/nerva/integration_scenarios.zig` (`NERVA_INTEGRATION_SCENARIOS`; unset, every scenario
+   runs, as on GitHub). flock is not fair, so a call first takes `locks/turnstile.lock` exclusively; it
+   holds it only while it waits for `box.lock` and lets it go once it has it, so the turnstile is never
+   held for a test. The long jobs (`fuzz-long`, `vopr-long`, `jepsen`) take no lock and integration does
+   not wait for them: **integration can still fail on timing while one runs beside it**; run it again
+   when the search ends. A call's waits share one budget, `CI_BOX_WAIT` (6480 s by default: the longest
+   single hold, a short job's, plus one exclusive integration run and five minutes; a raised
+   `CI_STEP_MINUTES` raises it, a lower one does not lower it), and fail NRV-E1245. The budget is not a
+   bound on the queue: each integration step queued ahead of a short job can cost it a whole drain, so
+   with several pushes at once NRV-E1245 can fire with every holder inside its limits (start it again); the exclusive run is bounded by `CI_INTEGRATION_RUN_MINUTES` (5); the wait counts in
+   the step's time like any pre-job work (NRV-W1207). A Markdown-only run takes no lock. Every push's
+   integration step waits for the running short jobs (the longest, `check-packages`, about 25 minutes;
+   no new short job starts meanwhile), and then holds the box for seconds; a second integration step
+   queued behind it waits for a drain again.
+
    **When the disk fills** (a job fails with "No space left", or NRV-W1202 keeps appearing), with
    no pipeline running: `rm -rf /var/cache/nerva-ci/branches/*` empties every branch cache, and
    `rm -rf /var/cache/nerva-ci/main/zig /var/cache/nerva-ci/main/zig-local` main's Zig caches. The

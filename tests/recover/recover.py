@@ -397,7 +397,26 @@ def refusals(tmp, nerva):
         cluster.close()
 
 
+# The entries of NERVA_INTEGRATION_SCENARIOS that name timed scenarios: the group and every scenario
+# `Scenario.timed` marks in src/nerva/integration_scenarios.zig (ci/ci_test.sh checks the two agree).
+TIMED_SCENARIOS = ("timed", "latency")
+
+
+def only_timed_selected():
+    """True when NERVA_INTEGRATION_SCENARIOS is set and every entry names a timed scenario. Unset,
+    empty, `untimed`, `cluster` or a list holding any other entry is not: the test runs."""
+    value = os.environ.get("NERVA_INTEGRATION_SCENARIOS")
+    return value is not None and all(entry in TIMED_SCENARIOS for entry in value.split(","))
+
+
 def main():
+    # `zig build test:integration` runs this after the integration executable. CI runs the timed
+    # scenarios alone on the host (decision O12, src/nerva/integration_scenarios.zig); this test
+    # measures nothing against the clock and is minutes long, so it skips when the selection holds
+    # no untimed scenario. ci/ci_test.sh pins when it fires.
+    if only_timed_selected():
+        print("skipped: NERVA_INTEGRATION_SCENARIOS selects timed scenarios only", flush=True)
+        return
     nerva = os.path.abspath(sys.argv[1])
     parts = sys.argv[2:] or ["repair", "sync", "refusals"]
     tmp = tempfile.mkdtemp(prefix="nerva-recover-")

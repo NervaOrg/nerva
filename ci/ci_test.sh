@@ -253,6 +253,7 @@ rc=0
 timed stubjob 5 sh -c 'exit 7' >/dev/null 2>&1 || rc=$?
 is "a failing job keeps its own status" 7 "$rc"
 refuses NRV-E1208 "CI_STEP_MINUTES not a number" env CI_STEP_MINUTES=soon ci/woodpecker_step.sh check
+refuses "NRV-E1208: ci/woodpecker_step.sh integration takes no argument, got 'bogus'" "integration with an argument is refused, not ignored" ci/woodpecker_step.sh integration bogus
 
 # --- ci/cache.sh ---
 # As root the job's user is `nobody`, as it is `ci` in a step (a root that acts as its own job is
@@ -636,10 +637,11 @@ refuses NRV-E1227 "an open failure refuses" open_fail "$o3" feature/o
 # behavioural test below checks it.
 as_ci_lines=$(grep -c '"${as_ci\[@\]}"' ci/woodpecker_step.sh || true)
 closing_lines=$(grep -c '"${as_ci\[@\]}".* 6>&- 7>&- 8>&- 9<&-' ci/woodpecker_step.sh || true)
-is "woodpecker_step.sh runs two commands as ci" 2 "$as_ci_lines"
+is "woodpecker_step.sh runs four commands as ci (install_zig, integration's untimed and timed runs, the job)" 4 "$as_ci_lines"
 is "install_zig closes fds 6 to 9 for the job's user (static; the job's own are tested behaviourally)" 1 "$closing_lines"
-is "the step runs the root tests and the job through ci_step_job, as arrays (static)" 2 "$(grep -c '^tests_cmd=(bash ci/ci_test.sh)$\|^ci_step_job .* tests_cmd job_cmd || status=\$?$' ci/woodpecker_step.sh || true)"
-is "the root tests are bounded by their own limit, not the job's (static; ci_step_job passes it to ci_step_run_with_tests)" "1 1" "$(grep -c '"$((test_minutes \* 60))" tests_cmd job_cmd' ci/woodpecker_step.sh || true) $(grep -c 'ci_step_run_with_tests "\$1" "\$4" "\$job_seconds"' ci/cache.sh || true)"
+is "the step runs the root tests and the job as arrays, through ci_step_integration and ci_step_job_in_box (static; the box lock's flow is tested behaviourally below)" "1 1 1" "$(grep -c '^tests_cmd=(bash ci/ci_test.sh)$' ci/woodpecker_step.sh || true) $(grep -cF 'ci_step_integration "$cache/locks" "$minutes" "$reserved" "$((test_minutes * 60))" tests_cmd untimed_cmd timed_cmd' ci/woodpecker_step.sh || true) $(grep -cF 'ci_step_job_in_box "$box" "$cache/locks" "$job" "$minutes" "$reserved" "$((test_minutes * 60))" tests_cmd job_cmd' ci/woodpecker_step.sh || true)"
+is "integration's runs are 'ci/job.sh integration untimed' then 'ci/job.sh integration timed', as ci (static)" "1 1" "$(grep -c '^    untimed_cmd=("${as_ci\[@\]}" ci/job.sh integration untimed)$' ci/woodpecker_step.sh || true) $(grep -c '^    timed_cmd=("${as_ci\[@\]}" ci/job.sh integration timed)$' ci/woodpecker_step.sh || true)"
+is "the root tests are bounded by their own limit, not the job's (static; ci_step_job passes it to ci_step_run_with_tests)" "2 1" "$(grep -cF '"$((test_minutes * 60))" tests_cmd ' ci/woodpecker_step.sh || true) $(grep -c 'ci_step_run_with_tests "\$1" "\$4" "\$job_seconds"' ci/cache.sh || true)"
 # Both places that take main's lock use ci_shared_lock (bounded, NRV-E1224), never a bare flock; the
 # jepsen lock file is made by ci_lock_file.
 is "main's lock is taken by ci_shared_lock in both roles" 2 "$(grep -c 'ci_shared_lock || exit 1' ci/woodpecker_step.sh || true)"
@@ -654,7 +656,7 @@ is "jepsen's lock (fd 8) is let go before its trash is emptied, by the tail (sta
 lock8_l=$(grep -n 'flock -x -w "\${CI_JEPSEN_WAIT:-5400}" 8' "$ws" | cut -d: -f1)
 pre_j=$(grep -n '^    ci_trash_empty "\$cache/jepsen" #' "$ws" | cut -d: -f1)
 is "jepsen's old trash is emptied before the step takes the Jepsen lock others wait on (static)" yes "$([ -n "$lock8_l" ] && [ -n "$pre_j" ] && [ "$pre_j" -lt "$lock8_l" ] && echo yes)"
-run_l=$(grep -n '^ci_step_job ' "$ws" | cut -d: -f1)
+run_l=$(grep -n '^    ci_step_job_in_box "\$box" ' "$ws" | cut -d: -f1)
 finish_l=$(grep -n '^ci_step_finish "\$role" "\$cache" "\${CI_BRANCH_DIR:-}" "\$job"$' "$ws" | cut -d: -f1)
 is "the step measures and empties its trash after the job, in its tail (static)" yes "$([ -n "$run_l" ] && [ -n "$finish_l" ] && [ "$run_l" -lt "$finish_l" ] && echo yes)"
 is "the old run directories are swept by ci_jepsen_sweep, with no age test of its own (static)" "1 0" "$(grep -c '^    ci_jepsen_sweep "\$cache/jepsen"$' "$ws" || true) $(grep -c -e '-mtime' "$ws" || true)"
@@ -2715,11 +2717,11 @@ is "ci_job_seconds: ... with NRV-E1215 naming the job and the Timeout, not CI_ST
 is "ci_job_seconds: 20 s left (under the 60 s floor) is 0 too" "0" "$(jobs_ CI_STEP_START=$((now - 3100)) CI_REPO_TIMEOUT_MINUTES=60)"
 is "ci_job_seconds: no time left once the reserve is taken: 0" "0" "$(RES=1260 JOBMIN=75 jobs_ CI_STEP_START=$((now - 2400)) CI_REPO_TIMEOUT_MINUTES=60)"
 is "ci_job_seconds: a job that fits is left alone, silent (75 of 360, 10 min used)" "4500 yes" "$(JOBMIN=75 jobs_ CI_STEP_START=$((now - 600))) $([ ! -s "$tmp/jobs.err" ] && echo yes)"
-is "the step bounds the job with ci_step_job, with the root tests' reserve (and the validated kill-after) for check-scripts (static)" "1 1" "$(grep -c '^ci_step_job "\$job" "\$minutes" "\$reserved" "\$((test_minutes \* 60))" tests_cmd job_cmd || status=\$?$' "$ws" || true) $(grep -c '^if \[ "\$job" = check-scripts \]; then reserved=\$((test_minutes \* 60 + \${CI_KILL_AFTER:-60})); fi$' "$ws" || true)"
+is "the step bounds the job with ci_step_job, with the root tests' reserve (and the validated kill-after) for check-scripts (static)" "2 1" "$(grep -cF 'ci_step_job "$@"' ci/cache.sh || true) $(grep -c '^if \[ "\$job" = check-scripts \]; then reserved=\$((test_minutes \* 60 + \${CI_KILL_AFTER:-60})); fi$' "$ws" || true)"
 # The step's tail follows the job whatever its status: no `exit` between the ci_step_job call and ci_step_finish.
-job_l=$(grep -n '^ci_step_job ' "$ws" | cut -d: -f1)
+job_l=$(grep -n '^if \[ "\$box" = integration \]; then$' "$ws" | cut -d: -f1)
 fin_l=$(grep -n '^ci_step_finish ' "$ws" | cut -d: -f1)
-is "no exit between the step's job and its tail (static)" "0" "$(sed -n "${job_l},${fin_l}p" "$ws" | grep -c '^[[:space:]]*exit' || true)"
+is "no exit between the step's job and its tail (static)" "0 yes" "$(sed -n "${job_l},${fin_l}p" "$ws" | grep -c '^[[:space:]]*exit' || true) $([ -n "$job_l" ] && [ -n "$fin_l" ] && echo yes)"
 # --- BEGIN ci_step_job (behavioural; the mutation harness extracts this block)
 # ci_step_job (ci/cache.sh) is what the step calls: a bash function named timeout stands in for
 # timeout(1), logs what it was asked to run and moves $SECONDS on by the limit, as a job that ran
@@ -3193,13 +3195,13 @@ st="$tmp/step"
 mkdir -p "$st"
 cat >"$st/tests.sh" <<'EOS'
 #!/bin/bash
-echo "tests fd9:$([ -e /proc/self/fd/9 ] && echo open || echo closed)" >>"$LOG"
+echo "tests fd9:$([ -e /proc/self/fd/9 ] && echo open || echo closed) fd10:$([ -e /proc/self/fd/10 ] && echo open || echo closed) fd11:$([ -e /proc/self/fd/11 ] && echo open || echo closed)" >>"$LOG"
 [ -z "${T_SLEEP:-}" ] || sleep "$T_SLEEP"
 exit "${T_RC:-0}"
 EOS
 cat >"$st/job.sh" <<'EOS'
 #!/bin/bash
-echo "job CI_SCRIPTS_TESTED=${CI_SCRIPTS_TESTED-unset} fd9:$([ -e /proc/self/fd/9 ] && echo open || echo closed)" >>"$LOG"
+echo "job CI_SCRIPTS_TESTED=${CI_SCRIPTS_TESTED-unset} fd9:$([ -e /proc/self/fd/9 ] && echo open || echo closed) fd10:$([ -e /proc/self/fd/10 ] && echo open || echo closed) fd11:$([ -e /proc/self/fd/11 ] && echo open || echo closed)" >>"$LOG"
 exit "${J_RC:-0}"
 EOS
 step_run() { # step_run JOB T_RC J_RC TEST_SECONDS [VAR=value...]: sets step_rc, step_log, step_err
@@ -3211,7 +3213,7 @@ step_run() { # step_run JOB T_RC J_RC TEST_SECONDS [VAR=value...]: sets step_rc,
         . ci/lib.sh
         export CI_KILL_AFTER=1
         for kv in "$@"; do export "${kv?}"; done
-        exec 9<"$st/tests.sh" # an open lock descriptor, as the step has
+        exec 9<"$st/tests.sh" 10<"$st/tests.sh" 11<"$st/tests.sh" # open lock descriptors, as the step has
         # shellcheck disable=SC2034 # a nameref array, read by ci_step_run_with_tests
         tests_cmd=(env LOG="$st/log" T_RC="$t_rc" bash "$st/tests.sh")
         # shellcheck disable=SC2034 # a nameref array, read by ci_step_run_with_tests
@@ -3226,7 +3228,7 @@ step_run() { # step_run JOB T_RC J_RC TEST_SECONDS [VAR=value...]: sets step_rc,
 }
 step_run check-scripts 1 0 60 X=1
 is "step tail: the tests fail, the job passes: the step fails" 1 "$step_rc"
-is "step tail: check-scripts runs the tests first, then the job with CI_SCRIPTS_TESTED=1, both with fd 9 closed" "tests fd9:closed|job CI_SCRIPTS_TESTED=1 fd9:closed|" "$step_log"
+is "step tail: check-scripts runs the tests first, then the job with CI_SCRIPTS_TESTED=1, both with fds 9, 10 and 11 closed" "tests fd9:closed fd10:closed fd11:closed|job CI_SCRIPTS_TESTED=1 fd9:closed fd10:closed fd11:closed|" "$step_log"
 step_run check-scripts 0 3 60 X=1
 is "step tail: the tests pass, the job fails: the job's status" 3 "$step_rc"
 step_run check-scripts 0 0 60 X=1
@@ -3235,7 +3237,7 @@ step_run check-scripts 1 3 60 X=1
 is "step tail: both fail: the job's status" 3 "$step_rc"
 step_run check 1 0 60 CI_SCRIPTS_TESTED=1
 is "step tail: another job does not run the root tests (they would fail here), and passes alone" 0 "$step_rc"
-is "step tail: another job runs alone, CI_SCRIPTS_TESTED unset (even if a pipeline variable set it), fd 9 closed" "job CI_SCRIPTS_TESTED=unset fd9:closed|" "$step_log"
+is "step tail: another job runs alone, CI_SCRIPTS_TESTED unset (even if a pipeline variable set it), fds 9, 10 and 11 closed" "job CI_SCRIPTS_TESTED=unset fd9:closed fd10:closed fd11:closed|" "$step_log"
 step_run check 0 3 60 X=1
 is "step tail: another job's failure is the step's" 3 "$step_rc"
 # The tests have a bound of their own, and the message names its knob; the job still runs after it.
@@ -3248,6 +3250,266 @@ out=$(. ci/lib.sh; CI_KILL_AFTER=1 ci_run_timed demo 1 sleep 30 2>&1 || true)
 grep -q "NRV-E1215: demo ran past its 1 seconds.*CI_STEP_MINUTES raises it" <<<"$out" || { echo "FAIL the job's bound does not name CI_STEP_MINUTES: $out" >&2; fail=1; }
 refuses NRV-E1208 "CI_SCRIPTS_TEST_MINUTES not a number" env CI_SCRIPTS_TEST_MINUTES=soon ci/woodpecker_step.sh check
 refuses NRV-E1208 "CI_SCRIPTS_TEST_MINUTES zero" env CI_SCRIPTS_TEST_MINUTES=0 ci/woodpecker_step.sh check
+
+# --- The box lock (decision O12, NRV-E1245): jobs hold locks/box.lock shared, integration exclusive,
+# behind a turnstile. Real flock on files in a scratch lock directory.
+bl="$tmp/boxlocks"
+mkdir -m 700 "$bl"
+box_hold() { # box_hold MODE MARKER SECONDS [WAIT]: a holder in the background; its pid (box_pid) is the sleep that holds the descriptors
+    ( . ci/cache.sh; CI_BOX_WAIT="${4:-30}" ci_box_lock "$1" "$bl" && : >"$2" && exec sleep "$3" ) >/dev/null 2>&1 &
+    box_pid=$!
+}
+box_try() { # box_try MODE WAIT: the output of one ci_box_lock; the last line is its status
+    ( . ci/cache.sh; CI_BOX_WAIT="$2" ci_box_lock "$1" "$bl" && echo rc=0 || echo rc=1 ) 2>&1
+}
+box_rc() { tail -n 1 <<<"$1"; }
+# Shared holders coexist, and the turnstile is let go after each.
+box_hold shared "$tmp/s1" 4
+wait_for "$tmp/s1" || { echo "FAIL the first shared holder never held the box lock" >&2; fail=1; }
+out=$(box_try shared 2)
+is "box lock: a second shared holder gets it beside the first" "rc=0" "$(box_rc "$out")"
+is "box lock: a shared holder does not keep the turnstile" free "$(flock -x -n "$bl/turnstile.lock" true && echo free || echo held)"
+out=$(box_try exclusive 1)
+is "box lock: an exclusive holder cannot get it beside a shared one" "rc=1" "$(box_rc "$out")"
+grep -q "NRV-E1245: the box lock .*box.lock was not free for the exclusive holder within 1 s (turnstile and box together): short jobs hold it shared" <<<"$out" || { echo "FAIL box lock: exclusive beside shared: no NRV-E1245: $out" >&2; fail=1; }
+wait "$box_pid" || true
+# The exclusive holder excludes shared and exclusive ones, with its code, and is not run unlocked.
+rm -f "$tmp/x1"
+box_hold exclusive "$tmp/x1" 4
+wait_for "$tmp/x1" || { echo "FAIL the exclusive holder never held the box lock" >&2; fail=1; }
+out=$(box_try shared 1)
+is "box lock: a shared holder cannot get it beside the exclusive one" "rc=1" "$(box_rc "$out")"
+grep -q "NRV-E1245: .*box.lock was not free for the shared holder within 1 s (turnstile and box together): an integration test run holds it exclusive" <<<"$out" || { echo "FAIL box lock: shared beside exclusive: no NRV-E1245: $out" >&2; fail=1; }
+is "box lock: a running exclusive holder does not keep the turnstile (it let it go when it got the box)" free "$(flock -x -n "$bl/turnstile.lock" true && echo free || echo held)"
+out=$(box_try exclusive 1)
+is "box lock: a second exclusive holder cannot get it" "rc=1" "$(box_rc "$out")"
+wait "$box_pid" || true
+out=$(box_try shared 2)
+is "box lock: free again when the exclusive holder ends" "rc=0" "$(box_rc "$out")"
+# The turnstile: an exclusive step waiting for a shared holder keeps new shared steps out (control:
+# without a waiter a new shared step gets in beside the holder).
+rm -f "$tmp/s1" "$tmp/x1"
+box_hold shared "$tmp/s1" 7
+s1_pid=$box_pid
+wait_for "$tmp/s1" || { echo "FAIL the shared holder never held the box lock" >&2; fail=1; }
+out=$(box_try shared 2)
+is "box lock: control: a new shared step gets in beside a shared holder" "rc=0" "$(box_rc "$out")"
+box_hold exclusive "$tmp/x1" 4
+x_pid=$box_pid
+for _ in $(seq 50); do flock -x -n "$bl/turnstile.lock" true || break; sleep 0.1; done
+is "box lock: the waiting exclusive step holds the turnstile" held "$(flock -x -n "$bl/turnstile.lock" true && echo free || echo held)"
+out=$(box_try shared 1)
+is "box lock: a waiting exclusive step keeps a new shared step out" "rc=1" "$(box_rc "$out")"
+grep -q "NRV-E1245: .*turnstile.lock was not free for the shared holder within 1 s (turnstile and box together): integration steps ahead of this one hold the turnstile" <<<"$out" || { echo "FAIL box lock: turnstile: no NRV-E1245 naming the integration steps: $out" >&2; fail=1; }
+wait "$s1_pid" || true
+wait_for "$tmp/x1" || { echo "FAIL box lock: the exclusive step never got the lock after the shared holder ended" >&2; fail=1; }
+out=$(box_try shared 1)
+is "box lock: the exclusive step keeps new shared steps out while it runs" "rc=1" "$(box_rc "$out")"
+wait "$x_pid" || true
+out=$(box_try shared 2)
+is "box lock: shared steps run again after the exclusive one" "rc=0" "$(box_rc "$out")"
+# Knobs and misuse.
+out=$( ( . ci/cache.sh; CI_BOX_WAIT=soon ci_box_lock shared "$bl" && echo rc=0 || echo rc=1 ) 2>&1)
+grep -q "NRV-E1208: CI_BOX_WAIT='soon'" <<<"$out" || { echo "FAIL box lock: CI_BOX_WAIT not a number: $out" >&2; fail=1; }
+out=$( ( . ci/cache.sh; CI_INTEGRATION_RUN_MINUTES=0 ci_box_lock shared "$bl" && echo rc=0 || echo rc=1 ) 2>&1)
+grep -q "NRV-E1208: CI_INTEGRATION_RUN_MINUTES='0'" <<<"$out" || { echo "FAIL box lock: CI_INTEGRATION_RUN_MINUTES zero: $out" >&2; fail=1; }
+out=$( ( . ci/cache.sh; ci_box_lock sideways "$bl" && echo rc=0 || echo rc=1 ) 2>&1)
+grep -q "NRV-B1203" <<<"$out" || { echo "FAIL box lock: a bad mode: $out" >&2; fail=1; }
+# The default wait is derived from the jobs' limits: (75 min + kill) + (20 min + kill) + (5 min + kill)
+# + 300 s with the defaults, and follows a raised CI_STEP_MINUTES; a bad value counts as the default.
+bw() { env -u CI_BOX_WAIT -u CI_STEP_MINUTES -u CI_SCRIPTS_TEST_MINUTES -u CI_INTEGRATION_RUN_MINUTES -u CI_KILL_AFTER "$@" bash -c '. ci/cache.sh; ci_box_wait_default'; }
+is "box lock: the default wait is 6480 s (75 + 20 + 5 minutes, three kill-afters, 5 minutes)" 6480 "$(bw)"
+is "box lock: the default wait follows a raised CI_STEP_MINUTES (200: +7500 s)" 13980 "$(bw CI_STEP_MINUTES=200)"
+is "box lock: the default wait follows CI_SCRIPTS_TEST_MINUTES, CI_INTEGRATION_RUN_MINUTES and CI_KILL_AFTER" 7215 "$(bw CI_SCRIPTS_TEST_MINUTES=30 CI_INTEGRATION_RUN_MINUTES=10 CI_KILL_AFTER=5)"
+is "box lock: a value that is no number counts as the default" 6480 "$(bw CI_STEP_MINUTES=x)"
+is "box lock: a waiter's own lower limits do not lower the default (the holders may use the defaults)" 6480 "$(bw CI_STEP_MINUTES=20 CI_SCRIPTS_TEST_MINUTES=5)"
+# A call's two waits share one budget: the turnstile held for 3 s and the box for much longer, with a
+# budget of 4 s, fails after about 4 s, not 3 + 4.
+rm -f "$tmp/s1"
+box_hold shared "$tmp/s1" 8
+s_pid=$box_pid
+wait_for "$tmp/s1" || { echo "FAIL the shared holder never held the box lock" >&2; fail=1; }
+( exec 11<"$bl/turnstile.lock"; flock -x 11; sleep 3 ) &
+sleep 0.3
+t0=$SECONDS
+out=$(box_try exclusive 4)
+el=$((SECONDS - t0))
+is "box lock: the turnstile wait and the box wait share one budget (4 s, not 3 + 4)" "rc=1 yes" "$(box_rc "$out") $([ "$el" -le 5 ] && echo yes)"
+grep -q "NRV-E1245: the box lock .*box.lock was not free for the exclusive holder within 4 s (turnstile and box together)" <<<"$out" || { echo "FAIL box lock: the budget's message: $out" >&2; fail=1; }
+kill -9 "$s_pid" 2>/dev/null || true
+wait "$s_pid" 2>/dev/null || true
+wait
+# A flock that fails for another reason than the timeout (here: fd 10 is taken for the stderr a
+# redirection on the call saves) is NRV-B1204, never a timeout that blames another holder.
+out=$( ( . ci/cache.sh; CI_BOX_WAIT=1 ci_box_lock shared "$bl" 2>"$tmp/redir.err" && echo rc=0 || echo rc=1 ) 2>&1 10<&- 11<&-)
+is "box lock: a call with a redirection (fd 10 lost) fails" "rc=1" "$(box_rc "$out")"
+grep -q "NRV-B1204: flock on the box lock .* failed with status [0-9]*, which is not a timeout" "$tmp/redir.err" || { echo "FAIL box lock: a flock failure that is not a timeout is not NRV-B1204: $(cat "$tmp/redir.err")" >&2; fail=1; }
+if grep -q "NRV-E1245" "$tmp/redir.err"; then echo "FAIL box lock: a flock failure that is not a timeout is reported as NRV-E1245" >&2; fail=1; fi
+# A holder that is killed (a cancelled step: SIGKILL of the container's processes) frees the lock.
+rm -f "$tmp/x1"
+box_hold exclusive "$tmp/x1" 60
+wait_for "$tmp/x1" || { echo "FAIL the exclusive holder never held the box lock" >&2; fail=1; }
+out=$(box_try shared 1)
+is "box lock: control: a live exclusive holder keeps shared ones out" "rc=1" "$(box_rc "$out")"
+kill -9 "$box_pid"
+wait "$box_pid" 2>/dev/null || true
+out=$(box_try exclusive 2)
+is "box lock: a killed exclusive holder frees the lock (and the turnstile)" "rc=0" "$(box_rc "$out")"
+rm -f "$tmp/s1"
+box_hold shared "$tmp/s1" 60
+wait_for "$tmp/s1" || { echo "FAIL the shared holder never held the box lock" >&2; fail=1; }
+kill -9 "$box_pid"
+wait "$box_pid" 2>/dev/null || true
+out=$(box_try exclusive 2)
+is "box lock: a killed shared holder frees the lock" "rc=0" "$(box_rc "$out")"
+# ci_box_unlock lets go of both; a failed wait leaves nothing held; the upgrade of a step that holds
+# the lock shared is refused (it would deadlock two integration steps): release first, then ask.
+out=$( ( . ci/cache.sh; ci_box_lock shared "$bl" && ci_box_unlock && flock -x -n "$bl/box.lock" true && flock -x -n "$bl/turnstile.lock" true && echo rc=0 || echo rc=1 ) 2>&1)
+is "box lock: ci_box_unlock lets go of the box lock" "rc=0" "$(box_rc "$out")"
+out=$( ( . ci/cache.sh; ci_box_lock shared "$bl" && ci_box_lock exclusive "$bl" && echo rc=0 || echo rc=1 ) 2>&1)
+is "box lock: waiting for exclusive while holding shared is refused" "rc=1" "$(box_rc "$out")"
+grep -q "NRV-B1203: ci_box_lock exclusive: called while holding the box lock (shared)" <<<"$out" || { echo "FAIL box lock: a held lock is not refused with NRV-B1203: $out" >&2; fail=1; }
+out=$( ( . ci/cache.sh; ci_box_lock shared "$bl" && ci_box_unlock && ci_box_lock exclusive "$bl" && echo rc=0 || echo rc=1 ) 2>&1)
+is "box lock: shared, released, then exclusive (the step's order) works" "rc=0" "$(box_rc "$out")"
+rm -f "$tmp/s1"
+box_hold shared "$tmp/s1" 4
+wait_for "$tmp/s1" || { echo "FAIL the shared holder never held the box lock" >&2; fail=1; }
+out=$( ( . ci/cache.sh; CI_BOX_WAIT=1 ci_box_lock exclusive "$bl" || { flock -x -n "$bl/turnstile.lock" true && echo free; } ) 2>&1)
+is "box lock: a failed exclusive wait leaves the turnstile free" free "$(tail -n 1 <<<"$out")"
+wait "$box_pid" || true
+# --- ci_step_job_in_box and ci_step_integration (ci/cache.sh): the step's flow with a stub job that
+# records which lock the step holds while it runs (a child opens the lock file itself: a shared try
+# fails under an exclusive lock, an exclusive try under any lock) and whether fds 10 and 11 are closed.
+# `timeout` is a function that logs its limit and runs the command.
+cat >"$st/boxjob.sh" <<'EOS'
+#!/bin/bash
+# boxjob.sh NAME RC LOCKS: logs the box lock's state as this process sees it
+s=$(flock -s -n "$3/box.lock" true && echo yes || echo no)
+x=$(flock -x -n "$3/box.lock" true && echo yes || echo no)
+echo "$1 shared-ok:$s excl-ok:$x fd10:$([ -e /proc/self/fd/10 ] && echo open || echo closed) fd11:$([ -e /proc/self/fd/11 ] && echo open || echo closed)" >>"$LOG"
+exit "$2"
+EOS
+bi_run() { # bi_run MODE B_RC J_RC [VAR=value...]: MODE integration, shared, exclusive or none; sets bi_rc, bi_log, bi_limits, bi_err
+    local mode="$1" b_rc="$2" j_rc="$3"
+    shift 3
+    rm -f "$st/bilog" "$st/bilimits"
+    bi_rc=0
+    (
+        . ci/cache.sh
+        export CI_KILL_AFTER=1 CI_BOX_WAIT=3 CI_INTEGRATION_RUN_MINUTES=20 LOG="$st/bilog"
+        unset CI_TIMEOUT_KNOB CI_STEP_START
+        for kv in "$@"; do export "${kv?}"; done
+        timeout() { echo "$2" >>"$st/bilimits"; shift 2; "$@"; }
+        # shellcheck disable=SC2034 # namerefs, read by ci_step_run_with_tests
+        tests_cmd=(true)
+        # shellcheck disable=SC2034 # namerefs, read by ci_step_run_with_tests
+        untimed_cmd=(bash "$st/boxjob.sh" untimed "$b_rc" "$bl")
+        # shellcheck disable=SC2034 # namerefs, read by ci_step_run_with_tests
+        job_cmd=(bash "$st/boxjob.sh" "$([ "$mode" = integration ] && echo timed || echo test)" "$j_rc" "$bl")
+        status=0
+        if [ "$mode" = integration ]; then
+            ci_step_integration "$bl" "${BI_MINUTES:-75}" 0 1200 tests_cmd untimed_cmd job_cmd || status=$?
+        else
+            ci_step_job_in_box "$mode" "$bl" demo "${BI_MINUTES:-75}" 0 1200 tests_cmd job_cmd || status=$?
+        fi
+        echo "after box:$(flock -x -n "$bl/box.lock" true && echo free || echo held) turnstile:$(flock -x -n "$bl/turnstile.lock" true && echo free || echo held) held:${CI_BOX_HELD:-none}" >>"$st/bilog"
+        exit "$status"
+    ) 2>"$st/bierr" || bi_rc=$?
+    bi_log=$(if [ -f "$st/bilog" ]; then tr '\n' '|' <"$st/bilog"; fi)
+    bi_limits=$(if [ -f "$st/bilimits" ]; then tr '\n' '|' <"$st/bilimits"; fi)
+    bi_err=$(cat "$st/bierr")
+}
+rel="after box:free turnstile:free held:none|"
+bi_run integration 0 0 BI_MINUTES=75
+# The timed scenario (the latency bound) must never run under the shared lock: the stub of the timed run
+# sees `shared-ok:no` only while the lock is held exclusive. Mutant: ci_step_integration runs the timed
+# array in the shared mode (or the arrays swapped): the line below shows `shared-ok:yes` for it.
+is "integration: the untimed scenarios run shared, then the timed one exclusive (the shared lock was let go between), both with fds 10 and 11 closed, both locks free after" \
+    "0 untimed shared-ok:yes excl-ok:no fd10:closed fd11:closed|timed shared-ok:no excl-ok:no fd10:closed fd11:closed|$rel" "$bi_rc $bi_log"
+is "integration: the untimed run has the step's limit (75 min), the timed one the run limit (20 min as set here)" "4500|1200|" "$bi_limits"
+bi_run integration 3 0
+is "integration: a failing untimed run skips the timed one (it never runs without them), the step's status is the untimed run's, the locks are free" \
+    "3 untimed shared-ok:yes excl-ok:no fd10:closed fd11:closed|$rel" "$bi_rc $bi_log"
+bi_run integration 0 4
+is "integration: a failing timed run is the step's status and the locks are free after" \
+    "4 untimed shared-ok:yes excl-ok:no fd10:closed fd11:closed|timed shared-ok:no excl-ok:no fd10:closed fd11:closed|$rel" "$bi_rc $bi_log"
+bi_run integration 0 0 BI_MINUTES=5
+is "integration: the run limit is capped by the step's limit (5 min: 300 s and 300 s)" "300|300|" "$bi_limits"
+bi_run integration 0 0 CI_INTEGRATION_RUN_MINUTES=7
+is "integration: CI_INTEGRATION_RUN_MINUTES sets the timed run's limit (7 min), not the untimed one's" "4500|420|" "$bi_limits"
+bi_run integration 0 0 CI_INTEGRATION_RUN_MINUTES=
+is "integration: the timed run's limit is 5 minutes by default (the scenario takes seconds)" "4500|300|" "$bi_limits"
+bi_run shared 0 6
+is "a short job runs shared, fds 10 and 11 closed, its status is the step's, the locks are free after" \
+    "6 test shared-ok:yes excl-ok:no fd10:closed fd11:closed|$rel" "$bi_rc $bi_log"
+bi_run none 0 0
+is "a long job runs with no box lock at all, and takes none" "0 test shared-ok:yes excl-ok:yes fd10:closed fd11:closed|$rel" "$bi_rc $bi_log"
+# A lock that cannot be had (an exclusive holder, 1 s of budget): NRV-E1245, status 1, nothing run, nothing held.
+rm -f "$tmp/x1"
+box_hold exclusive "$tmp/x1" 6
+x_pid=$box_pid
+wait_for "$tmp/x1" || { echo "FAIL the exclusive holder never held the box lock" >&2; fail=1; }
+bi_run shared 0 0 CI_BOX_WAIT=1
+is "a short job that cannot get the lock does not run, status 1, nothing held" "1 after box:held turnstile:free held:none|" "$bi_rc $bi_log"
+grep -q "NRV-E1245" <<<"$bi_err" || { echo "FAIL a short job that cannot get the lock: no NRV-E1245: $bi_err" >&2; fail=1; }
+bi_run integration 0 0 CI_BOX_WAIT=1
+is "integration whose untimed run cannot get the lock runs neither it nor the timed one, status 1" "1 after box:held turnstile:free held:none|" "$bi_rc $bi_log"
+kill -9 "$x_pid" 2>/dev/null || true
+wait "$x_pid" 2>/dev/null || true
+# The step: the long jobs take no lock, the short ones shared, integration runs its untimed scenarios
+# shared then its timed one exclusive, each around the run alone (static); the descriptors are closed for children (static).
+is "the long jobs take no box lock; integration has its own flow; the rest are shared (static)" "1 1 1" "$(grep -c '^    fuzz-long | vopr-long | jepsen) box=none ;;$' ci/woodpecker_step.sh || true) $(grep -c '^    integration) box=integration ;;$' ci/woodpecker_step.sh || true) $(grep -c '^    \*) box=shared ;;$' ci/woodpecker_step.sh || true)"
+is "the step closes the box lock's fds 10 and 11 for install_zig, the job and the root tests (static)" "1 2" "$(grep -c 'ci/install_zig.sh .* 10<&- 11<&-' ci/woodpecker_step.sh || true) $(grep -c '9<&- 10<&- 11<&-' ci/lib.sh || true)"
+is "ci_locks_check runs after a Markdown-only run's exit (N68) and before the caches are checked (static)" yes "$(m=$(grep -n '^    echo "Markdown alone' ci/woodpecker_step.sh | cut -d: -f1); l=$(grep -n '^ci_locks_check ' ci/woodpecker_step.sh | cut -d: -f1); c=$(grep -n '^ci_cache_check ' ci/woodpecker_step.sh | cut -d: -f1); [ -n "$m" ] && [ -n "$l" ] && [ -n "$c" ] && [ "$m" -lt "$l" ] && [ "$l" -lt "$c" ] && echo yes)"
+is "no box lock is taken before the first apt-get, nor by the top of the step (static)" 0 "$(grep -c '^ci_box_lock ' ci/woodpecker_step.sh || true)"
+
+# --- ci/job.sh integration [untimed|timed] (decision O12): a stub ./zig/zig records its arguments and the
+# scenario selection it was given. No argument leaves NERVA_INTEGRATION_SCENARIOS unset, so every scenario
+# runs (GitHub Actions, CLAUDE.md's command); `untimed` and `timed` set it; anything else is refused at
+# once, never passed on. Mutant: the two names swapped, or the variable set for no argument: caught below.
+jr="$tmp/jobroot"
+mkdir -p "$jr/zig"
+cat >"$jr/zig/zig" <<'EOS'
+#!/bin/bash
+echo "zig $* scenarios=${NERVA_INTEGRATION_SCENARIOS-unset}"
+EOS
+chmod +x "$jr/zig/zig"
+job_int() { (cd "$jr" && env -u NERVA_INTEGRATION_SCENARIOS bash "$root/ci/job.sh" integration "$@" 2>&1; echo "rc=$?"); }
+is "job.sh integration: no argument runs every scenario (the variable stays unset)" "zig build test:integration scenarios=unset|rc=0|" "$(job_int | tr '\n' '|')"
+is "job.sh integration untimed: the untimed scenarios" "zig build test:integration scenarios=untimed|rc=0|" "$(job_int untimed | tr '\n' '|')"
+is "job.sh integration timed: the timed scenario" "zig build test:integration scenarios=timed|rc=0|" "$(job_int timed | tr '\n' '|')"
+is "job.sh integration with another argument: NRV-E1208, exit 2, zig not run" "yes rc=2" "$(out=$(job_int latency); grep -q 'NRV-E1208: usage: ci/job.sh integration \[untimed|timed\]' <<<"$out" && ! grep -q '^zig ' <<<"$out" && echo yes) $(job_int latency | tail -1)"
+
+# --- When the Python tests that follow the integration executable skip themselves (decision O12).
+# `zig build test:integration` runs tests/errors/commands.py and tests/recover/recover.py after the
+# executable. They must skip only when NERVA_INTEGRATION_SCENARIOS selects timed scenarios alone
+# (`timed`, `latency`, a list of them), never when it is unset, `untimed`, `cluster` or a list holding
+# any untimed entry: a skip there would turn the suites into a green no-op in CI. Run with no
+# arguments, a script that does not skip stops at once (usage or a missing argument): that is the
+# "ran" case here, and nothing else is started. Mutants: the test `== "timed"` (latency would run),
+# `!= "timed"` or `startswith`, caught by the cases below.
+if command -v python3 >/dev/null; then
+    for py in tests/errors/commands.py tests/recover/recover.py; do
+        for sel in timed latency "latency,timed" "timed,latency"; do
+            out=$(env -i PATH="$PATH" NERVA_INTEGRATION_SCENARIOS="$sel" python3 -B "$py" 2>&1) && rc=0 || rc=$?
+            is "$py skips for NERVA_INTEGRATION_SCENARIOS=$sel (exit 0, one skipped: line)" "0 1" "$rc $(grep -c '^skipped:' <<<"$out" || true)"
+        done
+        for sel in unset untimed cluster peer_auth "latency,cluster" "timed,untimed" "untimed,timed" "" "bogus" "timed,"; do
+            if [ "$sel" = unset ]; then
+                out=$(env -i PATH="$PATH" python3 -B "$py" 2>&1) && rc=0 || rc=$?
+            else
+                out=$(env -i PATH="$PATH" NERVA_INTEGRATION_SCENARIOS="$sel" python3 -B "$py" 2>&1) && rc=0 || rc=$?
+            fi
+            is "$py does not skip for NERVA_INTEGRATION_SCENARIOS='$sel'" "0 nonzero" "$(grep -c '^skipped:' <<<"$out" || true) $([ "$rc" != 0 ] && echo nonzero)"
+        done
+        # Its timed names are the Zig side's: the group and every scenario Scenario.timed marks.
+        zig_timed=$(sed -n 's/^ *\.\([a-z_]*\) => true,$/\1/p' src/nerva/integration_scenarios.zig | sort | tr '\n' ' ')
+        py_timed=$(sed -n 's/^TIMED_SCENARIOS = (\(.*\))$/\1/p' "$py" | tr -d '" ' | tr ',' '\n' | grep -v '^timed$' | sort | tr '\n' ' ')
+        is "$py's TIMED_SCENARIOS are the scenarios Scenario.timed marks, and the group" "$zig_timed" "$py_timed"
+    done
+else
+    echo "note: no python3: the Python tests' skip rule was not tested" >&2
+fi
 
 # --- The suite is hermetic (review 6001089776): the root run in a Woodpecker step has the step's
 # environment, and a step exports CI_BRANCH_PRUNE_ALL=1 when the box is low on disk. Run the whole

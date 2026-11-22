@@ -9,7 +9,11 @@
 #   ci/job.sh check-code            typecheck, format, the quickstart loop, declared views
 #   ci/job.sh check-scripts         the release, perf, fleet, Jepsen and CI scripts' tests
 #   ci/job.sh check-packages        the package repositories' tests (the longest of the scripts')
-#   ci/job.sh integration           three real replicas (~3.5 GiB of disk)
+#   ci/job.sh integration [untimed|timed]
+#                                   three real replicas (~3.5 GiB of disk). With no argument every
+#                                   scenario of src/integration_tests.zig runs; `untimed` runs all
+#                                   but the timed one (what takes the minutes), `timed` the timed
+#                                   one alone, in seconds (NERVA_INTEGRATION_SCENARIOS, decision O12)
 #   ci/job.sh api                   the JSON API against a model
 #   ci/job.sh releases              mixed releases
 #   ci/job.sh targets               targets-check, then targets-build
@@ -95,7 +99,16 @@ check)
 check-code) check_code ;;
 check-scripts) check_scripts ;;
 check-packages) check_packages ;;
-integration) ./zig/zig build test:integration ;;
+integration)
+    case "$arg" in
+    '') ./zig/zig build test:integration ;;
+    untimed | timed) NERVA_INTEGRATION_SCENARIOS="$arg" ./zig/zig build test:integration ;;
+    *)
+        ci_error "NRV-E1208: usage: ci/job.sh integration [untimed|timed]"
+        exit 2
+        ;;
+    esac
+    ;;
 api) ./zig/zig build test:api ;;
 releases) ./zig/zig build test:release ;;
 targets-check) targets_check ;;

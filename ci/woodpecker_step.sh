@@ -23,6 +23,11 @@
 #     made the disk look low) and again after it, for the tail (CI_TRASH_TAIL_SECONDS, never past the
 #     repository's timeout: CI_REPO_TIMEOUT_MINUTES); a branch's size is a record its own step writes after its locks, before the job and
 #     after it (CI_BRANCH_DU_SECONDS).
+#   - The short jobs hold a shared lock on locks/box.lock around their run alone, the integration job
+#     an exclusive one around its timed scenario alone (every other scenario is a shared run before),
+#     behind a turnstile (locks/turnstile.lock) so shared jobs cannot starve it: that scenario runs
+#     with no other short job's run beside it. The long jobs (fuzz-long, vopr-long, jepsen) take no lock and integration does not
+#     wait for them (decision O12, ci_box_lock; CI_BOX_WAIT, NRV-E1245).
 #   - Each job has a timeout (75 minutes; 330 for the long searches; CI_STEP_MINUTES replaces it),
 #     see the `case` below; one that runs past it fails NRV-E1215.
 set -euo pipefail
@@ -34,6 +39,12 @@ CI_STEP_START=$(date +%s)
 
 job="${1:?usage: ci/woodpecker_step.sh <job> [arg]}"
 arg="${2:-}"
+# The integration job takes no argument here (it runs its two scenario groups itself, O12): one given
+# is a mistake in the YAML, refused as `ci/job.sh integration bogus` is, never silently ignored.
+if [ "$job" = integration ] && [ -n "$arg" ]; then
+    ci_error "NRV-E1208: ci/woodpecker_step.sh integration takes no argument, got '$arg'"
+    exit 2
+fi
 cache=/cache
 user=ci
 free_min_gib="${CI_FREE_MIN_GIB:-60}"
@@ -59,6 +70,12 @@ minutes="${CI_STEP_MINUTES:-$minutes}"
 test_minutes="${CI_SCRIPTS_TEST_MINUTES:-20}"
 [[ "$test_minutes" =~ ^[1-9][0-9]*$ ]] || { ci_error "NRV-E1208: CI_SCRIPTS_TEST_MINUTES='$test_minutes' is not a whole number of minutes"; exit 2; }
 
+# The box lock (decision O12, ci_box_lock in ci/cache.sh) is taken far below, around the job's run
+# alone: never around the package install, the seed copy or the tail, and not at all by a Markdown-only
+# run (N68), which exits before it (and before ci_locks_check, so that run never looks at locks/).
+. ci/cache.sh
+ci_knobs_check || exit 2
+
 export DEBIAN_FRONTEND=noninteractive
 apt-get -o Acquire::Retries=5 update -qq
 # What GitHub's ubuntu-24.04 runner has and the scripts use (unzip: .github/scripts/mac_zip_check.sh;
@@ -83,13 +100,12 @@ ci/io_uring_check.sh
 
 case "$job" in check | check-scripts | check-packages) ci/install_repo_tools.sh ;; esac
 
-. ci/cache.sh
 # shellcheck disable=SC2034 # read by ci/cache.sh (ci_as_job)
 CI_JOB_USER="$user" # ci_as_job: what root would make in a cache the job writes, the job's user makes
 id "$user" >/dev/null 2>&1 || useradd --create-home --uid 1001 --user-group "$user"
 chown -R "$user:$user" "$PWD"
+ci_locks_check "$cache" || exit 1
 ci_cache_check "$role" "$cache" || exit 1
-ci_knobs_check || exit 2
 # What an earlier step left in the trash of the mount this one writes is removed BEFORE the disk is
 # measured: its blocks and inodes are what made the disk look low, and a step that measures first
 # prunes caches that were fine (ci_trash_empty: one removal per mount at a time, none waits for
@@ -180,10 +196,10 @@ as_ci=(setpriv --reuid "$user" --regid "$user" --init-groups
     ZIG_GLOBAL_CACHE_DIR="$base/zig" ZIG_LOCAL_CACHE_DIR="$base/zig-local"
     CI_TOOLCHAIN_DIR="$cache/main/tools" CI_TOOLCHAIN_WRITE="$toolchain_write")
 
-# The step's locks (fds 6 to 9) stay with the step: bash's `exec N<file` is not close-on-exec, so a
+# The step's locks (fds 6 to 11) stay with the step: bash's `exec N<file` is not close-on-exec, so a
 # job would inherit them and could `flock -x` one for good. Both commands close them for the child
 # only; the step's own descriptors, and so its locks, stay open until it exits.
-"${as_ci[@]}" ci/install_zig.sh 6>&- 7>&- 8>&- 9<&-
+"${as_ci[@]}" ci/install_zig.sh 6>&- 7>&- 8>&- 9<&- 10<&- 11<&-
 # The scripts' own tests run as root, here, before the job (review 6000930445): their guards on what
 # root does (the uid spies, the ownership and mount tests) are vacuous, and say so, as anyone else.
 # The checkout is this commit's and nothing untrusted has run in this step yet, as for the scripts
@@ -205,7 +221,27 @@ if [ "$job" = check-scripts ]; then reserved=$((test_minutes * 60 + ${CI_KILL_AF
 # check-scripts the root tests run first, bounded by CI_SCRIPTS_TEST_MINUTES, not by the job's whole
 # limit; either failing fails the step. A job with no time left is not started, and a shortened one
 # names the repository's Timeout in its NRV-E1215.) The tail below runs whatever the status.
-ci_step_job "$job" "$minutes" "$reserved" "$((test_minutes * 60))" tests_cmd job_cmd || status=$?
+# The box lock (decision O12; ci_step_job_in_box, ci_step_integration in ci/cache.sh, with their tests)
+# covers the job's run alone and is let go before the tail. fuzz-long, vopr-long and jepsen are long
+# jobs: they take no lock, so they never keep integration waiting (and integration's timing can suffer
+# beside them: accepted, O12). integration runs every scenario but the timed one first
+# (`ci/job.sh integration untimed`: a shared run, which also compiles), then the timed scenario alone
+# (`ci/job.sh integration timed`), exclusive, bounded by CI_INTEGRATION_RUN_MINUTES, so what everyone
+# waits for is a cluster start and 50 lookups and nothing else. A wait that fails (NRV-E1245) fails the step, which goes on to its tail.
+case "$job" in
+    fuzz-long | vopr-long | jepsen) box=none ;;
+    integration) box=integration ;;
+    *) box=shared ;;
+esac
+if [ "$box" = integration ]; then
+    # shellcheck disable=SC2034 # nameref arrays, read by ci_step_run_with_tests
+    untimed_cmd=("${as_ci[@]}" ci/job.sh integration untimed)
+    # shellcheck disable=SC2034 # as above
+    timed_cmd=("${as_ci[@]}" ci/job.sh integration timed)
+    ci_step_integration "$cache/locks" "$minutes" "$reserved" "$((test_minutes * 60))" tests_cmd untimed_cmd timed_cmd || status=$?
+else
+    ci_step_job_in_box "$box" "$cache/locks" "$job" "$minutes" "$reserved" "$((test_minutes * 60))" tests_cmd job_cmd || status=$?
+fi
 # A Jepsen run holds the Jepsen lock exclusively for its whole run, so what is left of what its sweep
 # and its reset of the tools moved aside (both were drained at once, a bounded 20 s each) is removed
 # only now, after the lock is let go (nothing is held that another step waits on): by ci_step_finish
