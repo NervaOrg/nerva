@@ -10,6 +10,8 @@
 #   ci/job.sh check-scripts         the release, perf, fleet, Jepsen and CI scripts' tests
 #   ci/job.sh check-packages        the package repositories' tests (the longest of the scripts')
 #   ci/job.sh integration           three real replicas (~3.5 GiB of disk)
+#   ci/job.sh integration-build     its build alone, run before it (decision O12: the test is then run under
+#                                   the exclusive box lock, with the compile already cached)
 #   ci/job.sh api                   the JSON API against a model
 #   ci/job.sh releases              mixed releases
 #   ci/job.sh targets               targets-check, then targets-build
@@ -96,6 +98,7 @@ check-code) check_code ;;
 check-scripts) check_scripts ;;
 check-packages) check_packages ;;
 integration) ./zig/zig build test:integration ;;
+integration-build) ./zig/zig build ;;
 api) ./zig/zig build test:api ;;
 releases) ./zig/zig build test:release ;;
 targets-check) targets_check ;;

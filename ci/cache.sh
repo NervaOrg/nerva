@@ -154,12 +154,12 @@ ci_job_not_root() {
 
 # ci_knobs_check: NRV-E1208 when CI_NORMALIZE_SECONDS, CI_CHILD_LOCK_WAIT, CI_BRANCH_DU_SECONDS,
 # CI_TRASH_SECONDS, CI_TRASH_TAIL_SECONDS, CI_TRASH_PENDING_MINUTES, CI_REPO_TIMEOUT_MINUTES,
-# CI_KILL_AFTER, CI_BOX_WAIT or CI_MIN_FREE_INODES, if set, is not a whole number (1 or more, at most six digits). The seconds go
+# CI_KILL_AFTER, CI_BOX_WAIT, CI_INTEGRATION_RUN_MINUTES or CI_MIN_FREE_INODES, if set, is not a whole number (1 or more, at most six digits). The seconds go
 # to timeout(1) and flock -w, where 0 means no limit or no wait, and anything else is an error from
 # a root step's tool; the minutes go to find -mmin and to arithmetic; the inode threshold is compared as a number.
 ci_knobs_check() {
     local n
-    for n in CI_NORMALIZE_SECONDS CI_CHILD_LOCK_WAIT CI_BRANCH_DU_SECONDS CI_TRASH_SECONDS CI_TRASH_TAIL_SECONDS CI_TRASH_PENDING_MINUTES CI_REPO_TIMEOUT_MINUTES CI_KILL_AFTER CI_BOX_WAIT CI_MIN_FREE_INODES; do
+    for n in CI_NORMALIZE_SECONDS CI_CHILD_LOCK_WAIT CI_BRANCH_DU_SECONDS CI_TRASH_SECONDS CI_TRASH_TAIL_SECONDS CI_TRASH_PENDING_MINUTES CI_REPO_TIMEOUT_MINUTES CI_KILL_AFTER CI_BOX_WAIT CI_INTEGRATION_RUN_MINUTES CI_MIN_FREE_INODES; do
         [ -z "${!n:-}" ] || [[ "${!n}" =~ ^[1-9][0-9]{0,5}$ ]] || {
             ci_error "NRV-E1208: $n='${!n}' is not a whole number (1 or more, at most six digits; seconds, minutes for the *_MINUTES knobs, or inodes for CI_MIN_FREE_INODES)"
             return 1
@@ -718,19 +718,24 @@ ci_main_lock_open() {
     { exec 9<"$f"; } 2>/dev/null || { ci_lock_open_failed "$f" '<'; return 1; }
 }
 
-# ci_box_lock MODE LOCKS: the host-wide reader/writer lock (decision O12). Every job step holds
-# LOCKS/box.lock (fd 10) SHARED for its whole run, so jobs run side by side; the integration job
-# holds it EXCLUSIVE, so its timing test (src/integration_tests.zig, one tick) runs with no other
-# job on the host (NervaOrg/nerva#11). flock is not fair: shared holders arriving one after another
-# would starve the exclusive waiter for ever. So every step first takes LOCKS/turnstile.lock (fd 11)
-# exclusively: a shared step lets it go as soon as it holds box.lock, the exclusive step HOLDS it
-# (also for the whole run) while it waits for box.lock, so no new job gets in behind it. The order
-# is always turnstile then box, so no cycle. Both waits are bounded by CI_BOX_WAIT (default 5400 s,
-# as CI_JEPSEN_WAIT): NRV-E1245, never a run without the lock. The wait is part of the step's time
-# (ci_job_seconds counts from CI_STEP_START, NRV-W1207). The step closes fds 10 and 11 for its
-# children, as 6 to 9. MODE is shared or exclusive.
+# ci_box_lock MODE LOCKS: the host-wide reader/writer lock around a SHORT job's run (decision O12).
+# A short job holds LOCKS/box.lock (fd 10) SHARED around its run alone (never its apt-get, its seed
+# copy or its tail), so short jobs run side by side; the integration job holds it EXCLUSIVE around
+# its test run alone, so its timing test (src/integration_tests.zig, one tick) runs with no other
+# short job's run beside it (NervaOrg/nerva#11). The long jobs (fuzz-long, vopr-long, Jepsen) take no
+# lock at all and never wait for this one. flock is not fair: shared holders arriving one after another
+# would starve the exclusive waiter for ever. So every call first takes LOCKS/turnstile.lock (fd 11)
+# exclusively: a shared call lets it go as soon as it holds box.lock; the exclusive call HOLDS it (also
+# for the whole run) while it waits for box.lock, so no new short job gets in behind it. The order is
+# always turnstile then box, and a step NEVER waits for the turnstile or an exclusive lock while it
+# holds box.lock shared (two integration steps would deadlock): it calls ci_box_unlock first
+# (CI_BOX_HELD, set here and cleared there, refuses it: NRV-B1203). Both waits are bounded by CI_BOX_WAIT
+# (default 4800 s: the short jobs' own limit, 75 minutes, and five more, so a wait ends early only when
+# a job outlived its own limit): NRV-E1245, never a run without the lock. The wait is part of the step's
+# time like any pre-job time (ci_job_seconds counts from CI_STEP_START, NRV-W1207). The step closes fds
+# 10 and 11 for its children, as 6 to 9. MODE is shared or exclusive.
 ci_box_lock() {
-    local mode="$1" locks="$2" wait="${CI_BOX_WAIT:-5400}" f
+    local mode="$1" locks="$2" wait="${CI_BOX_WAIT:-4800}" f
     case "$mode" in
     shared | exclusive) ;;
     *)
@@ -738,6 +743,10 @@ ci_box_lock() {
         return 1
         ;;
     esac
+    if [ -n "${CI_BOX_HELD:-}" ]; then
+        ci_error "NRV-B1203: ci_box_lock $mode: called while holding the box lock ($CI_BOX_HELD); waiting for the turnstile or an exclusive lock while holding it shared would deadlock two integration steps (a bug in the script that called it)"
+        return 1
+    fi
     ci_knobs_check || return 1
     for f in turnstile box; do ci_lock_file "$locks/$f.lock" || return 1; done
     # The opens are tested in a group and made bare: bash saves the stderr a group redirects in the
@@ -746,19 +755,40 @@ ci_box_lock() {
         { : <"$locks/$f.lock"; } 2>/dev/null || { ci_lock_open_failed "$locks/$f.lock" '<'; return 1; }
     done
     exec 11<"$locks/turnstile.lock" 10<"$locks/box.lock"
-    ci_box_lock_wait "$mode" "$wait" 11 -x "$locks/turnstile.lock" || return 1
+    # Held from here, so the failure paths below let go of what was taken (a failed step goes on to its tail).
+    CI_BOX_HELD=$mode
+    ci_box_lock_wait "$mode" "$wait" 11 -x "$locks/turnstile.lock" || { ci_box_unlock; return 1; }
     if [ "$mode" = shared ]; then
-        ci_box_lock_wait "$mode" "$wait" 10 -s "$locks/box.lock" || return 1
+        ci_box_lock_wait "$mode" "$wait" 10 -s "$locks/box.lock" || { ci_box_unlock; return 1; }
         flock -u 11
     else
-        ci_box_lock_wait "$mode" "$wait" 10 -x "$locks/box.lock" || return 1
+        ci_box_lock_wait "$mode" "$wait" 10 -x "$locks/box.lock" || { ci_box_unlock; return 1; }
     fi
 }
 
-# ci_box_lock_wait MODE SECONDS FD FLAG FILE: one bounded wait of ci_box_lock, NRV-E1245.
+# ci_box_unlock: lets go of the box lock and the turnstile (whichever are held) and closes fds 10 and
+# 11. The step calls it right after the run the lock covers, before the tail. Never fails.
+ci_box_unlock() {
+    CI_BOX_HELD=
+    flock -u 10 2>/dev/null || true
+    flock -u 11 2>/dev/null || true
+    exec 10<&- 11<&-
+}
+
+# ci_box_lock_wait MODE SECONDS FD FLAG FILE: one bounded wait of ci_box_lock, NRV-E1245. The message
+# names who holds the lock: what a shared step waits for is an integration step (the turnstile or the
+# exclusive lock), what an integration step waits for is the short jobs running (and, at the turnstile,
+# another integration step).
 ci_box_lock_wait() {
+    local who
     flock "$4" -w "$2" "$3" || {
-        ci_error "NRV-E1245: the box lock $5 was not free for the $1 holder within $2 s: the integration job runs alone on this machine (decision O12), so a long job, or a process on the host (lslocks shows its pid), holds it; start this one again when it ends, or raise CI_BOX_WAIT"
+        case "$5:$1" in
+        */turnstile.lock:shared) who="an integration step holds the turnstile while it waits for the running jobs to end and then runs alone; it ends within CI_BOX_WAIT of its own start" ;;
+        */turnstile.lock:*) who="another integration step holds the turnstile while it waits for the running jobs to end and then runs alone" ;;
+        */box.lock:shared) who="an integration test run holds it exclusive (CI_INTEGRATION_RUN_MINUTES at most), or a process outside the steps" ;;
+        *) who="short jobs hold it shared while they run (a job past its own limit, or a process outside the steps; lslocks shows the pids); the long jobs hold none" ;;
+        esac
+        ci_error "NRV-E1245: the box lock $5 was not free for the $1 holder within $2 s: $who (decision O12); start this one again, or raise CI_BOX_WAIT"
         return 1
     }
 }

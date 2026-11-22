@@ -467,13 +467,16 @@ set:
 
    **The box lock** (decision O12). The `integration` job asserts a median lookup under one 10 ms
    tick of wall time, which a box running other jobs cannot promise (#11: 6.6 to 17.4 ms under
-   load, 2.1 ms alone). So every step holds `locks/box.lock` shared for its whole run, and the
-   `integration` job holds it exclusive: it runs with no other job on the host. flock is not fair, so
-   a step first takes `locks/turnstile.lock` exclusively (and lets it go once it holds `box.lock`); the
-   integration job keeps the turnstile while it waits for the running jobs to end and while it runs, so
-   nothing new starts behind it. The Jepsen job holds the lock shared like the rest. Both waits are
-   bounded by `CI_BOX_WAIT` (5400 s) and fail NRV-E1245; the wait counts in the step's time like any
-   pre-job work (NRV-W1207). A 330-minute search running when integration starts makes it wait.
+   load, 2.1 ms alone). So a short job holds `locks/box.lock` shared around its run alone (not its
+   `apt-get`, its seed copy or its tail), and the `integration` job builds under the shared lock, lets
+   it go, then runs its test exclusive: no other short job's run beside it. flock is not fair, so a
+   call first takes `locks/turnstile.lock` exclusively (and lets it go once it holds `box.lock`); the
+   integration job keeps the turnstile while it waits for the running jobs to end and while its test
+   runs, so nothing new starts behind it. The long jobs (`fuzz-long`, `vopr-long`, `jepsen`) take no
+   lock and integration does not wait for them: **integration can still fail on timing while one runs
+   beside it**; run it again when the search ends. Waits are bounded by `CI_BOX_WAIT` (4800 s: the
+   short jobs' limit and five minutes) and fail NRV-E1245; the test run by `CI_INTEGRATION_RUN_MINUTES`
+   (15); the wait counts in the step's time like any pre-job work (NRV-W1207). A Markdown-only run takes no lock.
 
    **When the disk fills** (a job fails with "No space left", or NRV-W1202 keeps appearing), with
    no pipeline running: `rm -rf /var/cache/nerva-ci/branches/*` empties every branch cache, and
