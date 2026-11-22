@@ -636,10 +636,10 @@ refuses NRV-E1227 "an open failure refuses" open_fail "$o3" feature/o
 # behavioural test below checks it.
 as_ci_lines=$(grep -c '"${as_ci\[@\]}"' ci/woodpecker_step.sh || true)
 closing_lines=$(grep -c '"${as_ci\[@\]}".* 6>&- 7>&- 8>&- 9<&-' ci/woodpecker_step.sh || true)
-is "woodpecker_step.sh runs two commands as ci" 2 "$as_ci_lines"
+is "woodpecker_step.sh runs three commands as ci (install_zig, the integration build, the job)" 3 "$as_ci_lines"
 is "install_zig closes fds 6 to 9 for the job's user (static; the job's own are tested behaviourally)" 1 "$closing_lines"
-is "the step runs the root tests and the job through ci_step_job, as arrays (static)" 2 "$(grep -c '^tests_cmd=(bash ci/ci_test.sh)$\|^ci_step_job .* tests_cmd job_cmd || status=\$?$' ci/woodpecker_step.sh || true)"
-is "the root tests are bounded by their own limit, not the job's (static; ci_step_job passes it to ci_step_run_with_tests)" "1 1" "$(grep -c '"$((test_minutes \* 60))" tests_cmd job_cmd' ci/woodpecker_step.sh || true) $(grep -c 'ci_step_run_with_tests "\$1" "\$4" "\$job_seconds"' ci/cache.sh || true)"
+is "the step runs the root tests and the job through ci_step_job, as arrays (static; run_in_box calls it twice: with and without the box lock)" "1 2" "$(grep -c '^tests_cmd=(bash ci/ci_test.sh)$' ci/woodpecker_step.sh || true) $(grep -c '^ *ci_step_job "\$2" "\$3" "\$reserved" .* tests_cmd "\$4"' ci/woodpecker_step.sh || true)"
+is "the root tests are bounded by their own limit, not the job's (static; ci_step_job passes it to ci_step_run_with_tests)" "2 1" "$(grep -c '"$((test_minutes \* 60))" tests_cmd "\$4"' ci/woodpecker_step.sh || true) $(grep -c 'ci_step_run_with_tests "\$1" "\$4" "\$job_seconds"' ci/cache.sh || true)"
 # Both places that take main's lock use ci_shared_lock (bounded, NRV-E1224), never a bare flock; the
 # jepsen lock file is made by ci_lock_file.
 is "main's lock is taken by ci_shared_lock in both roles" 2 "$(grep -c 'ci_shared_lock || exit 1' ci/woodpecker_step.sh || true)"
@@ -654,7 +654,7 @@ is "jepsen's lock (fd 8) is let go before its trash is emptied, by the tail (sta
 lock8_l=$(grep -n 'flock -x -w "\${CI_JEPSEN_WAIT:-5400}" 8' "$ws" | cut -d: -f1)
 pre_j=$(grep -n '^    ci_trash_empty "\$cache/jepsen" #' "$ws" | cut -d: -f1)
 is "jepsen's old trash is emptied before the step takes the Jepsen lock others wait on (static)" yes "$([ -n "$lock8_l" ] && [ -n "$pre_j" ] && [ "$pre_j" -lt "$lock8_l" ] && echo yes)"
-run_l=$(grep -n '^ci_step_job ' "$ws" | cut -d: -f1)
+run_l=$(grep -n '^    run_in_box "\$box" "\$job" ' "$ws" | cut -d: -f1)
 finish_l=$(grep -n '^ci_step_finish "\$role" "\$cache" "\${CI_BRANCH_DIR:-}" "\$job"$' "$ws" | cut -d: -f1)
 is "the step measures and empties its trash after the job, in its tail (static)" yes "$([ -n "$run_l" ] && [ -n "$finish_l" ] && [ "$run_l" -lt "$finish_l" ] && echo yes)"
 is "the old run directories are swept by ci_jepsen_sweep, with no age test of its own (static)" "1 0" "$(grep -c '^    ci_jepsen_sweep "\$cache/jepsen"$' "$ws" || true) $(grep -c -e '-mtime' "$ws" || true)"
@@ -2715,11 +2715,11 @@ is "ci_job_seconds: ... with NRV-E1215 naming the job and the Timeout, not CI_ST
 is "ci_job_seconds: 20 s left (under the 60 s floor) is 0 too" "0" "$(jobs_ CI_STEP_START=$((now - 3100)) CI_REPO_TIMEOUT_MINUTES=60)"
 is "ci_job_seconds: no time left once the reserve is taken: 0" "0" "$(RES=1260 JOBMIN=75 jobs_ CI_STEP_START=$((now - 2400)) CI_REPO_TIMEOUT_MINUTES=60)"
 is "ci_job_seconds: a job that fits is left alone, silent (75 of 360, 10 min used)" "4500 yes" "$(JOBMIN=75 jobs_ CI_STEP_START=$((now - 600))) $([ ! -s "$tmp/jobs.err" ] && echo yes)"
-is "the step bounds the job with ci_step_job, with the root tests' reserve (and the validated kill-after) for check-scripts (static)" "1 1" "$(grep -c '^ci_step_job "\$job" "\$minutes" "\$reserved" "\$((test_minutes \* 60))" tests_cmd job_cmd || status=\$?$' "$ws" || true) $(grep -c '^if \[ "\$job" = check-scripts \]; then reserved=\$((test_minutes \* 60 + \${CI_KILL_AFTER:-60})); fi$' "$ws" || true)"
+is "the step bounds the job with ci_step_job, with the root tests' reserve (and the validated kill-after) for check-scripts (static)" "1 1" "$(grep -c '^ *ci_step_job "\$2" "\$3" "\$reserved" "\$((test_minutes \* 60))" tests_cmd "\$4" || rc=\$?$' "$ws" || true) $(grep -c '^if \[ "\$job" = check-scripts \]; then reserved=\$((test_minutes \* 60 + \${CI_KILL_AFTER:-60})); fi$' "$ws" || true)"
 # The step's tail follows the job whatever its status: no `exit` between the ci_step_job call and ci_step_finish.
-job_l=$(grep -n '^ci_step_job ' "$ws" | cut -d: -f1)
+job_l=$(grep -n '^if \[ "\$box" = integration \]; then$' "$ws" | cut -d: -f1)
 fin_l=$(grep -n '^ci_step_finish ' "$ws" | cut -d: -f1)
-is "no exit between the step's job and its tail (static)" "0" "$(sed -n "${job_l},${fin_l}p" "$ws" | grep -c '^[[:space:]]*exit' || true)"
+is "no exit between the step's job and its tail (static)" "0 yes" "$(sed -n "${job_l},${fin_l}p" "$ws" | grep -c '^[[:space:]]*exit' || true) $([ -n "$job_l" ] && [ -n "$fin_l" ] && echo yes)"
 # --- BEGIN ci_step_job (behavioural; the mutation harness extracts this block)
 # ci_step_job (ci/cache.sh) is what the step calls: a bash function named timeout stands in for
 # timeout(1), logs what it was asked to run and moves $SECONDS on by the limit, as a job that ran

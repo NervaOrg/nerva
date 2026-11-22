@@ -49,9 +49,10 @@ lock (`CI_BOX_HELD`: NRV-B1203).
 short jobs' step limit (75 minutes) and five more, so a wait only times out when a job outlived its own
 limit. A timeout fails the step with NRV-E1245 (its message names who holds what: the integration step
 that holds the turnstile, or the short jobs that hold the box); the test is never run without the lock.
-The exclusive test run is itself bounded by `CI_INTEGRATION_RUN_MINUTES` (default 15, capped by the
-step's limit), not the 75 minutes: what every short job waits behind is a test of about 20 s plus
-the errors and recover tests, and a hung one must not stall the box for an hour. Both knobs are validated by
+The exclusive run is itself bounded by `CI_INTEGRATION_RUN_MINUTES` (default 30, capped by the
+step's limit), not the 75 minutes: what every short job waits behind is `zig build test:integration`
+(measured here: 10 minutes on a 4-core sandbox with `zig build` already done; the lookup test, the
+errors test and the recover test all run in it), and a hung one must not stall the box for an hour. Both knobs are validated by
 `ci_knobs_check` (NRV-E1208).
 
 **6. The wait is accounted like other pre-job time.** The waits happen between `CI_STEP_START` and
@@ -88,9 +89,9 @@ open and sees them closed, and kills a lock's holder to see the lock freed.
 - **Jepsen's node containers** belong to the host's Docker daemon: a cancelled Jepsen step can leave
   them running. Jepsen takes no lock in any case.
 - **Steps from a commit without this change** (an open branch not rebased) take no lock.
-- The exclusive window still includes what `zig build test:integration` compiles beyond `zig build`
-  (the test executable and the build with commit-key deduplication off, used by the errors test): the
-  scheduling is measured in `worklog/O12.md`, not on the real box.
+- The exclusive window is the whole `zig build test:integration`, not the lookup test alone: it also
+  compiles what `zig build` did not (the test executable, the build with commit-key deduplication off)
+  and runs the errors and recover tests (see "What it costs").
 - The scheduling is not verified on the real box from here (see the pull request).
 
 ## Reason
@@ -103,7 +104,11 @@ cache copy or a trash walk.
 ## What it costs
 
 - Integration waits for the short jobs already running (up to their limits; about 25 minutes for the
-  longest in practice), and they wait behind it while it waits and runs: a few minutes. A hung short job
+  longest in practice), and they wait behind it while it waits and runs: about 10 minutes on the sandbox
+  measured, every push. Only `run_integration_tests` is timing sensitive; the errors and recover tests
+  and the residual compile run in the window too, because `build.zig` (in UPSTREAM.md) has no step for
+  the timing test alone. A step in `build.zig` for it, and for building without running, is the follow-up
+  that would shrink the window to the test (it is a vendored-file change: the owner's call). A hung short job
   holds integration up to `CI_BOX_WAIT` and then fails it NRV-E1245.
 - Integration's build needs `ci/job.sh integration-build` (one line; open PR #9 changes other lines of the file).
 - A red integration beside a long job, as above.

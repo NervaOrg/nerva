@@ -476,7 +476,7 @@ set:
    lock and integration does not wait for them: **integration can still fail on timing while one runs
    beside it**; run it again when the search ends. Waits are bounded by `CI_BOX_WAIT` (4800 s: the
    short jobs' limit and five minutes) and fail NRV-E1245; the test run by `CI_INTEGRATION_RUN_MINUTES`
-   (15); the wait counts in the step's time like any pre-job work (NRV-W1207). A Markdown-only run takes no lock.
+   (30); the wait counts in the step's time like any pre-job work (NRV-W1207). A Markdown-only run takes no lock.
 
    **When the disk fills** (a job fails with "No space left", or NRV-W1202 keeps appearing), with
    no pipeline running: `rm -rf /var/cache/nerva-ci/branches/*` empties every branch cache, and

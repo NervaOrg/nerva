@@ -246,7 +246,7 @@ if [ "$box" = integration ]; then
     unset CI_TIMEOUT_KNOB
     run_in_box shared "integration's build" "$minutes" build_cmd || status=$?
     if [ "$status" = 0 ]; then
-        run_minutes="${CI_INTEGRATION_RUN_MINUTES:-15}"
+        run_minutes="${CI_INTEGRATION_RUN_MINUTES:-30}"
         [ "$run_minutes" -le "$minutes" ] || run_minutes=$minutes
         export CI_TIMEOUT_KNOB="CI_INTEGRATION_RUN_MINUTES raises it for a run (CI_STEP_MINUTES caps it)"
         run_in_box exclusive integration "$run_minutes" job_cmd || status=$?
