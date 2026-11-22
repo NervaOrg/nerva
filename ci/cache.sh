@@ -723,17 +723,17 @@ ci_main_lock_open() {
 # everything compiled, O12). One place for the step, ci_box_wait_default and the tests.
 ci_integration_run_minutes() { echo "${CI_INTEGRATION_RUN_MINUTES:-5}"; }
 
-# ci_box_wait_default: CI_BOX_WAIT's default in seconds, derived from the limits that bound what a call
-# can wait behind (decision O12): the longest a SHORT job holds the box lock shared (its step limit,
-# CI_STEP_MINUTES, default 75, then for check-scripts the root tests' limit, CI_SCRIPTS_TEST_MINUTES,
-# default 20, each with CI_KILL_AFTER), plus one integration exclusive run (ci_integration_run_minutes
-# with its kill-after: a short job that arrives behind an integration step waits for the drain that
-# step waits for and then for its run), plus 5 minutes. A raised CI_STEP_MINUTES raises it. The values are ones the
-# step has validated (ci_knobs_check, woodpecker_step.sh); anything else counts as the default.
+# ci_box_wait_default: CI_BOX_WAIT's default in seconds, built from the limits of the jobs it can
+# wait behind (decision O12): a SHORT job's step limit (75 minutes), for check-scripts the root tests'
+# limit (20), one integration exclusive run (ci_integration_run_minutes), each with CI_KILL_AFTER, plus
+# 5 minutes. The holders may belong to other pipelines with other knobs, so the waiter's own
+# CI_STEP_MINUTES or CI_SCRIPTS_TEST_MINUTES may only RAISE a limit, never lower it below the fixed
+# defaults (a floor: 6480 s with the defaults). The values are ones the step has validated
+# (ci_knobs_check, woodpecker_step.sh); anything else counts as the default.
 ci_box_wait_default() {
     local kill="${CI_KILL_AFTER:-60}" m="${CI_STEP_MINUTES:-}" t="${CI_SCRIPTS_TEST_MINUTES:-}" r
-    [[ "$m" =~ ^[1-9][0-9]*$ ]] || m=75
-    [[ "$t" =~ ^[1-9][0-9]*$ ]] || t=20
+    { [[ "$m" =~ ^[1-9][0-9]*$ ]] && [ "$m" -ge 75 ]; } || m=75
+    { [[ "$t" =~ ^[1-9][0-9]*$ ]] && [ "$t" -ge 20 ]; } || t=20
     r=$(ci_integration_run_minutes)
     echo $(((m * 60 + kill) + (t * 60 + kill) + (r * 60 + kill) + 300))
 }

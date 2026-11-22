@@ -33,11 +33,17 @@ pub const environment_name = "NERVA_INTEGRATION_SCENARIOS";
 const group_untimed = "untimed";
 const group_timed = "timed";
 
+/// The longest value accepted, in bytes. Every name and group joined is under 50, so a longer one
+/// is a mistake, refused (NRV-E1246) before it is split. It bounds the number of entries too.
+pub const value_max = 256;
+
 pub const Selection = union(enum) {
     /// What to run: never empty.
     run: Set,
     /// The first entry of the value that is neither a scenario nor a group (an empty entry too).
     unknown: []const u8,
+    /// The value was longer than `value_max`: its length.
+    too_long: usize,
 };
 
 /// `value` is the variable's value, null when it is unset.
@@ -47,6 +53,7 @@ pub fn select(value: ?[]const u8) Selection {
         assert(all.count() > 0);
         return .{ .run = all };
     };
+    if (list.len > value_max) return .{ .too_long = list.len };
     var chosen: Set = .{};
     var entries = std.mem.splitScalar(u8, list, ',');
     while (entries.next()) |entry| {
@@ -74,10 +81,37 @@ pub const names = blk: {
     break :blk text ++ group_untimed ++ ", " ++ group_timed;
 };
 
+/// The longest line `refusal` writes: an entry of at most `value_max` bytes, the names, the text.
+pub const refusal_max = 640;
+
+/// The NRV-E1246 line (no newline) for a selection that is not `.run`, for the executable to
+/// print. It is here, not in `main`, so that a unit test pins its code and its text.
+pub fn refusal(buffer: *[refusal_max]u8, selection: Selection) []const u8 {
+    return (switch (selection) {
+        .run => unreachable,
+        .unknown => |entry| std.fmt.bufPrint(
+            buffer,
+            "error: NRV-E1246: {s} names '{s}', which is not a scenario ({s}); " ++
+                "unset it to run every scenario",
+            .{ environment_name, entry, names },
+        ),
+        .too_long => |length| std.fmt.bufPrint(
+            buffer,
+            "error: NRV-E1246: {s} is {d} bytes, more than the {d} a list of scenarios " ++
+                "needs ({s}); unset it to run every scenario",
+            .{ environment_name, length, value_max, names },
+        ),
+    }) catch unreachable; // `value_max` bounds the entry: the buffer holds the line.
+}
+
+/// The line for a value that could not be read at all (no memory for it).
+pub const unreadable = "error: NRV-E1246: " ++ environment_name ++
+    " could not be read (out of memory); unset it to run every scenario";
+
 fn expect_run(selection: Selection) !Set {
     return switch (selection) {
         .run => |set| set,
-        .unknown => error.TestUnexpectedResult,
+        .unknown, .too_long => error.TestUnexpectedResult,
     };
 }
 
@@ -114,11 +148,41 @@ test "integration scenarios: anything else is refused, never an empty run" {
     };
     for (refused) |value| {
         switch (select(value)) {
-            .run => return error.TestUnexpectedResult,
+            .run, .too_long => return error.TestUnexpectedResult,
             .unknown => {},
         }
     }
     // The entry reported is the first that is wrong.
     try testing.expectEqualStrings("lat", select("cluster,lat,nope").unknown);
     try testing.expectEqualStrings("", select("").unknown);
+}
+
+test "integration scenarios: the value has a bound, at it and one past it" {
+    // At the bound the value is split as usual (one entry of `value_max` bytes, not a scenario).
+    const at_bound = "x" ** value_max;
+    try testing.expectEqualStrings(at_bound, select(at_bound).unknown);
+    const past_bound = "x" ** (value_max + 1);
+    try testing.expectEqual(@as(usize, value_max + 1), select(past_bound).too_long);
+    // A list of scenarios as long as the bound is accepted.
+    const padded = "latency," ** 31 ++ "latency";
+    try testing.expect(padded.len <= value_max);
+    try testing.expectEqual(try expect_run(select("latency")), try expect_run(select(padded)));
+}
+
+test "integration scenarios: the NRV-E1246 lines" {
+    var buffer: [refusal_max]u8 = undefined;
+    try testing.expectEqualStrings(
+        "error: NRV-E1246: NERVA_INTEGRATION_SCENARIOS names 'bogus', which is not a scenario " ++
+            "(cluster, peer_auth, latency, untimed, timed); unset it to run every scenario",
+        refusal(&buffer, select("bogus")),
+    );
+    try testing.expect(std.mem.startsWith(
+        u8,
+        refusal(&buffer, select("x" ** (value_max + 1))),
+        "error: NRV-E1246: NERVA_INTEGRATION_SCENARIOS is 257 bytes, more than the 256",
+    ));
+    // The widest entry the bound lets through fits the buffer.
+    const widest = refusal(&buffer, select("x" ** value_max));
+    try testing.expect(std.mem.startsWith(u8, widest, "error: NRV-E1246: "));
+    try testing.expect(std.mem.startsWith(u8, unreadable, "error: NRV-E1246: "));
 }

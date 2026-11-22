@@ -253,6 +253,7 @@ rc=0
 timed stubjob 5 sh -c 'exit 7' >/dev/null 2>&1 || rc=$?
 is "a failing job keeps its own status" 7 "$rc"
 refuses NRV-E1208 "CI_STEP_MINUTES not a number" env CI_STEP_MINUTES=soon ci/woodpecker_step.sh check
+refuses "NRV-E1208: ci/woodpecker_step.sh integration takes no argument, got 'bogus'" "integration with an argument is refused, not ignored" ci/woodpecker_step.sh integration bogus
 
 # --- ci/cache.sh ---
 # As root the job's user is `nobody`, as it is `ci` in a step (a root that acts as its own job is
@@ -3321,6 +3322,7 @@ is "box lock: the default wait is 6480 s (75 + 20 + 5 minutes, three kill-afters
 is "box lock: the default wait follows a raised CI_STEP_MINUTES (200: +7500 s)" 13980 "$(bw CI_STEP_MINUTES=200)"
 is "box lock: the default wait follows CI_SCRIPTS_TEST_MINUTES, CI_INTEGRATION_RUN_MINUTES and CI_KILL_AFTER" 7215 "$(bw CI_SCRIPTS_TEST_MINUTES=30 CI_INTEGRATION_RUN_MINUTES=10 CI_KILL_AFTER=5)"
 is "box lock: a value that is no number counts as the default" 6480 "$(bw CI_STEP_MINUTES=x)"
+is "box lock: a waiter's own lower limits do not lower the default (the holders may use the defaults)" 6480 "$(bw CI_STEP_MINUTES=20 CI_SCRIPTS_TEST_MINUTES=5)"
 # A call's two waits share one budget: the turnstile held for 3 s and the box for much longer, with a
 # budget of 4 s, fails after about 4 s, not 3 + 4.
 rm -f "$tmp/s1"
@@ -3477,6 +3479,37 @@ is "job.sh integration: no argument runs every scenario (the variable stays unse
 is "job.sh integration untimed: the untimed scenarios" "zig build test:integration scenarios=untimed|rc=0|" "$(job_int untimed | tr '\n' '|')"
 is "job.sh integration timed: the timed scenario" "zig build test:integration scenarios=timed|rc=0|" "$(job_int timed | tr '\n' '|')"
 is "job.sh integration with another argument: NRV-E1208, exit 2, zig not run" "yes rc=2" "$(out=$(job_int latency); grep -q 'NRV-E1208: usage: ci/job.sh integration \[untimed|timed\]' <<<"$out" && ! grep -q '^zig ' <<<"$out" && echo yes) $(job_int latency | tail -1)"
+
+# --- When the Python tests that follow the integration executable skip themselves (decision O12).
+# `zig build test:integration` runs tests/errors/commands.py and tests/recover/recover.py after the
+# executable. They must skip only when NERVA_INTEGRATION_SCENARIOS selects timed scenarios alone
+# (`timed`, `latency`, a list of them), never when it is unset, `untimed`, `cluster` or a list holding
+# any untimed entry: a skip there would turn the suites into a green no-op in CI. Run with no
+# arguments, a script that does not skip stops at once (usage or a missing argument): that is the
+# "ran" case here, and nothing else is started. Mutants: the test `== "timed"` (latency would run),
+# `!= "timed"` or `startswith`, caught by the cases below.
+if command -v python3 >/dev/null; then
+    for py in tests/errors/commands.py tests/recover/recover.py; do
+        for sel in timed latency "latency,timed" "timed,latency"; do
+            out=$(env -i PATH="$PATH" NERVA_INTEGRATION_SCENARIOS="$sel" python3 -B "$py" 2>&1) && rc=0 || rc=$?
+            is "$py skips for NERVA_INTEGRATION_SCENARIOS=$sel (exit 0, one skipped: line)" "0 1" "$rc $(grep -c '^skipped:' <<<"$out" || true)"
+        done
+        for sel in unset untimed cluster peer_auth "latency,cluster" "timed,untimed" "untimed,timed" "" "bogus" "timed,"; do
+            if [ "$sel" = unset ]; then
+                out=$(env -i PATH="$PATH" python3 -B "$py" 2>&1) && rc=0 || rc=$?
+            else
+                out=$(env -i PATH="$PATH" NERVA_INTEGRATION_SCENARIOS="$sel" python3 -B "$py" 2>&1) && rc=0 || rc=$?
+            fi
+            is "$py does not skip for NERVA_INTEGRATION_SCENARIOS='$sel'" "0 nonzero" "$(grep -c '^skipped:' <<<"$out" || true) $([ "$rc" != 0 ] && echo nonzero)"
+        done
+        # Its timed names are the Zig side's: the group and every scenario Scenario.timed marks.
+        zig_timed=$(sed -n 's/^ *\.\([a-z_]*\) => true,$/\1/p' src/nerva/integration_scenarios.zig | sort | tr '\n' ' ')
+        py_timed=$(sed -n 's/^TIMED_SCENARIOS = (\(.*\))$/\1/p' "$py" | tr -d '" ' | tr ',' '\n' | grep -v '^timed$' | sort | tr '\n' ' ')
+        is "$py's TIMED_SCENARIOS are the scenarios Scenario.timed marks, and the group" "$zig_timed" "$py_timed"
+    done
+else
+    echo "note: no python3: the Python tests' skip rule was not tested" >&2
+fi
 
 # --- The suite is hermetic (review 6001089776): the root run in a Woodpecker step has the step's
 # environment, and a step exports CI_BRANCH_PRUNE_ALL=1 when the box is low on disk. Run the whole

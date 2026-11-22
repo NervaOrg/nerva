@@ -39,6 +39,12 @@ CI_STEP_START=$(date +%s)
 
 job="${1:?usage: ci/woodpecker_step.sh <job> [arg]}"
 arg="${2:-}"
+# The integration job takes no argument here (it runs its two scenario groups itself, O12): one given
+# is a mistake in the YAML, refused as `ci/job.sh integration bogus` is, never silently ignored.
+if [ "$job" = integration ] && [ -n "$arg" ]; then
+    ci_error "NRV-E1208: ci/woodpecker_step.sh integration takes no argument, got '$arg'"
+    exit 2
+fi
 cache=/cache
 user=ci
 free_min_gib="${CI_FREE_MIN_GIB:-60}"

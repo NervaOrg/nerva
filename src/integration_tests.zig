@@ -47,17 +47,19 @@ pub fn main() !void {
         scenarios.environment_name,
     ) catch |err| switch (err) {
         error.EnvironmentVariableNotFound => null,
-        else => return err,
+        // Out of memory, or (Windows) text that is not valid: never a raw error name.
+        else => {
+            std.debug.print("{s}\n", .{scenarios.unreadable});
+            std.process.exit(2);
+        },
     };
     defer if (requested) |owned| gpa.free(owned);
-    const selected = switch (scenarios.select(requested)) {
+    const selection = scenarios.select(requested);
+    const selected = switch (selection) {
         .run => |set| set,
-        .unknown => |entry| {
-            std.debug.print(
-                "error: NRV-E1246: {s} names '{s}', which is not a scenario ({s}); " ++
-                    "unset it to run every scenario\n",
-                .{ scenarios.environment_name, entry, scenarios.names },
-            );
+        .unknown, .too_long => {
+            var buffer: [scenarios.refusal_max]u8 = undefined;
+            std.debug.print("{s}\n", .{scenarios.refusal(&buffer, selection)});
             std.process.exit(2);
         },
     };
@@ -723,10 +725,11 @@ fn scenario_cluster() !void {
     }
 }
 
-/// A reply ends the client's wait at once, not at the end of its 10 ms tick, so the median lookup is
-/// well under one tick (it was always at least one, N51). A *timed* scenario (`integration_scenarios`):
-/// the bound is wall time, so CI runs it alone on the host (decision O12), on a cluster of its own so
-/// that alone costs a cluster start and the lookups, not the whole of `scenario_cluster`.
+/// A reply ends the client's wait at once, not at the end of its 10 ms tick, so the median lookup
+/// is well under one tick (it was always at least one, N51). A *timed* scenario
+/// (`integration_scenarios`): the bound is wall time, so CI runs it alone on the host (decision
+/// O12), on a cluster of its own so that alone costs a cluster start and the lookups, not the
+/// whole of `scenario_cluster`.
 fn scenario_latency() !void {
     const cluster = try Cluster.init();
     defer cluster.deinit();

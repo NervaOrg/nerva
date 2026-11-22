@@ -79,12 +79,25 @@ def expect(result, code, status, text, label):
     return code
 
 
+# The entries of NERVA_INTEGRATION_SCENARIOS that name timed scenarios: the group and every scenario
+# `Scenario.timed` marks in src/nerva/integration_scenarios.zig (ci/ci_test.sh checks the two agree).
+TIMED_SCENARIOS = ("timed", "latency")
+
+
+def only_timed_selected():
+    """True when NERVA_INTEGRATION_SCENARIOS is set and every entry names a timed scenario. Unset,
+    empty, `untimed`, `cluster` or a list holding any other entry is not: the test runs."""
+    value = os.environ.get("NERVA_INTEGRATION_SCENARIOS")
+    return value is not None and all(entry in TIMED_SCENARIOS for entry in value.split(","))
+
+
 def main():
     # `zig build test:integration` runs this after the integration executable. CI runs the timed
     # scenarios alone on the host (decision O12, src/nerva/integration_scenarios.zig); this test
-    # runs no timed scenario and is minutes long, so it is left to the untimed run.
-    if os.environ.get("NERVA_INTEGRATION_SCENARIOS") == "timed":
-        print("skipped: NERVA_INTEGRATION_SCENARIOS=timed runs the timed scenarios alone", flush=True)
+    # measures nothing against the clock and is minutes long, so it skips when the selection holds
+    # no untimed scenario. ci/ci_test.sh pins when it fires.
+    if only_timed_selected():
+        print("skipped: NERVA_INTEGRATION_SCENARIOS selects timed scenarios only", flush=True)
         return
     if len(sys.argv) != 3:
         sys.exit("usage: commands.py <nerva> <nerva-keys-off> "

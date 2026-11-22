@@ -52,20 +52,25 @@ a call made while the step holds the lock (`CI_BOX_HELD`: NRV-B1203).
 
 **5. One budget per call, and it is the longest honest wait.** A call has one budget, `CI_BOX_WAIT`,
 shared by its turnstile wait and its box wait (the second wait gets what the first left). The default
-is derived from the jobs' limits (`ci_box_wait_default`): the longest a holder can legitimately keep
-the box is a short job at its step limit (`CI_STEP_MINUTES`, 75) plus its root tests
-(`CI_SCRIPTS_TEST_MINUTES`, 20) plus the exclusive run (`CI_INTEGRATION_RUN_MINUTES`, 5), each with
-the kill-after (60 s), and 300 s more: 6480 s (108 minutes) with the defaults. It follows a raised
-`CI_STEP_MINUTES`. A timeout means a holder outlived its own limits. The turnstile is therefore held
-for at most one budget, 108 minutes at the very worst, and in practice until the running short jobs
-end (about 25 minutes for the longest). A timeout fails the step with NRV-E1245, whose message names
-who holds what; the test is never run without the lock. Only `flock` status 1 is a timeout; any other
+is built from the jobs' limits (`ci_box_wait_default`): the longest *one* holder keeps the box is a
+short job at its step limit (75 minutes) plus its root tests (20) plus the exclusive run
+(`CI_INTEGRATION_RUN_MINUTES`, 5), each with the kill-after (60 s), and 300 s more: 6480 s (108
+minutes) with the defaults. The holders may belong to other pipelines with other knobs, so the
+waiter's own `CI_STEP_MINUTES` and `CI_SCRIPTS_TEST_MINUTES` can only raise those limits, never
+lower them below these fixed defaults (a floor; a waiter dispatched with `CI_STEP_MINUTES=20` still
+waits 6480 s). **The budget is the longest single hold, not a bound on the queue.** One call's turnstile
+hold is at most one budget, but a call can queue behind several integration steps, and each can cost a
+full drain (see "Accepted": a short job that queues behind an integration step runs for up to its
+limit before the next integration step can start its own wait). So NRV-E1245 means a holder outlived
+its limit *or* several integration steps are queued ahead, with every holder inside its limits. A
+timeout fails the step with NRV-E1245, whose message names who holds what; the test is never run
+without the lock. Only `flock` status 1 is a timeout; any other
 status (for example fd 10 lost to a redirection) is NRV-B1204, a bug, never a timeout that blames
 another holder. The knobs are validated by `ci_knobs_check` (NRV-E1208).
 
 **6. The waits are accounted like other pre-job time.** They happen between `CI_STEP_START` and the job,
 so `ci_job_seconds` and `ci_tail_seconds` count them as they count the `apt-get` before (NRV-W1207,
-NRV-E1215). A short job waits in one call: at most 6480 s. An integration step waits in two (untimed,
+NRV-E1215). A short job waits in one call: one budget, 6480 s by default (the budget bounds the call, not the queue it waits in). An integration step waits in two (untimed,
 then timed): 2 x 6480 s = 216 minutes at the very worst, which is a bound, not an expectation: if the
 waits really used that, the step's remaining time inside the repository's 360-minute limit could not
 cover the two runs, and `ci_job_seconds` shortens or refuses the job (NRV-W1207, NRV-E1215)
@@ -107,10 +112,18 @@ measured 1.4 and 1.5 ms (before: 2.0 to 2.3 ms alone), with one client instead o
 **The Python tests that follow stay out of the exclusive run.** `zig build test:integration` also runs
 `tests/errors/commands.py` and `tests/recover/recover.py` after the executable (build graph: they depend on
 it); they take about 5 minutes and measure nothing against the clock. With `NERVA_INTEGRATION_SCENARIOS`
-exactly `timed` each prints a one-line skip and exits 0, so the exclusive run is the timed scenario alone
-(measured: 7 s in all, `zig build` start-up included, with everything compiled by the untimed run); the
-untimed run, and a run with the variable unset, run them as before. The cost: those two scripts know one
-value of the variable. `CI_INTEGRATION_RUN_MINUTES` defaults to 5: forty times the measured run, and a
+selects no untimed scenario (every entry is `timed` or a scenario `Scenario.timed` marks: `timed`,
+`latency`, a list of them) each prints a one-line skip and exits 0, so the exclusive run is the timed
+scenario alone (measured: 7 s in all, `zig build` start-up included, with everything compiled by the
+untimed run); the untimed run, a run with the variable unset, `cluster` or any list holding an untimed
+entry run them as before. `ci/ci_test.sh` pins both sides: it runs each script with a value of each
+kind and fails if the skip fires on unset, `untimed`, `cluster` or a mixed list, or does not fire on
+`timed`, `latency` or a list of them, and it checks that each script's `TIMED_SCENARIOS` equals the names
+`Scenario.timed` marks. Not chosen: one explicit flag from the Zig side (`build.zig` passes nothing on and
+is vendored). The cost: those two scripts know the timed names, kept in step by that check.
+The value is bounded too (`value_max`, 256 bytes; longer is NRV-E1246, tested at the bound and one past
+it), and an unreadable value or a refusal prints one coded line, never a raw error name.
+`CI_INTEGRATION_RUN_MINUTES` defaults to 5: forty times the measured run, and a
 hung cluster must not stall the box for more.
 
 ## Accepted: what the lock does not cover
@@ -121,16 +134,23 @@ hung cluster must not stall the box for more.
   hours for them, and every other job with it, is worse than a rare red. A red on timing during a long
   search is run again when it ends. Moving the long jobs off the box with #9's `tier` labels would
   remove this and is the follow-up.
-- **The stall is real, and bounded.** While an integration step waits, no new short job starts (the
+- **The stall is real.** While an integration step waits, no new short job starts (the
   turnstile): until the running short jobs end, which is the longest of them, about 25 minutes if
   `check-packages` has just started, less for the others, and at most their limits (75 minutes; 108
-  minutes if one outlives its limit). Then the exclusive run takes seconds (7 s measured here), so the
-  queue behind it is a drain plus about 10 s per integration step queued ahead: it passes the 108-minute
-  budget (NRV-E1245 for the short job, with the holder named) only if a short job is stuck. The previous
-  version held every push's short jobs for the drain plus about 10 minutes (the whole `test:integration`
-  run, 607 s measured here); that is gone, the drain is not. The old flaky red became a short, rare
-  queue, which is the price of an honest timing test on a shared box; the follow-up above (the `tier`
-  labels) is how to take the box's other load away.
+  minutes if one outlives its limit). Then the exclusive run takes seconds (7 s measured here). **With
+  more than one integration step the drain repeats.** The turnstile is let go when an integration step
+  holds the box, so a short job queued behind it takes the turnstile, runs for up to its limit, and
+  a second integration step that arrived during the first one's run queues behind that short job and
+  must wait for it: a second full drain. Every short job behind the second step waits for that drain
+  too. Each integration step queued ahead can therefore cost a whole drain (about 25 minutes with
+  `check-packages`, up to 75), not about 10 s. With two or three concurrent pushes and long short
+  jobs, a short job can pass the 108-minute budget with nothing stuck, and NRV-E1245 then fires although
+  every holder is inside its limits (`ci/cache.sh` and ERRORS.md say so in the message and the entry: start
+  it again). The code keeps this: a budget that covered the queue would have to scale with the number of
+  pushes, and a red on a loaded box that is run again is the cheaper failure; a fair queue (a ticket
+  order) is the fix if it shows up, together with the `tier` labels. The previous version held every
+  push's short jobs for the drain plus about 10 minutes; this one holds them for the drain plus
+  seconds, once per integration step ahead.
 - **The simulator fleet** (`ops/sim-fleet`, `CPUWeight=idle`) takes no lock. It yields CPU time and
   disk but not cache or memory bandwidth. The 2.0 ms measurement does not say whether the fleet was
   running; it is not verified here.
@@ -153,9 +173,10 @@ Nerva's own test file, not in a vendored one.
 ## What it costs
 
 - Integration waits for the short jobs already running, and they wait behind it while it waits and
-  runs (see "Accepted"); the run itself is seconds.
+  runs (see "Accepted"); the run itself is seconds, but each integration step queued ahead of a short
+  job can cost it a drain, so a short job can fail NRV-E1245 with no holder over its limit.
 - `src/integration_tests.zig` and its selection module are a little larger (one new scenario, one
-  environment variable, one code, NRV-E1246), and two Python tests know one value of the variable.
+  environment variable, one code, NRV-E1246), and two Python tests know the timed names.
 - The latency check no longer runs on a cluster that has done everything else first (see 8).
 - `ci/job.sh integration` takes an argument (open PR #9 changes other lines of the file).
 - A red integration beside a long job, as above.
