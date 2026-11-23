@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
-# Reads a pull request's changed file names on stdin, one per line, and prints one `class=true|false`
-# line per class: which parts of CI the change can affect (decision O14, which amends N68).
-# `--all` prints every class true (a push to main, a release, a dispatch, a list that could not be
-# had: the callers fail closed). `--expect N` says how many files the pull request changed
-# (`changed_files` of the event); a list shorter than that, or as long as the 3000 files the API
-# lists at most, is truncated, and every class is true.
+# Reads a pull request's changed files on stdin, one file per line, and prints one `class=true|false`
+# line per class: which parts of CI the change can affect (decision O14, which amends N68). A renamed
+# file is one line of two names separated by a tab (`new<TAB>old`): the old path is a deletion, and
+# both are classified. `--all` prints every class true (a push to main, a release, a dispatch, a
+# list that could not be had: the callers fail closed). `--expect N` says how many files the pull
+# request changed (`changed_files` of the event); a list of fewer lines (files, not names) than that,
+# or as long as the 3000 files the API lists at most, is truncated, and every class is true.
 #
 # A class may be skipped on a pull request only when this change cannot have caused a regression in
 # it: its inputs are known mechanically (the table below, checked against build.zig and tests/** by
 # classify_guard.py) and none changed. A skip certifies nothing else: flakes and environment drift
 # are caught by pushes to main, which run everything (O14). A file this table does not place makes
-# `all` true, and so does an empty list. A rename lists both its names (the old path is deleted).
+# `all` true, and so does an empty list.
 #
 #   all           every class (CI plumbing every job uses, an unplaced file, an empty list)
 #   binary        the inputs of the nerva binary and the Zig tests: every class but mac_keychain
@@ -44,16 +45,22 @@ case "${1:-}" in
 --all) raise_all ;;
 --expect) expect="${2:-}"; [[ "$expect" =~ ^[0-9]+$ ]] || raise_all ;;
 "") ;;
-*) echo "usage: classify_changes.sh [--all | --expect <changed files>] < file names" >&2; exit 2 ;;
+*) echo "error[NRV-E1251]: classify_changes.sh: usage: classify_changes.sh [--all | --expect <changed files>] < files, one per line (a rename: new<TAB>old)" >&2; exit 2 ;;
 esac
 
 if [ "${on[all]}" = false ]; then
+    entries=0
     files=()
-    while IFS= read -r file || [ -n "$file" ]; do
-        if [ -n "$file" ]; then files+=("$file"); fi
+    while IFS= read -r line || [ -n "$line" ]; do
+        if [ -n "$line" ]; then
+            entries=$((entries + 1))
+            IFS=$'\t' read -r -a names <<< "$line"
+            files+=("${names[@]}")
+        fi
     done
-    # An empty list, a list shorter than the pull request's changed files, or one at the API's limit.
-    if [ "${#files[@]}" = 0 ] || [ "${#files[@]}" -ge 3000 ] || { [ -n "$expect" ] && [ "${#files[@]}" -lt "$expect" ]; }; then
+    # An empty list, a list of fewer files than the pull request changed (a rename is one file of
+    # two names), or one at the API's limit.
+    if [ "$entries" = 0 ] || [ "$entries" -ge 3000 ] || { [ -n "$expect" ] && [ "$entries" -lt "$expect" ]; }; then
         raise_all
     fi
     for file in "${files[@]}"; do

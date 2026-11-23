@@ -23,8 +23,13 @@ environment is unchanged. It holds when:
 
 Everything else runs. Fail closed:
 
-- only a pull request is classified; a push to main, `release.yml`'s `workflow_call` and
-  `workflow_dispatch` run everything;
+- only a pull request is classified; a push to main (every push, Markdown included: `ci.yml`'s
+  `push` trigger has no `paths-ignore`, and the guard checks that), `release.yml`'s `workflow_call`
+  and `workflow_dispatch` run everything;
+- a pull request that changes `.github/workflows/**`, `.github/scripts/classify_*` or
+  `.github/actions/**` (either name of a rename) runs everything, decided in the workflow's own
+  `classify` step from the pull request's file list, outside `classify_changes.sh`: the classifier
+  never gates a change to itself, and a broken one cannot skip the run that changes it;
 - a changed file the classifier does not place, an empty list, a list shorter than the pull
   request's `changed_files`, one at the API's 3000-file limit, a list the API could not give, or a
   list for another head than the run's (the pull request's head is read before and after the list
@@ -56,15 +61,17 @@ in the merged change, and is then a pre-existing bug for an issue (CLAUDE.md).
 ## Mechanism
 
 - `.github/scripts/classify_changes.sh` reads file names on stdin and prints one `class=true|false`
-  line per class (`--all`, `--expect N`: a list at least as long as N, since a rename lists two
-  names). Classes: `all`, `binary` (src/, build.zig, zig/, VERSION: every suite but the keychain
+  line per class (`--all`, `--expect N`: at least N files, one per line, a rename as
+  `new<TAB>old`, so a rename counts once and lists both names; fewer is a cut list). Classes: `all`, `binary` (src/, build.zig, zig/, VERSION: every suite but the keychain
   job), `any`, one per suite (`unit fuzz vopr targets integration api views release demo demo_r4
   demo_r5 macos packaging ci_scripts`), `mac_keychain` and the derived `checks`. `all` and `binary`
   fold into the suites, so a job gates on its own class alone. `docs_only.sh` stays as it is:
   Woodpecker's `ci/changes.sh` uses it.
-- `.github/scripts/classify_pr.sh` fetches the list (`filename` and `previous_filename` of each file)
-  and the head, and fails closed as above. ci.yml's `changes` job and packages.yml's `classify` job
-  run it.
+- `.github/scripts/classify_pr.sh` fetches the list (one line per file: `filename`, then
+  `previous_filename` for a rename) and the head, and fails closed as above (NRV-E1252). ci.yml's
+  `changes` job and packages.yml's `classify` job run it, then force their classes for a change to
+  the plumbing (above) with a second read of the file list; a failed read fails the step, and every
+  condition is `!= 'false'`, so everything runs. The classifier's usage error is NRV-E1251.
 - `.github/scripts/classify_guard.py` (NRV-E1250), run by `classify_changes_test.sh` in ci.yml's
   `ci-scripts` job, checks:
   - **Reads.** From the scripts build.zig's steps run, ci/job.sh's `check_code`, `check_scripts`
@@ -75,25 +82,40 @@ in the merged change, and is then a pre-existing bug for an issue (CLAUDE.md).
     class that reaches it. A file whose class includes `all` is not followed further (a change to it
     runs everything). The Zig unit tests' reads of files outside `src/` are checked the same way
     (literals, consts, `@embedFile`).
-  - **What it cannot evaluate fails closed.** A path built from parts the guard cannot evaluate, that
+  - **What it cannot evaluate fails closed.** A path built from parts the guard cannot evaluate
+    (`os.path.join(root, "docs", ...)`, `Path(root) / "docs"` with an unknown `root` included), that
     holds a repository directory or one of the root files the classifier names, and a Zig
     `cwd()` read of a variable inside a test, is an error unless `UNANALYSED` names it, with the
     repository paths it stands for (checked like any other read). A literal that names a repository
     file but is a fixture, an argument or message text is in `NOT_READS`, with the reason. Both lists
     are reviewed by hand, and an entry that matches nothing is an error.
-  - **The workflow.** `changes` outputs each class as its own value; every step of a job that waits
-    for `changes` (a list of `needs` included) is gated, in the form `!= 'false'` that runs when
-    `changes` fails, on a class its job depends on (`JOB_CLASSES`), and the job has a step on its
-    own class; `all` and `binary` make each class a job is gated on true.
+  - **The workflow.** `changes` outputs each class as its own value and forces them (above). Every
+    job that waits for `changes` (a list of `needs` included) has the job-level
+    `if: ${{ !cancelled() }}` (or one of the three exact variants VOPR and the x86_64 macOS job
+    need), so a failed `changes` does not skip it (a skipped required check passes). Every step is
+    gated in exactly the form `needs.changes.outputs.<class> != 'false'` (optionally after
+    `always() && `; VOPR's matrix has its one exact form): no other term is ANDed or ORed in, so no
+    `&& false`, `&& matrix.x` or `== 'true'`. The class is one its job depends on
+    (`JOB_CLASSES`), the job has a step on its own class, and the steps that run the unit tests are
+    gated on exactly `unit` and `macos` (`UNIT_CLASSES`), the classes a file a unit test reads must
+    select. `ci-scripts` runs the classifier's own test and its checkout with no `if`. `all` and
+    `binary` make each class a job is gated on true. `on.push` has no `paths` or `paths-ignore`.
+    packages.yml's jobs have exactly `!cancelled() && (not a draft) && needs.classify.outputs.run
+    != 'false'`, parsed, not matched as a substring; its `grep` covers `all`, `binary` and
+    `packaging`.
+  - **Symbolic links.** A tracked symlink is an error (where the root is a git work tree): the
+    guard follows none.
   - **Permissions.** Every workflow that calls another grants it what its jobs ask for (a called
     workflow cannot hold more than its caller; GitHub refuses the file at load, which PR CI cannot
     see for `release.yml`, which runs only on a `VERSION` push).
-- ci.yml: the `changes` job outputs every class; each job's steps are gated on its class. `checks`
+- ci.yml: the `changes` job outputs every class; each job's steps are gated on its class. The
+  classifier's own test, with its checkout, runs on every pull request, ungated. `checks`
   runs `check-code`, `check-scripts` (CI_SCRIPTS_TESTED=1) and `check-packages` as separate steps.
   VOPR's fixed seeds (1, 2, 5) gate on `vopr`; its random seed gates on `any`, so the random search
   still runs on every non-docs change.
 - packages.yml (fixes #13): the `paths:` list is gone; a `classify` job runs the classifier and the
-  jobs run for `all`, `binary` or `packaging`. release.yml grants its call `pull-requests: read`,
+  jobs run for `all`, `binary` or `packaging`, or for a change to the plumbing. Its tarball and
+  deb/rpm jobs wait for ready_for_review, so they do not run while a pull request is a draft. release.yml grants its call `pull-requests: read`,
   as it does `ci.yml`'s.
 
 ## Cross-suite reads found
@@ -108,21 +130,27 @@ by the CI scripts' tests.
 
 ## Gaps
 
-What the guard does not see, exactly; each rests on the classifier's table and on review:
+What the guard does not see, exactly (each line was checked against `classify_guard.py`); each rests
+on the classifier's table and on review:
 
-- **Shell.** Only literal repository paths and `$var/x` for a variable the script set from its own
-  `dirname "$0"`. A path through any other variable, `eval`, a `cd` and a relative path, or a
-  command that reads a directory it was handed, is invisible. Shell inside Python strings and
-  workflow `run:` steps is not scanned.
-- **Python.** A path through a function argument or an attribute (`f"{self.repo}/docs/x"`) is not
-  evaluated; it is an error when it holds a repository directory, so it needs an `UNANALYSED` entry,
-  and the entry's paths are the reviewer's claim. A path with no repository directory in its text
-  (`os.path.join(root, name)` with `name` computed) is not seen. A literal naming a directory is
-  not expanded into its files. Reads by a subprocess the test starts (a script it runs by a path
+- **Shell.** Literal repository paths, `$var/x` for a variable the script set from its own
+  `dirname "$0"` (or `BASH_SOURCE`), and `$(dirname "$0")/../x` written inline. A path through any
+  other variable (`${0%/*}`, an argument, `$PWD`), `eval`, a `cd` and a relative path, or a command
+  that reads a directory it was handed, is invisible. Shell inside Python strings and workflow
+  `run:` steps is not scanned.
+- **Python.** A path with a repository directory in its text that the guard cannot evaluate
+  (`f"{self.repo}/docs/x"`, an unknown root joined with `"docs"`) is an error and needs an
+  `UNANALYSED` entry; the entry's paths are the reviewer's claim. A path with no repository
+  directory in its text (`os.path.join(root, name)` with `name` computed) is not seen, and neither
+  is an `importlib.import_module(name)` or `__import__(name)` with a computed name, a `sys.path`
+  entry that is not a literal, or a module found through `PYTHONPATH`. A literal naming a directory
+  is not expanded into its files. Reads by a subprocess the test starts (a script it runs by a path
   built at run time) are followed only where the path is a literal.
 - **Zig.** Only `std.fs.cwd().<read>(...)` and `@embedFile` in `src/**`; a read through another
   handle (`shell.cwd`, a dir opened earlier) is not seen, and a non-literal path outside a `test`
   block is taken for a runtime path.
+- **Symbolic links.** A tracked one is refused; one the guard's `git ls-files` cannot see (the root
+  is not a git work tree) is not.
 - **Reads that are not static.** Anything a suite reads because another file said so (a manifest, a
   glob in a config, `git ls-files`) is invisible. The runtime audit below would close this.
 - **Files `all` reaches.** The reads of a file whose class includes `all` are not followed, on the
@@ -130,7 +158,10 @@ What the guard does not see, exactly; each rests on the classifier's table and o
   suite only if a suite also reads that file by a path the guard can see.
 - **Roots.** A suite that CI runs and that none of the roots names (a new step in a workflow, a
   new function in ci/job.sh) is not seen until its script is a root; ci.yml's job table and
-  ci/job.sh's functions are checked, other workflows' steps are not.
+  ci/job.sh's functions are checked, other workflows' steps are not (packages.yml's gate is).
+- **Woodpecker.** `docs_only.sh` and `ci/changes.sh` are unchanged, and none of the files read
+  `paths-ignore`: removing the Markdown exemption from `ci.yml`'s `push` trigger changes nothing
+  for them.
 
 ## Cost
 

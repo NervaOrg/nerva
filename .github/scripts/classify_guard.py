@@ -71,7 +71,7 @@ JOB_FUNCTIONS = {"check_code": "checks", "check_scripts": "ci_scripts", "check_p
 # first of them. A job not in this table that waits for `changes` is an error: add it here.
 JOB_CLASSES = {
     "checks": ["checks", "ci_scripts", "packaging"],
-    "ci-scripts": ["ci_scripts", "any"],
+    "ci-scripts": ["ci_scripts"],
     "integration": ["integration"],
     "api": ["api"],
     "releases": ["release"],
@@ -87,6 +87,42 @@ JOB_CLASSES = {
     "vopr": ["vopr", "any"],
     "vopr_main": ["vopr"],
 }
+
+# The jobs that run `zig build test:unit` (ci/job.sh unit, or natively on macOS), by the class that
+# gates their step. A file a unit test reads must select every one of them: a third job that runs
+# the unit tests is an error until it is here.
+UNIT_CLASSES = ("unit", "macos")
+RUNS_UNIT = re.compile(r"test:unit|job\.sh unit\b")
+
+# The one job-level `if` a job that waits for `changes` may have, besides the default: it must run
+# when `changes` fails (`!cancelled()` runs after a failed need; a bare comparison of an output
+# skips the job, and a skipped required check passes).
+JOB_IF = "!cancelled()"
+JOB_IF_OTHER = {
+    "vopr": "!cancelled() && github.event_name == 'pull_request'",
+    "vopr_main": "!cancelled() && github.event_name != 'pull_request'",
+    "macos-x86_64": "!cancelled() && needs.macos-arm64.result == 'success'",
+}
+# A step's `if` is exactly one of these forms: a class `!= 'false'` (a failed `changes` leaves the
+# output empty, and empty is not 'false'), after `always() && ` for a step that must also run when
+# an earlier one failed, or VOPR's matrix of two classes. Anything else (`== 'true'`, `&& <term>`,
+# `|| false`) can skip a step the class selects, or fail open.
+GATE = re.compile(r"(?:always\(\) && )?needs\.changes\.outputs\.(\w+) != 'false'")
+GATE_MATRIX = {
+    "vopr": "((matrix.seed == 'random' && needs.changes.outputs.any != 'false') || "
+            "(matrix.seed != 'random' && needs.changes.outputs.vopr != 'false'))",
+}
+# Steps with no `if` at all: the classifier's own test runs on every pull request, and the checkout
+# it needs. Keyed by job; a step of the job that runs the test must have no `if`.
+UNGATED = {"ci-scripts": "classify_changes_test.sh"}
+# The step of `changes` that forces every class for a pull request that changes the plumbing, and
+# the paths it forces on (ci.yml's `changes` job and packages.yml's `classify` job).
+FORCE_PATHS = (".github/workflows/", ".github/scripts/classify_", ".github/actions/")
+# packages.yml's jobs run for these classes of `classify_pr.sh` (`all` and `binary` fold into
+# `packaging`, which the guard checks, so this is `all`, `binary` and `packaging` as written).
+PACKAGES_CLASSES = {"all", "binary", "packaging"}
+PACKAGES_IF = ("!cancelled() && (github.event_name != 'pull_request' || !github.event.pull_request.draft) && "
+               "needs.classify.outputs.run != 'false'")
 
 # Paths the guard cannot evaluate, reviewed by hand, each with the repository paths (globs) it
 # stands for. Key: (file, the constant or Zig argument). Every one of these is a path built or
@@ -118,6 +154,13 @@ UNANALYSED = {
     ("tests/packaging/packages.py", "/packaging/linux/"): ["packaging/linux/*"],
     ("tests/packaging/packages.py", "/packaging/linux/package-setup.sh"): ["packaging/linux/package-setup.sh"],
     ("tests/packaging/packages.py", "/packaging/linux:/src:ro"): ["packaging/linux/*"],
+    # Directories of a scratch repository or tree a test builds in a temporary directory.
+    ("ops/sim-fleet/test_sim_fleet.py", "ops"): [],
+    (".github/scripts/test_release_finish.py", ".github"): [],
+    (".github/scripts/test_release_finish.py", "scripts"): [],
+    (".github/scripts/test_release_finish.py", "src"): [],
+    (".github/scripts/test_sbom.py", "zig"): [],
+    (".github/scripts/sbom.py", "zig"): ["zig/download.sh"],  # root / "zig" / "download.sh"
     # A Zig test that reads the file it is in, through a path joined from @src().file.
     ("src/stdx/prng.zig", "path"): ["src/stdx/prng.zig"],
 }
@@ -143,6 +186,10 @@ ROOT_FILES = ("VERSION", "UPSTREAM.md", "build.zig", "build.zig.zon", ".gitmodul
 # A call that only reports: the paths in its message are not reads.
 REPORTING = ("print", "warn", "fail", "die", "error", "ci_error", "sys.stderr.write", "sys.exit", "exit",
              "logging.info", "logging.warning", "logging.error", "log")
+# Calls that open, list or stat a path: inside a reporting call they are still reads.
+OPENERS = ("open", "io.open", "os.listdir", "os.scandir", "os.walk", "glob.glob", "glob.iglob", "os.stat",
+           "os.path.exists", "os.path.isfile", "os.path.isdir", "os.path.getsize", "os.path.getmtime")
+OPENER_ATTRS = ("read_text", "read_bytes", "open", "iterdir", "glob", "rglob", "exists", "is_file", "is_dir", "stat")
 READ_CALLS = ("readFileAlloc", "openFile", "openFileZ", "openDir", "readFile", "statFile")
 
 
@@ -302,6 +349,8 @@ class Guard:
                     return ("abs", rel)
                 return env.get(node.id)
             if isinstance(node, ast.Attribute):
+                if dotted(node) == "os.pardir":
+                    return ("lit", "..")
                 inner = ev(node.value)
                 if node.attr == "parent" and inner and inner[0] == "abs":
                     return ("abs", posixpath.dirname(inner[1]))
@@ -344,11 +393,25 @@ class Guard:
                 path = p if p.startswith("/") else posixpath.join(path, p)
             return (kind, posixpath.normpath(path))
 
+        # `import os as _o`, `from pathlib import Path as P`: a renamed module or function is the name
+        # the guard knows it by, so `_o.path.join` is `os.path.join`.
+        alias = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for a in node.names:
+                    if a.asname:
+                        alias[a.asname] = a.name
+            elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+                for a in node.names:
+                    if a.asname or node.module in ("os", "os.path", "posixpath", "sys", "importlib", "glob", "io"):
+                        alias[a.asname or a.name] = "Path" if (node.module, a.name) == ("pathlib", "Path") \
+                            else node.module + "." + a.name
+
         def dotted(node):
             if isinstance(node, ast.Attribute):
                 inner = dotted(node.value)
                 return inner + "." + node.attr if inner else None
-            return node.id if isinstance(node, ast.Name) else None
+            return alias.get(node.id, node.id) if isinstance(node, ast.Name) else None
 
         # Assignments (HERE = dirname(abspath(__file__))), in source order, in any scope.
         assigns = [n for n in ast.walk(tree)
@@ -366,12 +429,17 @@ class Guard:
                     isinstance(node.func, ast.Attribute) and node.func.attr in ("format", "join"))
             return False
 
-        # Text that only reports (a raise, an assert's message, print(...)) is not a path read.
+        # Text that only reports (a raise, an assert's message, print(...)) is not a path read, but a
+        # call inside it that opens, lists or stats a path is (print(open(...).read())).
         quiet = set()
         for node in ast.walk(tree):
             if isinstance(node, ast.Raise) or (isinstance(node, ast.Call) and dotted(node.func) in REPORTING) \
                     or isinstance(node, ast.Assert):
                 quiet.update(id(n) for n in ast.walk(node))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and (dotted(node.func) in OPENERS or (
+                    isinstance(node.func, ast.Attribute) and node.func.attr in OPENER_ATTRS)):
+                quiet.difference_update(id(n) for n in ast.walk(node))
         files, dirs, unresolved = set(), set(), set()
         for node in ast.walk(tree):
             value = None
@@ -380,8 +448,14 @@ class Guard:
             elif isinstance(node, ast.Constant) and isinstance(node.value, str):
                 value = ("lit", node.value)
             if composite(node) and value is None and id(node) not in quiet:
+                # A join or `/` chain of parts the guard cannot evaluate, one of which is a top-level
+                # directory by itself (os.path.join(root, "docs", "x.md")), is as much a path to the
+                # repository as one that holds "docs/".
+                chain = (isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div)) or (
+                    isinstance(node, ast.Call) and dotted(node.func) in ("os.path.join", "posixpath.join"))
                 for sub in ast.walk(node):
-                    if isinstance(sub, ast.Constant) and isinstance(sub.value, str) and self.path_like(sub.value):
+                    if isinstance(sub, ast.Constant) and isinstance(sub.value, str) and (
+                            self.path_like(sub.value) or (chain and sub.value in TOP_DIRS)):
                         unresolved.add(sub.value)
             if not value:
                 continue
@@ -402,13 +476,25 @@ class Guard:
                 files.add(absolute)
             elif self.is_dir(absolute) and kind == "abs" and absolute != here:
                 dirs.add(absolute)
-        # An `import x` finds x.py beside the script, or in a directory put on sys.path.
+        # A relative entry of sys.path is relative to the directory the suite runs in: the repository.
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and dotted(node.func) in ("sys.path.insert", "sys.path.append") and node.args:
+                entry = ev(node.args[-1])
+                if entry and entry[0] == "lit" and not entry[1].startswith("/"):
+                    directory = posixpath.normpath(entry[1])
+                    if not directory.startswith("..") and self.is_dir(directory):
+                        dirs.add(directory)
+        # An `import x` finds x.py beside the script, or in a directory put on sys.path; so does
+        # importlib.import_module("x") and __import__("x") with a literal name.
         for node in ast.walk(tree):
             names = []
             if isinstance(node, ast.Import):
                 names = [a.name.split(".")[0] for a in node.names]
             elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
                 names = [node.module.split(".")[0]]
+            elif isinstance(node, ast.Call) and dotted(node.func) in ("importlib.import_module", "__import__") \
+                    and node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
+                names = [node.args[0].value.split(".")[0]]
             for name in names:
                 for directory in [here] + sorted(dirs):
                     candidate = posixpath.join(directory, name + ".py")
@@ -457,6 +543,9 @@ class Guard:
                     add(self.rel(p))
             else:
                 add(pattern)
+        # A path from the script's own directory in place: "$(dirname "$0")/../tests/x".
+        for m in re.finditer(r'\$\(dirname "?(?:\$0|\$\{BASH_SOURCE(?:\[0\])?\})"?\)((?:/\.\.)*)/([A-Za-z0-9_./-]*[A-Za-z0-9_])', text):
+            add(posixpath.join(here, "." + m.group(1), m.group(2)))
         # Directories this script finds for itself: here=$(cd "$(dirname "$0")" && pwd), root=$(cd "$here/.." ...).
         dirs = {}
         for m in re.finditer(r'^\s*(\w+)=.*\bdirname\b[^\n]*?(?:\$0|BASH_SOURCE)[^\n]*?\)"?((?:/\.\.)*)', text, re.M):
@@ -551,18 +640,42 @@ class Guard:
                     else:
                         targets = []
                     for target in targets:
-                        if self.exists(target) and not target.startswith("src/") and "unit" not in self.classify(target):
+                        missing = self.unit_missing(target)
+                        if self.exists(target) and missing:
                             self.errors.append(
-                                "%s reads %s in a unit test, but classify_changes.sh does not select unit for it" %
-                                (rel, target))
+                                "%s reads %s in a unit test, but classify_changes.sh does not select %s for it" %
+                                (rel, target, " and ".join(missing)))
                 for m in embed.finditer(text):
                     target = posixpath.normpath(posixpath.join(posixpath.dirname(rel), m.group(1)))
-                    if self.is_file(target) and not target.startswith("src/") and "unit" not in self.classify(target):
+                    missing = self.unit_missing(target)
+                    if self.is_file(target) and missing:
                         self.errors.append(
-                            "%s embeds %s in a unit test, but classify_changes.sh does not select unit for it" %
-                            (rel, target))
+                            "%s embeds %s in a unit test, but classify_changes.sh does not select %s for it" %
+                            (rel, target, " and ".join(missing)))
+
+    def unit_missing(self, target):
+        """The classes of the jobs that run the unit tests (UNIT_CLASSES) the classifier does not select
+        for a file outside src/ that a unit test reads."""
+        if target.startswith("src/"):
+            return []
+        return [c for c in UNIT_CLASSES if c not in self.classify(target)]
 
     # --- the check ------------------------------------------------------------------------
+
+    def check_symlinks(self):
+        """A tracked symlink makes a path the guard reads another file's (tests/views/x.py -> ../api/api.py):
+        the guard follows none, so there must be none. Only where `root` is a git work tree."""
+        try:
+            out = subprocess.run(["git", "-C", self.root, "ls-files", "-s"], capture_output=True, text=True)
+        except OSError:
+            return
+        if out.returncode:
+            return
+        for line in out.stdout.splitlines():
+            if line.startswith("120000 "):
+                self.errors.append("%s is a symbolic link: classify_guard.py follows none, so a change to its target "
+                                   "could skip a suite that reads it through the link. Use a copy, or a path the "
+                                   "guard can read" % line.split("\t", 1)[1])
 
     def check_reads(self):
         roots = self.build_roots()
@@ -619,8 +732,41 @@ class Guard:
 
     # --- workflows ------------------------------------------------------------------------
 
-    GATE_TERM = re.compile(
-        r"needs\.changes\.outputs\.(\w+) != 'false'|matrix\.\w+ [!=]= '\w+'|always\(\)|!cancelled\(\)|[()]|&&|\|\||\s+")
+    @staticmethod
+    def expression(condition):
+        """An `if:` as GitHub evaluates it: `${{ }}` stripped, whitespace collapsed."""
+        text = " ".join(str(condition).split())
+        m = re.fullmatch(r"\$\{\{ (.*) \}\}", text)
+        return m.group(1) if m else text
+
+    def load(self, name):
+        path = os.path.join(self.root, ".github/workflows", name)
+        if not os.path.isfile(path):
+            return None
+        return yaml.safe_load(open(path, encoding="utf-8")) or {}
+
+    def check_triggers(self, workflow):
+        """Every push to main runs everything: no `paths` or `paths-ignore` on `push` (O14). PyYAML reads the
+        key `on` as True."""
+        on = workflow.get("on", workflow.get(True)) or {}
+        push = on.get("push") if isinstance(on, dict) else None
+        if isinstance(push, dict) and ("paths" in push or "paths-ignore" in push):
+            self.errors.append("ci.yml: `on.push` has `paths` or `paths-ignore`: a push to main must run everything, "
+                               "Markdown included, since it is the backstop for what a pull request skipped (O14)")
+
+    def check_force(self, jobs, name, step_id, outputs_of):
+        """The `classify` step of a job forces every class (ci.yml) or the run (packages.yml) for a pull request that
+        changes the workflows, the classifier or the actions, from the pull request's own file list."""
+        steps = (jobs.get(name) or {}).get("steps") or []
+        classify = [s for s in steps if s.get("id") == step_id]
+        run = classify[0].get("run", "") if classify else ""
+        for fragment in FORCE_PATHS + ("previous_filename", "pull_request"):
+            if fragment not in run:
+                self.errors.append(
+                    "%s: the step `%s` of job `%s` does not force %s for a pull request that changes `%s`: a classifier "
+                    "that is broken must not skip the run that changes it" % (outputs_of, step_id, name, outputs_of,
+                                                                              fragment))
+                break
 
     def check_workflow(self):
         path = os.path.join(self.root, ".github/workflows/ci.yml")
@@ -629,7 +775,8 @@ class Guard:
         if yaml is None:
             self.errors.append("PyYAML is not installed: classify_guard.py reads the workflows with it")
             return
-        workflow = yaml.safe_load(open(path, encoding="utf-8"))
+        workflow = self.load("ci.yml")
+        self.check_triggers(workflow)
         known = self.known_classes()
         jobs = workflow["jobs"]
         outputs = (jobs.get("changes") or {}).get("outputs") or {}
@@ -641,9 +788,11 @@ class Guard:
                 self.errors.append("ci.yml's `changes` job outputs %s as `%s`, not `%s`" % (name, outputs[name], want))
         for name in sorted(set(outputs) - set(known)):
             self.errors.append("ci.yml's `changes` job outputs %s, which is not a class of classify_changes.sh" % name)
+        self.check_force(jobs, "changes", "classify", "every class")
         # `all` and `binary` fold into the suites: every class a job is gated on is true for both.
         binary, everything = self.classify("build.zig"), self.classify("ci/job.sh")
         gated_on = set()
+        unit_gates = set()
         for name, job in jobs.items():
             needs = job.get("needs") or []
             needs = [needs] if isinstance(needs, str) else needs
@@ -654,21 +803,43 @@ class Guard:
                 self.errors.append("ci.yml: job %s waits for `changes`, and classify_guard.py does not know which "
                                    "class gates it: add it to JOB_CLASSES" % name)
                 continue
+            # The job runs when `changes` fails, or a skipped required check would pass.
+            want_if = JOB_IF_OTHER.get(name, JOB_IF)
+            have_if = self.expression(job["if"]) if "if" in job else None
+            if have_if != want_if:
+                self.errors.append(
+                    "ci.yml: job %s has `if: %s`; it must be exactly `%s` (a job that waits for `changes` and does not "
+                    "run after a failed one is skipped, and a skipped required check passes)" %
+                    (name, have_if if have_if is not None else "(none)", want_if))
             used = set()
             for step in job.get("steps") or []:
                 label = step.get("name") or step.get("uses") or step.get("run", "")[:40]
+                run = step.get("run", "") or ""
                 condition = step.get("if")
+                ungated = UNGATED.get(name)
+                if ungated and (ungated in run or str(step.get("uses", "")).startswith("actions/checkout")):
+                    if condition is not None:
+                        self.errors.append("ci.yml: job %s step `%s` has an `if`: it runs on every pull request, with "
+                                           "no gate (the classifier's own test must not depend on the classifier)" %
+                                           (name, label))
+                    continue
                 if not isinstance(condition, str) or "needs.changes.outputs." not in condition:
                     self.errors.append("ci.yml: job %s has a step with no condition on `changes`: %s" % (name, label))
                     continue
-                rest = self.GATE_TERM.sub("", condition)
-                if rest:
+                text = self.expression(condition)
+                classes = None
+                m = GATE.fullmatch(text)
+                if m:
+                    classes = [m.group(1)]
+                elif GATE_MATRIX.get(name) == text:
+                    classes = re.findall(r"needs\.changes\.outputs\.(\w+) != 'false'", text)
+                if classes is None:
                     self.errors.append(
-                        "ci.yml: job %s step `%s` is gated by `%s`; every term must be `needs.changes.outputs.<class> "
-                        "!= 'false'` (so a failed `changes` runs the step), `always()` or a matrix test, not `%s`" %
-                        (name, label, condition.strip(), rest.strip()))
+                        "ci.yml: job %s step `%s` is gated by `%s`; it must be exactly `needs.changes.outputs.<class> "
+                        "!= 'false'` (so a failed `changes` runs the step), optionally after `always() && `%s" %
+                        (name, label, text, " (or the job's matrix form)" if name in GATE_MATRIX else ""))
                     continue
-                for cls in re.findall(r"needs\.changes\.outputs\.(\w+) != 'false'", condition):
+                for cls in classes:
                     used.add(cls)
                     gated_on.add(cls)
                     if cls not in known:
@@ -677,8 +848,17 @@ class Guard:
                     elif cls not in allowed:
                         self.errors.append("ci.yml: job %s step `%s` is gated on `%s`, but the job depends on %s" %
                                            (name, label, cls, " and ".join(allowed)))
+                if RUNS_UNIT.search(run):
+                    unit_gates.update(classes)
             if allowed[0] not in used:
                 self.errors.append("ci.yml: no step of job %s is gated on `%s`, the class it depends on" % (name, allowed[0]))
+            if UNGATED.get(name) and not any(UNGATED[name] in (s.get("run") or "") for s in job.get("steps") or []):
+                self.errors.append("ci.yml: job %s has no step that runs %s" % (name, UNGATED[name]))
+        # The jobs that run the unit tests are the classes a file a unit test reads must select.
+        if unit_gates and unit_gates != set(UNIT_CLASSES):
+            self.errors.append("ci.yml: the steps that run the unit tests are gated on %s, but classify_guard.py "
+                               "requires a file a unit test reads to select %s (UNIT_CLASSES): keep them equal" %
+                               (sorted(unit_gates), sorted(UNIT_CLASSES)))
         for cls in sorted(gated_on & set(known)):
             if cls in ("all", "binary"):
                 continue
@@ -690,22 +870,40 @@ class Guard:
                                    "gates on it" % cls)
 
     def check_packages_gate(self):
-        """packages.yml: every job that waits for `classify` runs unless the output is 'false'."""
-        path = os.path.join(self.root, ".github/workflows/packages.yml")
-        if not os.path.isfile(path) or yaml is None:
+        """packages.yml: every job that waits for `classify` runs unless the output is 'false', and `run` is
+        derived from every class the jobs depend on."""
+        if yaml is None:
             return
-        workflow = yaml.safe_load(open(path, encoding="utf-8")) or {}
+        workflow = self.load("packages.yml")
+        if workflow is None:
+            return
         jobs = workflow.get("jobs") or {}
         for name, job in jobs.items():
             needs = job.get("needs") or []
             needs = [needs] if isinstance(needs, str) else needs
             if "classify" not in needs:
                 continue
-            condition = str(job.get("if", ""))
-            if "needs.classify.outputs.run != 'false'" not in condition or "== 'true'" in condition:
-                self.errors.append("packages.yml: job `%s` waits for `classify` but is not gated on "
-                                   "`needs.classify.outputs.run != 'false'` (the form that runs when `classify` fails)"
-                                   % name)
+            have = self.expression(job["if"]) if "if" in job else None
+            if have != PACKAGES_IF:
+                self.errors.append(
+                    "packages.yml: job `%s` waits for `classify` and has `if: %s`; it must be exactly `%s` (it runs "
+                    "when `classify` fails, a draft waits for ready_for_review, and an empty output is not 'false')"
+                    % (name, have if have is not None else "(none)", PACKAGES_IF))
+        steps = (jobs.get("classify") or {}).get("steps") or []
+        run = "\n".join(s.get("run", "") or "" for s in steps if s.get("id") == "classify")
+        grep = re.search(r"grep -qx((?: -e \w+=true)+) ", run)
+        wanted = set(re.findall(r"-e (\w+)=true", grep.group(1))) if grep else set()
+        if wanted != PACKAGES_CLASSES:
+            self.errors.append("packages.yml: `classify` runs the jobs for the classes %s, not %s (`all` and `binary` "
+                               "fold into the suites, so these are every class the packaging jobs depend on)" %
+                               (sorted(wanted), sorted(PACKAGES_CLASSES)))
+        for cls in sorted(PACKAGES_CLASSES - {"all", "binary"}):
+            for source, label in (("build.zig", "binary"), ("ci/job.sh", "all")):
+                if cls not in self.classify(source):
+                    self.errors.append("classify_changes.sh: `%s` (%s) does not make `%s` true, but packages.yml runs "
+                                       "for it" % (label, source, cls))
+        if jobs.get("classify"):
+            self.check_force(jobs, "classify", "classify", "the run")
 
     LEVEL = {"none": 0, "read": 1, "write": 2}
 
@@ -763,6 +961,7 @@ def main(argv):
     guard = Guard(root)
     guard.check_reads()
     guard.check_unit_reads()
+    guard.check_symlinks()
     guard.check_stale()
     guard.check_workflow()
     guard.check_packages_gate()

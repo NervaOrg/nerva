@@ -123,21 +123,31 @@ done
 # deletion, and the new one may be Markdown or unplaced. Each class is selected by its old path.
 # The new name alone selects nothing, which is the bug a list without previous_filename had.
 check "" 'notes/x.md' --expect 1
-check "unit macos ci_scripts checks any" $'notes/x.md\ndocs/ERRORS.md' --expect 1
-check "unit macos ci_scripts checks any" $'docs/ERRORS-old.md\ndocs/ERRORS.md' --expect 1
-check "api any" $'docs/HTTP.md\ndocs/API.md' --expect 1
-check "$binary_set" $'notes/wire_code.md\nsrc/nerva/wire_code.zig' --expect 1
-check "api integration any" $'docs/api.md\ntests/api/api.py' --expect 1
-check "packaging checks any" $'docs/old.md\ndocs/INSTALL.md' --expect 1
-check "packaging ci_scripts checks any" $'docs/old.md\ndocs/releases/packages.md' --expect 1
-check "ci_scripts checks any" $'docs/old.md\nUPSTREAM.md' --expect 1
-check "views checks any" $'notes/x.md\ntests/views/declared.py' --expect 1
-check "release any" $'notes/x.md\ntests/release/mixed.py' --expect 1
-check "demo any" $'notes/x.md\ndemo/common.py' --expect 1
-check "packaging ci_scripts checks any" $'notes/x.md\n.github/scripts/pre_p417_tags' --expect 1
-# A list longer than changed_files (renames) is whole; a shorter one is truncated.
-check "unit macos ci_scripts checks any" $'a.md\ndocs/ERRORS.md\nb.md\nREADME.md' --expect 3
+check "unit macos ci_scripts checks any" $'notes/x.md\tdocs/ERRORS.md' --expect 1
+check "unit macos ci_scripts checks any" $'docs/ERRORS-old.md\tdocs/ERRORS.md' --expect 1
+check "api any" $'docs/HTTP.md\tdocs/API.md' --expect 1
+check "$binary_set" $'notes/wire_code.md\tsrc/nerva/wire_code.zig' --expect 1
+check "api integration any" $'docs/api.md\ttests/api/api.py' --expect 1
+check "packaging checks any" $'docs/old.md\tdocs/INSTALL.md' --expect 1
+check "packaging ci_scripts checks any" $'docs/old.md\tdocs/releases/packages.md' --expect 1
+check "ci_scripts checks any" $'docs/old.md\tUPSTREAM.md' --expect 1
+check "views checks any" $'notes/x.md\ttests/views/declared.py' --expect 1
+check "release any" $'notes/x.md\ttests/release/mixed.py' --expect 1
+check "demo any" $'notes/x.md\tdemo/common.py' --expect 1
+check "packaging ci_scripts checks any" $'notes/x.md\t.github/scripts/pre_p417_tags' --expect 1
+# --expect counts files, one line each (a rename is one file of two names), not names: a list with
+# a rename that is missing a file is truncated, though it has as many names as the files changed.
+# (review 6031181952: {rename views/old -> views/new, README.md} against 3 files, src/x.zig missing.)
+check "$everything" $'tests/views/new.py\ttests/views/old.py\nREADME.md' --expect 3
+check "$binary_set" $'tests/views/new.py\ttests/views/old.py\nREADME.md\nsrc/x.zig' --expect 3
+check "views checks any" $'tests/views/new.py\ttests/views/old.py\nREADME.md\nnotes/x.md' --expect 3
+check "$everything" $'a.md\tb.md\tc.md' --expect 2
+check "" $'a.md\tb.md\nc.md' --expect 2
+# A list with more files than changed_files is whole; one with fewer is truncated.
+check "unit macos ci_scripts checks any" $'a.md\tdocs/ERRORS.md\nb.md\nREADME.md' --expect 3
+check "unit macos ci_scripts checks any" $'a.md\tdocs/ERRORS.md\nb.md' --expect 2
 check "$everything" $'a.md\nREADME.md' --expect 3
+check "$everything" $'a.md\tREADME.md' --expect 2
 # Unions.
 check "api integration release any" $'tests/api/a.py\ntests/release/b.py'
 check "views checks any" $'README.md\ntests/views/x.py'
@@ -232,6 +242,45 @@ open("{}/ci/job.sh".format(tempfile.gettempdir()))' 'cannot evaluate'
 guard_says 0 opaque_message 'import sys
 print(f"see docs/x.md for {sys.argv}")'
 guard_says 0 opaque_raise 'raise SystemExit(f"see docs/x.md for {1 + 1}")'
+# A join whose root it cannot place, with a repository directory in it, fails closed (the second review).
+guard_says 1 unknown_root_join 'import os, sys
+open(os.path.join(sys.argv[1], "docs", "API.md"))' 'cannot evaluate'
+guard_says 1 unknown_root_pathlib 'import sys
+from pathlib import Path
+open(Path(sys.argv[1]) / "docs" / "API.md")' 'cannot evaluate'
+guard_says 0 unknown_root_other 'import os, sys
+open(os.path.join(sys.argv[1], "scratch", "x"))'
+# A renamed import is the module it renames.
+guard_says 1 alias_join 'import os as _o, sys as _s
+open(_o.path.join(_s.argv[1], "docs", "API.md"))' 'cannot evaluate'
+guard_says 1 alias_path 'import sys as _s
+from pathlib import Path as _P
+open(_P(__file__).resolve().parents[2] / "docs/ERRORS.md")' 'docs/ERRORS.md is read by the api suite'
+guard_says 1 alias_sys_path 'import sys as _s
+_s.path.insert(0, "demo")
+import helper' 'demo/helper.py is read by the api suite'
+guard_says 1 from_join 'from os.path import join, dirname, abspath
+open(join(dirname(abspath(__file__)), "..", "..", "docs", "ERRORS.md"))' 'docs/ERRORS.md is read by the api suite'
+# A read inside print, assert or raise is still a read; only the message text is exempt.
+guard_says 1 print_open 'print(open("docs/ERRORS.md").read())' 'docs/ERRORS.md is read by the api suite'
+guard_says 1 assert_open 'assert open("docs/ERRORS.md").read()' 'docs/ERRORS.md is read by the api suite'
+guard_says 1 raise_open 'raise SystemExit(open("docs/ERRORS.md").read())' 'docs/ERRORS.md is read by the api suite'
+# A relative sys.path entry, and a module imported by name.
+guard_says 1 sys_path_relative 'import sys
+sys.path.insert(0, "demo")
+import helper' 'demo/helper.py is read by the api suite'
+guard_says 1 import_module 'import sys, importlib
+sys.path.insert(0, "demo")
+importlib.import_module("helper")' 'demo/helper.py is read by the api suite'
+guard_says 1 dunder_import 'import sys
+sys.path.append("demo")
+__import__("helper")' 'demo/helper.py is read by the api suite'
+# A tracked symbolic link, in a tree that is a git work tree.
+tree symlink 'x = 1'
+ln -s ../../docs/API.md "$tmp/symlink/tests/api/link.md"
+git -C "$tmp/symlink" init -q
+git -C "$tmp/symlink" add -f -A
+guard_in 1 symlink 'is a symbolic link'
 
 # A step the guard does not know, and a script build.zig runs that is not there.
 tree unknown_step 'x = 1'
@@ -279,6 +328,10 @@ guard_in 1 sh_root 'docs/API.md is read by the ci_scripts suite'
 shell_tree sh_comment '# docs/API.md is not read
 echo hi'
 guard_in 0 sh_comment
+shell_tree sh_dirname 'cat "$(dirname "$0")/../docs/API.md"'
+guard_in 1 sh_dirname 'docs/API.md is read by the ci_scripts suite'
+shell_tree sh_bash_source 'cat "$(dirname "${BASH_SOURCE[0]}")/../docs/API.md"'
+guard_in 1 sh_bash_source 'docs/API.md is read by the ci_scripts suite'
 
 # The unit tests' reads of files outside src/: a literal, a const, an embed, a path it cannot evaluate.
 zig_tree() { # zig_tree <name> <zig source>
@@ -300,19 +353,27 @@ zig_tree zig_runtime 'fn f() void { _ = try std.fs.cwd().readFileAlloc(a, path, 
 guard_in 0 zig_runtime
 
 # ci.yml: each way the guard says a gate is wrong. A job that waits for `changes`, with its steps.
+# The classify step of the `changes` job: it forces every class for a change to the workflows, the
+# classifier or the actions, from the pull request's own file list (the guard reads these fragments).
+force_step='      - id: classify
+        run: |
+          if [ "$EVENT" = pull_request ]; then
+            gh api x --jq ".[] | .filename, (.previous_filename // empty)" | grep -Eq "^(.github/workflows/|.github/scripts/classify_|.github/actions/)"
+          fi'
 workflow_tree() { # workflow_tree <name> <outputs override sed> <job yaml>
     tree "$1" 'x = 1'
     mkdir -p "$tmp/$1/.github/workflows"
     {
         printf 'on: push\njobs:\n  changes:\n    runs-on: x\n    outputs:\n'
         for c in $everything; do printf '      %s: ${{ steps.classify.outputs.%s }}\n' "$c" "$c"; done
-        printf '    steps: []\n%s\n' "$3"
+        printf '    steps:\n%s\n%s\n' "$force_step" "$3"
     } > "$tmp/$1/.github/workflows/ci.yml"
     if [ -n "$2" ]; then sed -i "$2" "$tmp/$1/.github/workflows/ci.yml"; fi
 }
 job() { # job <name> <needs> <condition>: a job of two steps gated on <condition>
     printf '  %s:
     needs: %s
+    if: ${{ !cancelled() }}
     runs-on: x
     steps:
       - run: a
@@ -333,9 +394,9 @@ guard_in 1 wf_unknown_class 'which is not a class'
 workflow_tree wf_wrong_gate '' "$(job unit changes "needs.changes.outputs.fuzz != 'false'")"
 guard_in 1 wf_wrong_gate 'is gated on `fuzz`, but the job depends on unit'
 workflow_tree wf_fail_open '' "$(job unit changes "needs.changes.outputs.unit == 'true'")"
-guard_in 1 wf_fail_open 'every term must be'
+guard_in 1 wf_fail_open 'must be exactly'
 workflow_tree wf_or_true '' "$(job unit changes "needs.changes.outputs.unit != 'false' || true")"
-guard_in 1 wf_or_true 'every term must be'
+guard_in 1 wf_or_true 'must be exactly'
 workflow_tree wf_ungated '' "$(job unit changes "$ok")
       - run: c"
 guard_in 1 wf_ungated 'no condition on `changes`'
@@ -351,6 +412,113 @@ workflow_tree wf_unknown_job '' "$(job mystery changes "$ok")"
 guard_in 1 wf_unknown_job 'does not know which class gates it'
 workflow_tree wf_no_primary '' "$(job unit changes "needs.changes.outputs.any != 'false'")"
 guard_in 1 wf_no_primary 'is gated on `any`'
+
+# The classifier must not decide whether its own test runs (the second review's selfgate mutant): a
+# change to the workflows or the classifier forces every class, and the classifier's test and its
+# checkout have no `if`.
+workflow_tree wf_no_force 's/previous_filename/other/' "$(job unit changes "$ok")"
+guard_in 1 wf_no_force 'does not force every class'
+workflow_tree wf_no_force_path 's|\.github/actions/|.github/action/|' "$(job unit changes "$ok")"
+guard_in 1 wf_no_force_path 'does not force every class'
+workflow_tree wf_no_job_if '/    if: \${{ !cancelled() }}/d' "$(job unit changes "$ok")"
+guard_in 1 wf_no_job_if 'job unit has `if: (none)`'
+workflow_tree wf_job_if_output 's/if: \${{ !cancelled() }}/if: ${{ needs.changes.outputs.unit == '"'true'"' }}/' "$(job unit changes "$ok")"
+guard_in 1 wf_job_if_output 'job unit has `if: needs.changes.outputs.unit'
+workflow_tree wf_job_if_always 's/if: \${{ !cancelled() }}/if: ${{ always() }}/' "$(job unit changes "$ok")"
+guard_in 1 wf_job_if_always 'job unit has `if: always()`'
+# A class gate is never ANDed with another term, nor joined by `||`.
+workflow_tree wf_and_false '' "$(job unit changes "needs.changes.outputs.unit != 'false' && false")"
+guard_in 1 wf_and_false 'must be exactly'
+workflow_tree wf_and_matrix '' "$(job unit changes "needs.changes.outputs.unit != 'false' && matrix.x == 'y'")"
+guard_in 1 wf_and_matrix 'must be exactly'
+workflow_tree wf_always_ok '' "$(job unit changes "always() && needs.changes.outputs.unit != 'false'")"
+guard_in 0 wf_always_ok
+workflow_tree wf_always_or '' "$(job unit changes "always() || needs.changes.outputs.unit != 'false'")"
+guard_in 1 wf_always_or 'must be exactly'
+# The steps that run the unit tests are gated on the classes a file a unit test reads must select.
+unit_steps() { # unit_steps <class of the step that runs the unit tests>
+    printf '  unit:
+    needs: changes
+    if: ${{ !cancelled() }}
+    runs-on: x
+    steps:
+      - run: ci/job.sh unit
+        if: needs.changes.outputs.%s != '"'false'"'
+' "$1"
+}
+workflow_tree wf_unit_steps '' "$(unit_steps unit)"
+guard_in 1 wf_unit_steps 'requires a file a unit test reads to select'
+# The classifier's own test and its checkout run on every pull request.
+ci_scripts_job() { # ci_scripts_job <checkout if line> <test if line>
+    printf '  ci-scripts:
+    needs: changes
+    if: ${{ !cancelled() }}
+    runs-on: x
+    steps:
+      - uses: actions/checkout@x
+%s
+      - run: .github/scripts/classify_changes_test.sh
+%s
+      - run: ci/ci_test.sh
+        if: needs.changes.outputs.ci_scripts != '"'false'"'
+' "$1" "$2"
+}
+workflow_tree wf_cs_ok '' "$(ci_scripts_job '        name: c' '        name: t')"
+guard_in 0 wf_cs_ok
+workflow_tree wf_cs_test_gated '' "$(ci_scripts_job '        name: c' "        if: needs.changes.outputs.any != 'false'")"
+guard_in 1 wf_cs_test_gated 'with no gate'
+workflow_tree wf_cs_checkout_gated '' "$(ci_scripts_job "        if: needs.changes.outputs.any != 'false'" '        name: t')"
+guard_in 1 wf_cs_checkout_gated 'with no gate'
+workflow_tree wf_cs_no_test '' "$(ci_scripts_job '        name: c' '        name: t' | sed 's|classify_changes_test.sh|other.sh|')"
+guard_in 1 wf_cs_no_test 'has no step that runs classify_changes_test.sh'
+# Every push to main runs everything: a `paths-ignore` on `push` skips what a pull request skipped.
+workflow_tree wf_push_ignore 's/^on: push/on:\n  push:\n    paths-ignore: ["**.md"]/' "$(job unit changes "$ok")"
+guard_in 1 wf_push_ignore '`on.push` has `paths` or `paths-ignore`'
+workflow_tree wf_push_paths 's/^on: push/on:\n  push:\n    paths: ["src\/**"]/' "$(job unit changes "$ok")"
+guard_in 1 wf_push_paths '`on.push` has `paths` or `paths-ignore`'
+workflow_tree wf_push_branches 's/^on: push/on:\n  push:\n    branches: [main]/' "$(job unit changes "$ok")"
+guard_in 0 wf_push_branches
+
+# packages.yml: the jobs wait for `classify`, run when it fails, and `run` covers every class.
+packages_tree() { # packages_tree <name> <sed over packages.yml>
+    workflow_tree "$1" '' "$(job unit changes "$ok")"
+    cat > "$tmp/$1/.github/workflows/packages.yml" <<'YML'
+on: push
+jobs:
+  classify:
+    runs-on: x
+    steps:
+      - id: classify
+        run: |
+          classes=$(mktemp)
+          if grep -qx -e all=true -e binary=true -e packaging=true "$classes"; then run=true; else run=false; fi
+          if [ "$EVENT" = pull_request ]; then
+            gh api x --jq '.[] | .filename, (.previous_filename // empty)' | grep -Eq '^(.github/workflows/|.github/scripts/classify_|.github/actions/)'
+          fi
+  tarball:
+    needs: classify
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.classify.outputs.run != 'false' }}
+    runs-on: x
+    steps: []
+YML
+    if [ -n "$2" ]; then sed -i "$2" "$tmp/$1/.github/workflows/packages.yml"; fi
+}
+packages_tree pk_ok ''
+guard_in 0 pk_ok
+packages_tree pk_no_cancelled 's/!cancelled() && //'
+guard_in 1 pk_no_cancelled 'job `tarball` waits for `classify`'
+packages_tree pk_cancelled_substring 's/!cancelled() && /!cancelled() || /'
+guard_in 1 pk_cancelled_substring 'job `tarball` waits for `classify`'
+packages_tree pk_always_false "s/needs.classify.outputs.run != 'false' }}/needs.classify.outputs.run != 'false' \&\& false }}/"
+guard_in 1 pk_always_false 'job `tarball` waits for `classify`'
+packages_tree pk_equals_true "s/needs.classify.outputs.run != 'false'/needs.classify.outputs.run == 'true'/"
+guard_in 1 pk_equals_true 'job `tarball` waits for `classify`'
+packages_tree pk_grep_misses 's/ -e packaging=true//'
+guard_in 1 pk_grep_misses '`classify` runs the jobs for the classes'
+packages_tree pk_grep_extra 's/ -e packaging=true/ -e packaging=true -e demo=true/'
+guard_in 1 pk_grep_extra '`classify` runs the jobs for the classes'
+packages_tree pk_no_force 's/previous_filename/other/'
+guard_in 1 pk_no_force 'does not force the run'
 
 # A workflow that calls another grants it what its jobs ask for (the next release failed at startup
 # when release.yml called packages.yml without pull-requests: read).
@@ -438,6 +606,73 @@ pr_says "$everything" "$rename" 'aaa aaa' EVENT=push
 pr_says "$everything" "$rename" 'aaa aaa' PR=
 pr_says "$everything" "$rename" 'aaa aaa' CHANGED=3
 pr_says "$everything" '[]' 'aaa aaa'
+# The count is of files, not names: a rename lists two names and counts once. The second review's
+# case: a rename and README.md against changed_files=3 is a list one file short, so it fails closed.
+two_files='[{"filename":"tests/views/new.py","previous_filename":"tests/views/old.py"},{"filename":"README.md"}]'
+pr_says "views checks any" "$two_files" 'aaa aaa' CHANGED=2
+pr_says "$everything" "$two_files" 'aaa aaa' CHANGED=3
+pr_says "$everything" "$two_files" 'aaa aaa' CHANGED=
+# NRV-E1252: classify_pr.sh says why every class runs; NRV-E1251: the classifier's usage error.
+err=$(env PATH="$stub:$PATH" STUB_DIR="$stub" EVENT=pull_request PR= HEAD_SHA=aaa CHANGED=1 REPO=o/r "$here/classify_pr.sh" 2>&1 > /dev/null || true)
+case $err in *'error[NRV-E1252]: classify_pr.sh: '*) ;; *) echo "classify_changes_test: classify_pr.sh fails closed without NRV-E1252: $err" >&2; fail=1 ;; esac
+status=0
+err=$("$here/classify_changes.sh" --bogus 2>&1 < /dev/null) || status=$?
+case $err in *'error[NRV-E1251]: classify_changes.sh: usage'*) ;; *) echo "classify_changes_test: the usage error lacks NRV-E1251: $err" >&2; fail=1 ;; esac
+if [ "$status" != 2 ]; then echo "classify_changes_test: the usage error exits $status, want 2" >&2; fail=1; fi
+
+# ci.yml's `classify` step, run as GitHub runs it (bash -e) with the stand-in `gh`: a pull request that
+# changes the workflows, the classifier or the actions has every class true, whatever the classifier
+# says; and the second review's selfgate mutant (a classifier arm that swallows its own change) cannot
+# skip the run.
+step_script="$tmp/step.sh"
+python3 -I - "$root/.github/workflows/ci.yml" > "$step_script" <<'PY'
+import sys, yaml
+steps = yaml.safe_load(open(sys.argv[1]))["jobs"]["changes"]["steps"]
+print([s for s in steps if s.get("id") == "classify"][0]["run"])
+PY
+# step_says <scripts dir> "<true classes>" '<files json>' [env VAR=value ...]
+step_says() {
+    local scripts=$1 want=$2 files=$3 out got status=0
+    shift 3
+    out="$tmp/step.out"
+    : > "$out"
+    rm -f "$stub/n"
+    printf '%s' "$files" > "$stub/files.json"
+    printf 'aaa\naaa\n' > "$stub/heads"
+    (cd "$scripts/../.." && env PATH="$stub:$PATH" STUB_DIR="$stub" EVENT=pull_request PR=7 HEAD_SHA=aaa CHANGED=1 \
+        REPO=o/r GITHUB_OUTPUT="$out" "$@" bash -e "$step_script" > /dev/null 2>&1) || status=$?
+    got=$(sed -n 's/=true$//p' "$out" | sort | tr '\n' ' ')
+    want=$(printf '%s\n' $want | sed '/^$/d' | sort | tr '\n' ' ')
+    # A step that fails runs every job's steps too (`!= 'false'` on an empty output), so failing is closed.
+    if [ "$status" != 0 ] && [ -z "$got" ]; then return; fi
+    if [ "$got" != "$want" ] || [ "$status" != 0 ]; then
+        echo "classify_changes_test: ci.yml classify step: want [$want], got [$got] (exit $status) for $files $*" >&2
+        fail=1
+    fi
+}
+step_says "$here" "" '[{"filename":"README.md"}]'
+step_says "$here" "$everything" '[{"filename":".github/workflows/ci.yml"}]'
+step_says "$here" "$everything" '[{"filename":".github/scripts/classify_changes.sh"}]'
+step_says "$here" "$everything" '[{"filename":".github/scripts/classify_guard.py"}]'
+step_says "$here" "$everything" '[{"filename":".github/actions/x/action.yml"}]'
+step_says "$here" "$everything" '[{"filename":"notes/old.md","previous_filename":".github/workflows/ci.yml"}]'
+step_says "$here" "$everything" '[{"filename":"README.md"},{"filename":".github/workflows/ci.yml"}]' CHANGED=2
+step_says "$here" "$everything" '[{"filename":"README.md"}]' EVENT=push
+step_says "$here" "$everything" '[{"filename":"README.md"}]' STUB_FILES_FAIL=1
+selfgate="$tmp/selfgate"
+mkdir -p "$selfgate/.github/scripts"
+cp "$here/classify_changes.sh" "$here/classify_pr.sh" "$selfgate/.github/scripts/"
+sed -i 's|^        # CI plumbing every job uses, and this classifier and its tests: everything runs.$|        .github/ISSUE_TEMPLATE/* \| .github/*) ;;\n&|' "$selfgate/.github/scripts/classify_changes.sh"
+if ! grep -q 'ISSUE_TEMPLATE' "$selfgate/.github/scripts/classify_changes.sh"; then
+    echo "classify_changes_test: the selfgate mutant did not apply" >&2
+    fail=1
+fi
+# The mutant classifier alone leaves the classifier's own change with no class: that was the hole.
+mutant=$(printf '.github/scripts/classify_changes.sh\n.github/scripts/classify_changes_test.sh\n' \
+    | "$selfgate/.github/scripts/classify_changes.sh" --expect 2 | sed -n 's/=true$//p' | tr '\n' ' ')
+if [ -n "$mutant" ]; then echo "classify_changes_test: the selfgate mutant selects [$mutant]" >&2; fail=1; fi
+# The step forces every class on top of it.
+step_says "$selfgate/.github/scripts" "$everything" '[{"filename":".github/scripts/classify_changes.sh"},{"filename":".github/scripts/classify_changes_test.sh"}]' CHANGED=2
 
 [ "$fail" = 0 ] && echo "classify_changes_test: ok"
 exit "$fail"

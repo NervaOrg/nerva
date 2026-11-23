@@ -22,13 +22,14 @@
 name: CI
 
 on:
-  # Markdown alone (docs, CHANGELOG) pushed to main starts nothing (N68); release.yml's call still
-  # runs. A pull request always runs, since the ruleset requires every check on it, but the
-  # `changes` job turns every step of a job whose class did not change into a no-op (see below). The site is
+  # Every push to main runs everything, Markdown alone included (O14, amending N68): the suites read
+  # some Markdown (docs/API.md, docs/ERRORS.md, ...), and a push to main is the backstop for what a
+  # pull request skipped. A pull request always runs, since the ruleset requires every check on it,
+  # but the `changes` job turns every step of a job whose class did not change into a no-op (see
+  # below). A pull request of Markdown alone is a no-op there (N68). The site is
   # NervaLog/nervalog.github.io now (P148).
   push:
     branches: [main]
-    paths-ignore: ['**.md']
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -44,15 +45,17 @@ concurrency:
 
 jobs:
 
-  # Which classes of test the change can affect (O14, amending N68). Markdown alone starts no run
-  # on a push to main (N68), but a pull request must still report every required check, or a pull
-  # request that skips a suite could never merge. So every job below runs on every pull request,
-  # and a job whose class is false skips each step, not the job: a skipped matrix job reports under
-  # its bare name, and the required names (`vopr (1)`, `demo (seats_chaos.py)`) would never appear.
-  # A class is skipped only when its outcome is deterministic given its inputs, its inputs are
-  # known (.github/scripts/classify_changes.sh, checked against build.zig and tests/** by
-  # classify_guard.py in the `ci-scripts` job), none changed against the pull request's merge base,
-  # and its environment is pinned. Fail closed: only a pull request is classified; a push to main,
+  # Which classes of test the change can affect (O14, amending N68). A pull request must still
+  # report every required check, or a pull request that skips a suite could never merge. So every
+  # job below runs on every pull request, and a job whose class is false skips each step, not the
+  # job: a skipped matrix job reports under its bare name, and the required names (`vopr (1)`,
+  # `demo (seats_chaos.py)`) would never appear. A class is skipped only when this change cannot
+  # have caused a regression in it: its inputs are known (.github/scripts/classify_changes.sh,
+  # checked against build.zig and tests/** by classify_guard.py in the `ci-scripts` job) and none
+  # changed (a rename lists both names). A pull request that changes the workflows, the classifier
+  # or the actions runs every class, decided in the step below, not by the classifier. The
+  # classifier's own test runs on every pull request, ungated. Fail closed: only a pull request is
+  # classified; a push to main,
   # a release's call and a dispatch run everything, as does a changed file the table does not
   # place, a list that cannot be had, or one with fewer files than the pull request changed or the
   # 3000 the API lists at most. If `changes` itself fails, every job still runs every step (the
@@ -101,9 +104,21 @@ jobs:
         run: |
           # Only a pull request is classified; a push to main, a release's call and a dispatch run
           # everything. A list that cannot be had, or is of another head, fails closed too (O14).
-          .github/scripts/classify_pr.sh > classes.txt
-          cat classes.txt
-          cat classes.txt >> "$GITHUB_OUTPUT"
+          classes=$(mktemp)
+          .github/scripts/classify_pr.sh > "$classes"
+          # A pull request that changes the workflows, the classifier or the actions runs every class,
+          # whatever the classifier (which that pull request may have changed) says: a broken
+          # classifier must never skip the run that changes it. Decided here, outside
+          # classify_changes.sh, from the pull request's own file list (a rename lists both names).
+          # A failed call fails the step, and an empty output runs everything.
+          if [ "$EVENT" = pull_request ]; then
+            names=$(gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[] | .filename, (.previous_filename // empty)')
+            if printf '%s\n' "$names" | grep -Eq '^(\.github/workflows/|\.github/scripts/classify_|\.github/actions/)'; then
+              sed -i 's/=false$/=true/' "$classes"
+            fi
+          fi
+          cat "$classes"
+          cat "$classes" >> "$GITHUB_OUTPUT"
 
   # P251: the old `system` job ran these serially (about 26 minutes). They are split into jobs that
   # run in parallel, and `system` below aggregates them under the required check's name. The
@@ -179,7 +194,6 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-        if: needs.changes.outputs.any != 'false'
         with:
           persist-credentials: false
 
@@ -188,9 +202,10 @@ jobs:
         run: sudo env "PATH=$PATH" bash ci/ci_test.sh
 
       # The change classifier's table and the guard that checks it against build.zig and tests/**
-      # (O14). Any change runs them: they are what lets a suite be skipped.
+      # (O14). Every run, with no gate: they are what lets a suite be skipped, so the classifier
+      # must not decide whether they run (a broken classifier would skip its own test). They take
+      # seconds; the guard checks that this step has no `if`.
       - name: The change classifier and its guard
-        if: needs.changes.outputs.any != 'false'
         run: .github/scripts/classify_changes_test.sh
 
   # Three real replicas; about 3.5 GiB of disk.

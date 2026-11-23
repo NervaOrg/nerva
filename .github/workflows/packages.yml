@@ -60,9 +60,16 @@ jobs:
           CHANGED: ${{ github.event.pull_request.changed_files }}
           REPO: ${{ github.repository }}
         run: |
-          .github/scripts/classify_pr.sh > classes.txt
-          cat classes.txt
-          if grep -qx -e all=true -e binary=true -e packaging=true classes.txt; then run=true; else run=false; fi
+          classes=$(mktemp)
+          .github/scripts/classify_pr.sh > "$classes"
+          cat "$classes"
+          if grep -qx -e all=true -e binary=true -e packaging=true "$classes"; then run=true; else run=false; fi
+          # A pull request that changes the workflows, the classifier or the actions runs, whatever
+          # the classifier (which it may have changed) says; as in ci.yml's `changes` job.
+          if [ "$EVENT" = pull_request ]; then
+            names=$(gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[] | .filename, (.previous_filename // empty)')
+            if printf '%s\n' "$names" | grep -Eq '^(\.github/workflows/|\.github/scripts/classify_|\.github/actions/)'; then run=true; fi
+          fi
           echo "run=$run" | tee -a "$GITHUB_OUTPUT"
 
   # The tarball's install.sh and units, under systemd as root on the runner (tests/packaging/
