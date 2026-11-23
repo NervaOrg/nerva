@@ -89,23 +89,19 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Classify the change (.github/scripts/classify_changes.sh)
+      - name: Classify the change (.github/scripts/classify_pr.sh)
         id: classify
         env:
           GH_TOKEN: ${{ github.token }}
           EVENT: ${{ github.event_name }}
           PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           CHANGED: ${{ github.event.pull_request.changed_files }}
+          REPO: ${{ github.repository }}
         run: |
           # Only a pull request is classified; a push to main, a release's call and a dispatch run
-          # everything. A list that cannot be had fails closed too (O14).
-          if [ "$EVENT" = pull_request ] && [ -n "$PR" ] \
-             && gh api "repos/${{ github.repository }}/pulls/$PR/files" --paginate \
-                  --jq '.[].filename' > files.txt; then
-            .github/scripts/classify_changes.sh --expect "${CHANGED:-}" < files.txt > classes.txt
-          else
-            .github/scripts/classify_changes.sh --all < /dev/null > classes.txt
-          fi
+          # everything. A list that cannot be had, or is of another head, fails closed too (O14).
+          .github/scripts/classify_pr.sh > classes.txt
           cat classes.txt
           cat classes.txt >> "$GITHUB_OUTPUT"
 

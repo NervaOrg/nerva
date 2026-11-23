@@ -6,10 +6,11 @@
 # (`changed_files` of the event); a list shorter than that, or as long as the 3000 files the API
 # lists at most, is truncated, and every class is true.
 #
-# A class may be skipped for a change only when its outcome is deterministic given its inputs, its
-# input set is known mechanically (the table below, checked against build.zig and tests/** by
-# classify_guard.py), no input changed, and its environment is pinned (O14). A file this table
-# does not place makes `all` true, and so does an empty list.
+# A class may be skipped on a pull request only when this change cannot have caused a regression in
+# it: its inputs are known mechanically (the table below, checked against build.zig and tests/** by
+# classify_guard.py) and none changed. A skip certifies nothing else: flakes and environment drift
+# are caught by pushes to main, which run everything (O14). A file this table does not place makes
+# `all` true, and so does an empty list. A rename lists both its names (the old path is deleted).
 #
 #   all           every class (CI plumbing every job uses, an unplaced file, an empty list)
 #   binary        the inputs of the nerva binary and the Zig tests: every class but mac_keychain
@@ -70,6 +71,12 @@ if [ "${on[all]}" = false ]; then
             .github/scripts/r2.py | .github/scripts/test_r2.py | packaging/*)
             raise packaging ci_scripts
             case "$file" in packaging/homebrew/*) raise macos ;; esac ;;
+        # Data and tools the packaging scripts read: package_repos.sh reads pre_p417_tags,
+        # ci/install_repo_tools.sh installs what test_package_repos.py runs, and
+        # docs/releases/packages.md is read by package_repos.sh, r2.py, repo_install_check.sh,
+        # their tests and tests/packaging/subkeys.py. Each is also read by the CI scripts' tests.
+        .github/scripts/pre_p417_tags | ci/install_repo_tools.sh | docs/releases/packages.md)
+            raise packaging ci_scripts ;;
         # tests/packaging/repos.py compares the install text with repo_install_check.sh.
         tests/packaging/* | docs/INSTALL.md) raise packaging ;;
         # The macOS jobs: the smoke test, and the keychain job's scripts.
@@ -79,10 +86,11 @@ if [ "${on[all]}" = false ]; then
         # other workflow and script, ops/, perf/, the release candidate and the Jepsen harness
         # that ops/jepsen's tests read, and the Markdown they read.
         .github/workflows/* | .github/scripts/* | ci/* | .woodpecker/* | ops/* | perf/* | scripts/* | \
-            release/* | tests/jepsen/* | UPSTREAM.md | docs/QUICKSTART.md | docs/releases/packages.md)
+            release/* | tests/jepsen/* | UPSTREAM.md | docs/QUICKSTART.md)
             raise ci_scripts ;;
-        # The register of codes: four unit tests parse it, ci_test.sh greps it (N68).
-        docs/ERRORS.md) raise unit ci_scripts ;;
+        # The register of codes: unit tests parse it (the macOS job runs them natively too), and
+        # ci_test.sh greps it (N68).
+        docs/ERRORS.md) raise unit macos ci_scripts ;;
         # tests/api/docs_routes.py compares it with the routes the gateway serves.
         docs/API.md) raise api ;;
         # tests/api/api.py is imported by tests/errors/commands.py (test:integration), and
