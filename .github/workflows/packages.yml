@@ -2,14 +2,16 @@
 # the two systemd units, proved on a real systemd; and slice 5's .deb and .rpm packages.
 #
 # It runs on every push to main (so on the release commit), is called by release.yml, whose draft
-# waits for it on the release commit itself (#384), and runs on a pull request that changes
-# packaging, the code whose output or exit statuses the installer and units rely on
-# (src/nerva_main.zig, src/nerva/diagnostic.zig) or VERSION (a draft's run waits until the pull
-# request is marked ready). Every job runs on GitHub's hosted runners, as ci.yml's do (P147e): a
-# test that installs a service and starts replicas as root needs a machine of its own, and a fork's
-# pull request must never run on a self-hosted one. The pinned toolchain comes from Actions' cache,
-# installed as ci.yml installs it. This workflow is not a required check: a pull request that
-# touches none of those paths never starts it.
+# waits for it on the release commit itself (#384), and runs on a pull request whose change the
+# classifier (.github/scripts/classify_changes.sh, decision O14) says can affect it: `all`,
+# `binary` (any of src/, build.zig, VERSION, the toolchain: the installer and units rely on the
+# binary's output and exit statuses) or `packaging` (packaging/, tests/packaging/, this workflow,
+# its scripts, docs/INSTALL.md). A draft's run waits until the pull request is marked ready. It
+# replaces a hand-written `paths:` list that missed what the classifier knows (#13). Every job runs
+# on GitHub's hosted runners, as ci.yml's do (P147e): a test that installs a service and starts
+# replicas as root needs a machine of its own, and a fork's pull request must never run on a
+# self-hosted one. The pinned toolchain comes from Actions' cache, installed as ci.yml installs it.
+# This workflow is not a required check: a pull request whose class is false skips its jobs.
 name: Packages
 
 on:
@@ -18,16 +20,6 @@ on:
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
-    paths:
-      - 'packaging/**'
-      - 'tests/packaging/**'
-      - '.github/workflows/packages.yml'
-      - '.github/scripts/package_repos.sh'
-      - '.github/scripts/repo_install_check.sh'
-      - '.github/scripts/test_package_repos.py'
-      - 'src/nerva_main.zig'
-      - 'src/nerva/diagnostic.zig'
-      - 'VERSION'
   workflow_dispatch:
   # release.yml calls it on the release commit and does not publish until it is green (#384, P386).
   workflow_call:
@@ -42,14 +34,51 @@ concurrency:
 
 jobs:
 
+  # Whether a pull request's change can affect these jobs. Anything but a pull request runs them;
+  # a list that cannot be had fails closed (the classifier prints every class true).
+  classify:
+    name: classify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      run: ${{ steps.classify.outputs.run }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          persist-credentials: false
+
+      - name: Classify the change (.github/scripts/classify_changes.sh)
+        id: classify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PR: ${{ github.event.pull_request.number }}
+          CHANGED: ${{ github.event.pull_request.changed_files }}
+        run: |
+          if [ "$EVENT" = pull_request ] && [ -n "$PR" ] \
+             && gh api "repos/${{ github.repository }}/pulls/$PR/files" --paginate \
+                  --jq '.[].filename' > files.txt; then
+            .github/scripts/classify_changes.sh --expect "${CHANGED:-}" < files.txt > classes.txt
+          else
+            .github/scripts/classify_changes.sh --all < /dev/null > classes.txt
+          fi
+          cat classes.txt
+          if grep -qx -e all=true -e binary=true -e packaging=true classes.txt; then run=true; else run=false; fi
+          echo "run=$run" | tee -a "$GITHUB_OUTPUT"
+
   # The tarball's install.sh and units, under systemd as root on the runner (tests/packaging/
   # install.py): install, idempotence, every NRV-E11xx, three replicas and a gateway, a SIGKILL,
   # a replica that exits 8, uninstall. It changes /usr/local/bin, /etc and /var/lib: the runner is
   # thrown away after the job.
   tarball:
     name: tarball installs
-    # A draft pull request waits for ready_for_review; every other event runs.
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    needs: classify
+    # A draft pull request waits for ready_for_review; every other event runs. A failed
+    # `classify` runs the job (an empty output is not 'false').
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.classify.outputs.run != 'false' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
@@ -86,7 +115,10 @@ jobs:
   # release.yml (slice 7) runs the same scripts: packaging/linux/build-deb.sh and build-rpm.sh.
   packages:
     name: deb and rpm
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
+    needs: classify
+    # A draft pull request waits for ready_for_review; every other event runs. A failed
+    # `classify` runs the job (an empty output is not 'false').
+    if: ${{ !cancelled() && (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.classify.outputs.run != 'false' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     steps:
