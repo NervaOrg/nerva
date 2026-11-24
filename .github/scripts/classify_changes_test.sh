@@ -497,6 +497,7 @@ endpoint=$2; program=
 for ((i = 3; i < $#; i++)); do if [ "${!i}" = --jq ]; then j=$((i + 1)); program=${!j}; fi; done
 case $endpoint in
 */files)
+    echo read >> "$STUB_DIR/files_calls"
     [ -z "${STUB_FILES_FAIL:-}" ] || exit 1
     jq -r "$program" "$STUB_DIR/files.json" ;;
 *)
@@ -511,12 +512,17 @@ chmod +x "$stub/gh"
 pr_says() {
     local want=$1 files=$2 heads=$3 got
     shift 3
-    rm -f "$stub/n"
+    rm -f "$stub/n"; : > "$stub/files_calls"
     printf '%s' "$files" > "$stub/files.json"
     printf '%s\n' $heads > "$stub/heads"
     got=$(env PATH="$stub:$PATH" STUB_DIR="$stub" EVENT=pull_request PR=7 HEAD_SHA=aaa CHANGED=1 REPO=o/r "$@" \
         "$here/classify_pr.sh" 2> /dev/null | sed -n 's/=true$//p' | sort | tr '\n' ' ')
     want=$(printf '%s\n' $want | sed '/^$/d' | sort | tr '\n' ' ')
+    # The list is read once: a second read is a second chance to classify another head's files.
+    if [ "$(wc -l < "$stub/files_calls")" -gt 1 ]; then
+        echo "classify_changes_test: classify_pr.sh read the file list more than once for $files $*" >&2
+        fail=1
+    fi
     if [ "$got" != "$want" ]; then
         echo "classify_changes_test: classify_pr.sh: want [$want], got [$got] for $files heads $heads $*" >&2
         fail=1
