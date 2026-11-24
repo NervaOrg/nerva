@@ -47,10 +47,10 @@ SUITE_CLASSES = ("integration", "api", "views", "release", "demo", "demo_r4", "d
 # The lint's literal: any run of path characters that names a tracked file, whatever its extension, as
 # written or relative to the file that names it.
 TOKEN = re.compile(r"[A-Za-z0-9_.@+-]+(?:/[A-Za-z0-9_.@+-]*)*")
-# `import a, b.c as d` (every name, also after a `;`), and `from x import a, b` or `from x import (a,\n b)`:
+# `import a, b.c as d` (every name, also after a `;` or a `:`), and `from x import a, b` or `from x import (a,\n b)`:
 # the module x, and each name, which may be a submodule.
-IMPORT = re.compile(r"(?:^|;)[ \t]*import[ \t]+([^;\n]+)", re.M)
-IMPORT_FROM = re.compile(r"(?:^|;)[ \t]*from[ \t]+([\w.]+)[ \t]+import[ \t]+(\([^)]*\)|[^;\n]*)", re.M)
+IMPORT = re.compile(r"(?:^|[;:])[ \t]*import[ \t]+([^;\n]+)", re.M)
+IMPORT_FROM = re.compile(r"(?:^|[;:])[ \t]*from[ \t]+([\w.]+)[ \t]+import[ \t]+(\([^)]*\)|[^;\n]*)", re.M)
 # Documents a suite's file names in a docstring and never reads (the manifest says `none` for them), and the
 # one test file another names as the place a case lives. Each is allowed by hand: the lint would otherwise
 # demand every suite select its own prose. A real read of one of these is not seen (O14, Limits).

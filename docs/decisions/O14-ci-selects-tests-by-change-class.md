@@ -139,7 +139,10 @@ see one is noticed:
 
 - **Dynamic paths** (`limit_computed`, `limit_importlib`). A path built at run time
   (`os.path.join(root, name)` with a computed name, an f-string or `+` with a variable, an
-  `importlib` name, `__import__`) is not seen.
+  `importlib` name, `__import__`) is not seen. Nor is a path whose pieces are all literals but
+  joined at run time (`os.path.join(HERE, "..", "demo", "x.py")`, `Path(...) / "demo" / "x.py"`,
+  `ROOT / "demo" / "x.py"`: `limit_join_literal`, `limit_pathlib_literal`, `limit_pathlib_root`);
+  only a whole literal is read.
 - **Directory listings and globs** (`limit_listdir`, `limit_glob`, `limit_directory`).
   `os.listdir`, `glob.glob("tests/api/*.py")`, `ls dir`, `find` and a literal that names a
   directory are not expanded into the files they reach.
@@ -153,7 +156,8 @@ see one is noticed:
   file may not name a document the manifest does not select for it. `CLAUDE.md`,
   `docs/DECISIONS.md`, `docs/briefs/*.md` and one test-file pair are allowed by name in
   `classify_guard.py` (`MENTIONED`), since the suites' docstrings cite them and nothing reads
-  them. A real read of one of those is not seen.
+  them. A real read of one of those is not seen, nor `commands.py` running `tests/release/mixed.py`
+  (`limit_pair`).
 
 What the lint does see, and a reader may rely on: every name of a comma import, `import a; import
 b`, and a `from x import (a, b)`; a path in a docstring or any triple-quoted string (an embedded

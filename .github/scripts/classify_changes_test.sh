@@ -254,6 +254,10 @@ lint 1 lint_import_comma 'import os, helper' 'import helper'
 lint 1 lint_import_comma3 'import sys, json, helper' 'import helper'
 lint 1 lint_import_comma_as 'import os as o, helper as h' 'import helper'
 lint 1 lint_import_semicolon 'import os; import helper' 'import helper'
+lint 1 lint_import_if 'if True: import helper' 'import helper'
+lint 1 lint_import_try 'try: import helper
+except ImportError: pass' 'import helper'
+lint 1 lint_from_colon 'if True: from helper import f' 'helper'
 lint 1 lint_from_comma 'from os import path, helper' 'import helper'
 lint 1 lint_from_paren 'from os import (
     path,
@@ -337,6 +341,20 @@ lint 0 limit_computed 'import os
 open(os.path.join("de" + "mo", "x" + ".py"))'
 lint 0 limit_importlib 'import importlib
 importlib.import_module("hel" + "per")'
+# A path whose pieces are all literals but joined at run time: only a computed or whole literal is read.
+lint 0 limit_join_literal 'import os
+p = os.path.join(HERE, "..", "..", "demo", "x.py")'
+lint 0 limit_pathlib_literal 'from pathlib import Path
+p = Path(__file__).parent / ".." / ".." / "demo" / "x.py"'
+lint 0 limit_pathlib_root 'ROOT = None
+p = ROOT / "demo" / "x.py"'
+# The one allowed test-file pair (MENTIONED_PAIRS): a real run of tests/release/mixed.py by commands.py is not seen.
+ltree limit_pair
+mkdir -p "$tmp/limit_pair/tests/errors" "$tmp/limit_pair/tests/release"
+printf 'api tests/errors/*\nrelease tests/release/*\n' >> "$tmp/limit_pair/.github/test-inputs.txt"
+echo x > "$tmp/limit_pair/tests/release/mixed.py"
+printf 'import subprocess\nsubprocess.run(["python3", "tests/release/mixed.py"])\n' > "$tmp/limit_pair/tests/errors/commands.py"
+guard_in 0 limit_pair
 # Reads through another file: what a file the suite reads says is not followed (an `all` file is not scanned).
 lint 0 limit_through_file 'open("../shared/data.txt")'
 echo 'demo/x.py' > "$tmp/limit_through_file/tests/shared/data.txt"
