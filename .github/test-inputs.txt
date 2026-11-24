@@ -1,0 +1,119 @@
+# What each narrowable class of CI reads: the hand-kept manifest of decision O14.
+#
+# One rule per line: `<class> <glob>`. A path takes the union of the classes of every rule it
+# matches. In a glob `*` matches any run of characters, `/` included, so `tests/api/*` is the whole
+# directory. A path that no rule matches runs EVERYTHING (the default, so a new kind of file is safe),
+# and so does a path with an `all` rule. `none` says nothing reads the file (documentation).
+#
+# Coarse by default. Only these narrow a pull request: documentation that no test reads, listed
+# below; and one suite's own directory (tests/api, tests/views, demo, packaging, ...). Everything
+# else runs everything, among it: src/, build.zig, build.zig.zon, zig/, VERSION, .gitmodules,
+# .gitattributes, ci/, ops/, perf/, scripts/, release/, tests/jepsen/, the workflows, the actions
+# and the classifier (classify_changes.sh keeps its own floor for the last four, so an edit to this
+# file cannot weaken it), shared libraries and runners, and any file not listed here.
+#
+# A Markdown file that a test or a build step reads must be listed with the classes that read it, or
+# be left out (everything runs). When in doubt, leave it out.
+#
+# Classes: all none integration api views release demo demo_r4 demo_r5 macos packaging ci_scripts
+# mac_keychain. classify_guard.py checks that the files of each suite name, in a literal path or an
+# import, only files that select that suite's class (best effort: it cannot see a computed path, a
+# directory listing or a glob; decision O14, "Limits"). Add a rule here, and a case to
+# classify_changes_test.sh.
+
+# Everything: written out so a reader sees the floor. (classify_changes.sh enforces the rest of it
+# by leaving unlisted paths to `all`.)
+all src/*
+all build.zig
+all build.zig.zon
+all zig/*
+all VERSION
+all .gitmodules
+all .gitattributes
+all */.gitattributes
+all ci/*
+all .github/workflows/*
+all .github/actions/*
+all .github/scripts/classify_*
+all .github/test-inputs.txt
+all docs/ERRORS.md
+all UPSTREAM.md
+# Markdown that a test reads under ops/ (also Woodpecker's docs_only.sh): the Jepsen reporter's test and
+# ci_test.sh. Everything under ops/ runs everything already; these say why the two are not documentation.
+all ops/jepsen/README.md
+all ops/ci/README.md
+
+# Documentation that nothing reads (N68).
+none README.md
+none CLAUDE.md
+none REVIEW.md
+none SECURITY.md
+none WORKLOG.md
+none worklog/*
+none docs/DECISIONS.md
+none docs/decisions/*
+none docs/retros/*
+none docs/design/*
+none docs/briefs/*
+none docs/demos/*
+none docs/GOALS-1.0.md
+none docs/MATURITY.md
+none docs/NON-GOALS.md
+none docs/OPERATING.md
+none docs/PRODUCTION.md
+none docs/ROADMAP.md
+none docs/TIGER_STYLE.md
+none docs/TROUBLESHOOTING.md
+none docs/TUTORIAL.md
+none docs/test-plan-*.md
+none docs/releases/v*
+
+# Markdown that a test reads: the classes that read it.
+api docs/API.md
+packaging docs/INSTALL.md
+ci_scripts docs/QUICKSTART.md
+packaging docs/QUICKSTART.md
+ci_scripts CHANGELOG.md
+ci_scripts docs/releases/automation.md
+packaging docs/releases/packages.md
+ci_scripts docs/releases/packages.md
+
+# One suite's own directory. tests/api/api.py is imported by tests/errors (commands.py runs in
+# test:integration), so it selects both suites, and so does tests/errors.
+api tests/api/*
+integration tests/api/api.py
+api tests/errors/*
+integration tests/errors/*
+integration tests/recover/*
+views tests/views/*
+release tests/release/*
+macos tests/macos/*
+demo demo/*
+demo tests/demo/canvas_chaos.py
+demo tests/demo/seats_chaos.py
+demo_r4 tests/demo/r4.py
+demo_r5 tests/demo/r5.py
+packaging tests/packaging/*
+
+# Packaging: its scripts, data and tests, and what the Homebrew formula's macOS job reads.
+packaging packaging/*
+ci_scripts packaging/*
+macos packaging/homebrew/*
+packaging .github/scripts/package_repos.sh
+packaging .github/scripts/repo_install_check.sh
+packaging .github/scripts/test_package_repos.py
+packaging .github/scripts/r2.py
+packaging .github/scripts/test_r2.py
+packaging .github/scripts/pre_p417_tags
+ci_scripts .github/scripts/package_repos.sh
+ci_scripts .github/scripts/repo_install_check.sh
+ci_scripts .github/scripts/test_package_repos.py
+ci_scripts .github/scripts/r2.py
+ci_scripts .github/scripts/test_r2.py
+ci_scripts .github/scripts/pre_p417_tags
+
+# The macOS signing-keychain job's scripts.
+mac_keychain .github/scripts/mac_*
+ci_scripts .github/scripts/mac_*
+mac_keychain .github/scripts/test_mac_sign.py
+ci_scripts .github/scripts/test_mac_sign.py
