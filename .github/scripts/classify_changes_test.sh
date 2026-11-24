@@ -73,6 +73,7 @@ check "packaging ci_scripts checks any" 'docs/releases/packages.md'
 check "api any" 'docs/API.md'
 check "packaging checks any" 'docs/INSTALL.md'
 check "$everything" 'ops/jepsen/README.md'
+check "$everything" 'ops/ci/README.md'
 check "$everything" $'README.md\nUPSTREAM.md'
 
 # The binary's inputs, the toolchain, CI plumbing and the classifier itself: everything.
@@ -248,11 +249,51 @@ ltree lint_pkg_dotted 'import pkg.sub'
 mkdir -p "$tmp/lint_pkg_dotted/demo/pkg"
 echo x > "$tmp/lint_pkg_dotted/demo/pkg/__init__.py"
 guard_in 1 lint_pkg_dotted 'import pkg'
-# A comment, a docstring and a mention in a message are not reads.
+# Comma imports (the fourth review): every name is checked, with `as`, after a `;`, and in a `from`.
+lint 1 lint_import_comma 'import os, helper' 'import helper'
+lint 1 lint_import_comma3 'import sys, json, helper' 'import helper'
+lint 1 lint_import_comma_as 'import os as o, helper as h' 'import helper'
+lint 1 lint_import_semicolon 'import os; import helper' 'import helper'
+lint 1 lint_from_comma 'from os import path, helper' 'import helper'
+lint 1 lint_from_paren 'from os import (
+    path,
+    helper,
+)' 'import helper'
+lint 0 lint_import_ok 'import os, sys, own
+from os import path, sep'
+# A comment line is not a read. A docstring and any triple-quoted string are scanned: one may be a script
+# that runs (the fourth review), and a path in prose only adds a candidate.
 lint 0 lint_comment '# demo/x.py is not read
 x = 1'
-lint 0 lint_docstring '"""Reads demo/x.py, they say."""
-x = 1'
+lint 1 lint_docstring '"""Reads demo/x.py, they say."""
+x = 1' 'names demo/x.py'
+lint 1 lint_embedded_script 'SCRIPT = (
+"""
+cat ../../demo/x.py
+""")' 'names demo/x.py'
+lint 1 lint_mispaired 'A = """
+x
+"""
+open("../../demo/x.py")
+B = """
+y
+"""' 'names demo/x.py'
+# Any extension, whether the path is relative to the file or follows a shell variable (the fourth review).
+ltree lint_ext_html 'open("../../demo/seats/index.html")'
+mkdir -p "$tmp/lint_ext_html/demo/seats"
+echo x > "$tmp/lint_ext_html/demo/seats/index.html"
+guard_in 1 lint_ext_html 'names demo/seats/index.html'
+ltree lint_ext_rb
+mkdir -p "$tmp/lint_ext_rb/packaging/homebrew"
+echo x > "$tmp/lint_ext_rb/packaging/homebrew/nerva.rb"
+printf 'macos packaging/homebrew/*\n' >> "$tmp/lint_ext_rb/.github/test-inputs.txt"
+printf 'cat "$here/../../packaging/homebrew/nerva.rb"\n' > "$tmp/lint_ext_rb/tests/api/run.sh"
+guard_in 1 lint_ext_rb 'names packaging/homebrew/nerva.rb'
+ltree lint_ext_root
+mkdir -p "$tmp/lint_ext_root/demo/seats"
+echo x > "$tmp/lint_ext_root/demo/seats/index.html"
+printf 'open(ROOT + "/demo/seats/index.html")\n' > "$tmp/lint_ext_root/tests/api/a.py"
+guard_in 1 lint_ext_root 'names demo/seats/index.html'
 # Shell files of a suite are scanned like any other (sh_upstream, sh_root_md of the third review).
 ltree lint_sh_ok
 printf 'cat UPSTREAM.md\ncat "$here/../docs/ERRORS.md"\ncat docs/API.md\n' > "$tmp/lint_sh_ok/tests/api/run.sh"
@@ -296,6 +337,21 @@ lint 0 limit_computed 'import os
 open(os.path.join("de" + "mo", "x" + ".py"))'
 lint 0 limit_importlib 'import importlib
 importlib.import_module("hel" + "per")'
+# Reads through another file: what a file the suite reads says is not followed (an `all` file is not scanned).
+lint 0 limit_through_file 'open("../shared/data.txt")'
+echo 'demo/x.py' > "$tmp/limit_through_file/tests/shared/data.txt"
+guard_in 0 limit_through_file
+# Documents named in prose, by hand (MENTIONED in classify_guard.py): a real read of one is not seen.
+ltree limit_mentioned 'open("docs/DECISIONS.md")'
+echo x > "$tmp/limit_mentioned/docs/DECISIONS.md"
+printf 'none docs/DECISIONS.md\n' >> "$tmp/limit_mentioned/.github/test-inputs.txt"
+guard_in 0 limit_mentioned
+# Roots: a file the manifest lists under the wrong class is checked as that class.
+ltree limit_wrong_class
+mkdir -p "$tmp/limit_wrong_class/tests/other"
+printf 'demo tests/other/*\n' >> "$tmp/limit_wrong_class/.github/test-inputs.txt"
+printf 'open("../../demo/x.py")\n' > "$tmp/limit_wrong_class/tests/other/b.py"
+guard_in 0 limit_wrong_class
 # A tracked symbolic link, in a tree that is a git work tree.
 ltree lint_symlink
 ln -s ../../docs/API.md "$tmp/lint_symlink/tests/api/link.md"
@@ -314,7 +370,21 @@ workflow_tree() { # workflow_tree <name> <sed over ci.yml> <job yaml>
         printf '    steps:\n      - id: classify\n        run: x\n'
         printf '  system:\n    needs:\n'
         for j in $system_needs; do printf '      - %s\n' "$j"; done
-        printf '    runs-on: x\n    steps: []\n%s\n' "$3"
+        cat << 'YAML'
+    if: ${{ always() }}
+    runs-on: x
+    steps:
+      - name: Every split job succeeded
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          for r in $RESULTS; do
+            if [ "$r" != success ]; then
+              exit 1
+            fi
+          done
+YAML
+        printf '%s\n' "$3"
     } > "$tmp/$1/.github/workflows/ci.yml"
     if [ -n "$2" ]; then sed -i "$2" "$tmp/$1/.github/workflows/ci.yml"; fi
 }
@@ -387,6 +457,19 @@ workflow_tree wf_system_drop '/^      - targets$/d' "$(job unit changes "$ok")"
 guard_in 1 wf_system_drop 'the required check `system` waits for'
 workflow_tree wf_system_extra 's/^      - targets$/&\n      - extra/' "$(job unit changes "$ok")"
 guard_in 1 wf_system_extra 'the required check `system` waits for'
+# `system` must run after a failed need and fail unless every need succeeded.
+workflow_tree wf_system_no_if '/^    if: \${{ always() }}$/d' "$(job unit changes "$ok")"
+guard_in 1 wf_system_no_if 'job system has `if: (none)`'
+workflow_tree wf_system_if_success "s/^    if: \${{ always() }}\$/    if: \${{ success() }}/" "$(job unit changes "$ok")"
+guard_in 1 wf_system_if_success 'job system has `if: success()`'
+workflow_tree wf_system_no_check 's/ != success / == success /' "$(job unit changes "$ok")"
+guard_in 1 wf_system_no_check 'job system has no step'
+workflow_tree wf_system_no_exit 's/^              exit 1$/              echo bad/' "$(job unit changes "$ok")"
+guard_in 1 wf_system_no_exit 'job system has no step'
+workflow_tree wf_system_no_results 's/join(needs.\*.result/join(needs.checks.result/' "$(job unit changes "$ok")"
+guard_in 1 wf_system_no_results 'job system has no step'
+workflow_tree wf_system_coe '/^  system:/,/^    steps:/ s/^    runs-on: x$/    runs-on: x\n    continue-on-error: true/' "$(job unit changes "$ok")"
+guard_in 1 wf_system_coe 'job system has `continue-on-error`'
 # The classifier's own test and its checkout run on every pull request.
 ci_scripts_job() { # ci_scripts_job <checkout if line> <test if line>
     printf '  ci-scripts:
@@ -565,6 +648,23 @@ status=0
 err=$("$here/classify_changes.sh" --bogus 2>&1 < /dev/null) || status=$?
 case $err in *'error[NRV-E1251]: classify_changes.sh: usage'*) ;; *) echo "classify_changes_test: the usage error lacks NRV-E1251: $err" >&2; fail=1 ;; esac
 if [ "$status" != 2 ]; then echo "classify_changes_test: the usage error exits $status, want 2" >&2; fail=1; fi
+# An argument the classifier does not use is a usage error too, after `--expect N`, `--all` or nothing.
+for args in "--expect 1 --all" "--expect 1 x" "--expect x y" "--all --all" "--all 1" "--expect 1 2 3"; do
+    status=0
+    # shellcheck disable=SC2086  # the words of $args are the arguments
+    err=$(printf 'README.md\n' | "$here/classify_changes.sh" $args 2>&1) || status=$?
+    case $err in *'error[NRV-E1251]: classify_changes.sh: usage'*) ;; *) echo "classify_changes_test: [$args] lacks NRV-E1251: $err" >&2; fail=1 ;; esac
+    if [ "$status" != 2 ]; then echo "classify_changes_test: [$args] exits $status, want 2" >&2; fail=1; fi
+done
+# A push, a release's call or a dispatch is not an error: a plain note, no code, exit 0, every class true.
+status=0
+err=$(env PATH="$stub:$PATH" STUB_DIR="$stub" EVENT=push PR= HEAD_SHA= CHANGED= REPO= "$here/classify_pr.sh" 2>&1 > /dev/null) || status=$?
+case $err in
+*'error['*) echo "classify_changes_test: a push prints an error code: $err" >&2; fail=1 ;;
+*'classify_pr.sh: the event is not a pull request: every class runs'*) ;;
+*) echo "classify_changes_test: a push does not say why every class runs: $err" >&2; fail=1 ;;
+esac
+if [ "$status" != 0 ]; then echo "classify_changes_test: a push exits $status, want 0" >&2; fail=1; fi
 # If even `--all` fails, classify_pr.sh fails (the step fails, its output is empty, everything runs):
 # it never exits 0 with nothing printed.
 brokendir="$tmp/broken/.github/scripts"

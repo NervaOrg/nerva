@@ -38,6 +38,10 @@ all .github/scripts/classify_*
 all .github/test-inputs.txt
 all docs/ERRORS.md
 all UPSTREAM.md
+# Markdown that a test reads under ops/ (also Woodpecker's docs_only.sh): the Jepsen reporter's test and
+# ci_test.sh. Everything under ops/ runs everything already; these say why the two are not documentation.
+all ops/jepsen/README.md
+all ops/ci/README.md
 
 # Documentation that nothing reads (N68).
 none README.md

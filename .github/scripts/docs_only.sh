@@ -8,12 +8,15 @@
 #   UPSTREAM.md     (.github/scripts/sbom.py and test_sbom.py)
 #   docs/API.md, docs/INSTALL.md, docs/QUICKSTART.md, CHANGELOG.md, docs/releases/automation.md and
 #   docs/releases/packages.md  (tests/api/docs_routes.py, the packaging and release script tests and
-#   scripts/quickstart_loop.sh; #15). The same facts are in .github/test-inputs.txt, which says which
-#   suite reads each: keep the two in step.
-# Re-check with: grep -rn '\.md"' build.zig src .github/scripts perf ops tests scripts packaging
+#   scripts/quickstart_loop.sh; #15)
+#   ops/jepsen/README.md  (ops/jepsen/test_jepsen_report.py), ops/ci/README.md  (ci/ci_test.sh: both
+#   run in check-scripts)
+# The same facts are in .github/test-inputs.txt, which says which suite reads each: keep the two in
+# step.
+# Re-check with: git grep -n '\.md' -- '*.py' '*.sh' '*.zig' build.zig ci ops tests demo .github/scripts scripts perf packaging
 set -eu
 
-reads_md='^(docs/ERRORS\.md|UPSTREAM\.md|docs/API\.md|docs/INSTALL\.md|docs/QUICKSTART\.md|CHANGELOG\.md|docs/releases/(automation|packages)\.md)$'
+reads_md='^(docs/ERRORS\.md|UPSTREAM\.md|docs/API\.md|docs/INSTALL\.md|docs/QUICKSTART\.md|CHANGELOG\.md|docs/releases/(automation|packages)\.md|ops/(jepsen|ci)/README\.md)$'
 seen=0
 while IFS= read -r file || [ -n "$file" ]; do
     [ -n "$file" ] || continue

@@ -9,13 +9,14 @@ ci.yml and packages.yml gate their jobs on its output. This checks two things.
      as `docs/API.md`, `tests/api/api.py` or `../api`, or a Python `import` of a module that is a
      tracked file. Each path found must be selected for every class of the file that names it, or
      run everything. BEST EFFORT, and no proof: it cannot see a path built at run time, a directory
-     listing, a glob, an `importlib` name, a path in a docstring or a comment (skipped), or one
+     listing, a glob, an `importlib` name, a path on a comment line (skipped), or one
      read through another file. The manifest is the claim; this catches the commonest slip, a new
      literal that the manifest does not know. A rule that matches no file is an error too.
   2. The wiring: ci.yml's `changes` job outputs each class as its own value, every job that waits
      for it runs after a failed one (`!cancelled()`), every step of such a job is gated in exactly
      `needs.changes.outputs.<class> != 'false'` on a class its job depends on, no gated job or step
-     has `continue-on-error`, `system` waits for the jobs it aggregates, the classifier's own test
+     has `continue-on-error`, `system` waits for the jobs it aggregates, runs `always()` and has the step that fails it unless each
+     succeeded, the classifier's own test
      and its checkout have no `if`, `on.push` has no `paths` or `paths-ignore`, packages.yml's jobs
      wait for `classify` and run when it fails or says nothing, and every workflow that calls another
      grants it the permissions its jobs ask for (a called workflow cannot hold more than its caller,
@@ -24,6 +25,7 @@ ci.yml and packages.yml gate their jobs on its output. This checks two things.
 
   classify_guard.py [--root DIR]      the repository, by default the one this file is in
 """
+import fnmatch
 import os
 import posixpath
 import re
@@ -42,11 +44,18 @@ CLASSIFIER = os.path.join(HERE, "classify_changes.sh")
 SUITE_CLASSES = ("integration", "api", "views", "release", "demo", "demo_r4", "demo_r5", "macos", "packaging",
                  "ci_scripts", "mac_keychain")
 
-# The lint's literal: a file name with one of these extensions, or a path under a top-level directory.
-EXTENSIONS = ("md", "py", "sh", "zig", "json", "txt", "toml", "yml")
+# The lint's literal: any run of path characters that names a tracked file, whatever its extension, as
+# written or relative to the file that names it.
 TOKEN = re.compile(r"[A-Za-z0-9_.@+-]+(?:/[A-Za-z0-9_.@+-]*)*")
-IMPORT = re.compile(r"^\s*(?:from|import)\s+([A-Za-z_]\w*)", re.M)
-DOCSTRING = re.compile(r'^[ \t]*[rbf]?(?:"""|\'\'\').*?(?:"""|\'\'\')', re.M | re.S)
+# `import a, b.c as d` (every name, also after a `;`), and `from x import a, b` or `from x import (a,\n b)`:
+# the module x, and each name, which may be a submodule.
+IMPORT = re.compile(r"(?:^|;)[ \t]*import[ \t]+([^;\n]+)", re.M)
+IMPORT_FROM = re.compile(r"(?:^|;)[ \t]*from[ \t]+([\w.]+)[ \t]+import[ \t]+(\([^)]*\)|[^;\n]*)", re.M)
+# Documents a suite's file names in a docstring and never reads (the manifest says `none` for them), and the
+# one test file another names as the place a case lives. Each is allowed by hand: the lint would otherwise
+# demand every suite select its own prose. A real read of one of these is not seen (O14, Limits).
+MENTIONED = ("CLAUDE.md", "docs/DECISIONS.md", "docs/briefs/*.md")
+MENTIONED_PAIRS = {("tests/errors/commands.py", "tests/release/mixed.py")}
 COMMENT = re.compile(r"^\s*(?:#|//)")
 
 # The classes each ci.yml job's steps may be gated on, and at least one step must be gated on the
@@ -149,9 +158,8 @@ class Guard:
     # --- the lint -------------------------------------------------------------------------
 
     def literals(self, rel, text):
-        """The text the lint scans: no docstrings and no comment lines (a path there is a mention, not a read)."""
-        if rel.endswith(".py"):
-            text = DOCSTRING.sub("", text)
+        """The text the lint scans: every line but a comment line. Triple-quoted strings are scanned, docstrings
+        too: a string may be a script that runs, and a path in prose only adds a candidate (select it, or reword)."""
         return "\n".join(line for line in text.splitlines() if not COMMENT.match(line))
 
     def resolve(self, rel, token, files):
@@ -167,17 +175,32 @@ class Guard:
                     return [cand]
         return []
 
-    def literal_paths(self, rel, text, files, modules, top_dirs):
+    @staticmethod
+    def imported(text):
+        """The top-level module names a Python text imports: every name of a comma import, the module of a
+        `from`, and each name it imports (a submodule is `from pkg import sub`)."""
+        names = set()
+        for clause in IMPORT.findall(text):
+            for part in clause.split(","):
+                words = part.split()
+                if words:
+                    names.add(words[0].split(".")[0])
+        for module, clause in IMPORT_FROM.findall(text):
+            names.add(module.lstrip(".").split(".")[0])
+            for part in clause.strip("()").split(","):
+                words = part.split()
+                if words:
+                    names.add(words[0])
+        return {n for n in names if n.isidentifier()}
+
+    def literal_paths(self, rel, text, files, modules):
         found = {}
         for token in TOKEN.findall(self.literals(rel, text)):
             token = token[2:] if token.startswith("./") else token
-            base = token.rstrip("/").rsplit("/", 1)[-1]
-            ext = base.rsplit(".", 1)[-1] if "." in base else ""
-            if ext in EXTENSIONS or token.split("/")[0] in top_dirs and "/" in token:
-                for p in self.resolve(rel, token, files):
-                    found[p] = token
+            for p in self.resolve(rel, token, files):
+                found[p] = token
         if rel.endswith(".py"):
-            for name in IMPORT.findall(text):
+            for name in self.imported(text):
                 for p in modules.get(name, ()):
                     found[p] = "import " + name
         found.pop(rel, None)
@@ -202,7 +225,6 @@ class Guard:
                     d = posixpath.dirname(d)
         for name, found in packages.items():
             modules.setdefault(name, found)
-        top_dirs = {f.split("/")[0] for f in files if "/" in f}
         self.check_rules(files)
         for rel in files:
             if rel.endswith(".md"):
@@ -216,7 +238,9 @@ class Guard:
             text = self.read(rel)
             if text is None:
                 continue
-            for path, token in sorted(self.literal_paths(rel, text, file_set, modules, top_dirs).items()):
+            for path, token in sorted(self.literal_paths(rel, text, file_set, modules).items()):
+                if (rel, path) in MENTIONED_PAIRS or any(fnmatch.fnmatchcase(path, m) for m in MENTIONED):
+                    continue
                 missing = [c for c in own if c not in self.classify(path)]
                 if missing:
                     self.errors.append(
@@ -297,6 +321,7 @@ class Guard:
         if set(system) != SYSTEM_NEEDS:
             self.errors.append("ci.yml: the required check `system` waits for %s, not %s: a job it drops can fail "
                                "unseen" % (sorted(system), sorted(SYSTEM_NEEDS)))
+        self.check_system(jobs.get("system") or {})
         for name, job in jobs.items():
             if "changes" not in self.needs_of(job) or name == "changes":
                 continue
@@ -361,6 +386,27 @@ class Guard:
                                    (name, allowed[0]))
             if UNGATED.get(name) and not any(UNGATED[name] in (s.get("run") or "") for s in job.get("steps") or []):
                 self.errors.append("ci.yml: job %s has no step that runs %s" % (name, UNGATED[name]))
+
+    def check_system(self, job):
+        """`system` is the required check. It runs after a failed need (`if: always()`; the default `success()`
+        would skip it, and a skipped required check passes), and a step fails it unless every need's result is
+        `success`: the step reads `join(needs.*.result, ' ')`, tests each against `success` and exits 1."""
+        have = self.expression(job["if"]) if "if" in job else None
+        if have != "always()":
+            self.errors.append("ci.yml: job system has `if: %s`; it must be exactly `always()` (a failed job it "
+                               "waits for would skip it, and a skipped required check passes)" %
+                               (have if have is not None else "(none)"))
+        if "continue-on-error" in job:
+            self.errors.append("ci.yml: job system has `continue-on-error`: a failed job would pass")
+        for step in job.get("steps") or []:
+            env = " ".join(str(v) for v in (step.get("env") or {}).values())
+            run = step.get("run") or ""
+            if ("join(needs.*.result" in env and "!= success" in run and "exit 1" in run and "if" not in step
+                    and "continue-on-error" not in step):
+                return
+        self.errors.append("ci.yml: job system has no step, without `if` or `continue-on-error`, that reads "
+                           "`join(needs.*.result, ' ')`, compares each with `success` and exits 1: a failed job "
+                           "it waits for would pass")
 
     def check_packages_gate(self):
         """packages.yml: every job that waits for `classify` runs unless the output is 'false'."""

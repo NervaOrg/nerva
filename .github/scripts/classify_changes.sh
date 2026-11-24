@@ -47,11 +47,15 @@ usage() {
 }
 
 expect=
+syntax="usage: classify_changes.sh [--all | --expect <changed files>] < files, one per line (a rename: new<TAB>old)"
 case "${1:-}" in
---all) raise_all ;;
---expect) expect="${2:-}"; [[ "$expect" =~ ^[1-9][0-9]*$ ]] || raise_all ;;
-"") ;;
-*) usage "usage: classify_changes.sh [--all | --expect <changed files>] < files, one per line (a rename: new<TAB>old)" ;;
+--all) [ "$#" = 1 ] || usage "$syntax"; raise_all ;;
+--expect)
+    # `--expect` with no number is a cut list (everything runs); any argument beyond it is a usage error.
+    [ "$#" -le 2 ] || usage "$syntax"
+    expect="${2:-}"; [[ "$expect" =~ ^[1-9][0-9]*$ ]] || raise_all ;;
+"") [ "$#" = 0 ] || usage "$syntax" ;;
+*) usage "$syntax" ;;
 esac
 
 # The manifest: `<class> <glob>` per line, `#` comments, blank lines. A rule it cannot read is an

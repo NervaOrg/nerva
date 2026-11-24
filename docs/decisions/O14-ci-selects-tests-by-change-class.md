@@ -92,20 +92,26 @@ for an issue (CLAUDE.md).
   counts once and lists both names; fewer, or an N that is not a positive number, is a cut list).
 - `classify_pr.sh` fetches the list once (one line per file: `filename`, then `previous_filename`
   for a rename) and the head before and after it, and hands the list to the classifier with
-  `--expect`. It fails closed as above (NRV-E1252) and exits 1 if even `--all` fails. ci.yml's
+  `--expect`. It fails closed as above (NRV-E1252; a non-pull-request event is not a failure and prints a plain
+  note) and exits 1 if even `--all` fails. The classifier refuses any argument after `--all` or
+  `--expect N` (NRV-E1251). ci.yml's
   `changes` job and packages.yml's `classify` job run it, and nothing else reads the list: the
   floor is the classifier's. packages.yml runs its jobs unless the output says `all=false` and
   `packaging=false`; an empty or garbled output runs them.
 - `classify_guard.py` (NRV-E1250), run by `classify_changes_test.sh` in ci.yml's `ci-scripts` job:
   - **The lint.** Every file that a narrowable suite owns (it has a suite class and no `all`) is
-    scanned for literal repository paths and Python imports of tracked modules. Each path found
-    must carry every one of the file's suite classes, or run everything. A rule that matches no
-    file is an error. It is a cheap regex lint, best effort, and no proof (Limits).
+    scanned for literal repository paths (any token that names a tracked file, whatever its
+    extension, as written or relative to the file) and for Python imports of tracked modules (every
+    name of a comma import, each name of a `from`). Each path found must carry every one of the
+    file's suite classes, or run everything. A rule that matches no file is an error. It is a cheap
+    regex lint, best effort, and no proof (Limits).
   - **The wiring.** `changes` outputs each class as its own value. Every job that waits for
     `changes` has the job-level `if: ${{ !cancelled() }}` (or one of the three exact variants VOPR
     and the x86_64 macOS job need), has no `continue-on-error`, and gates each step in exactly
     `needs.changes.outputs.<class> != 'false'` on a class its job depends on, with no step
-    `continue-on-error` either. `system` waits for exactly the jobs it aggregates. The
+    `continue-on-error` either. `system` waits for exactly the jobs it aggregates, has
+    `if: ${{ always() }}` and a step, without `if`, that reads `join(needs.*.result, ' ')`, compares
+    each result with `success` and exits 1. The
     classifier's own test and its checkout have no `if`. `on.push` has no `paths` or
     `paths-ignore`. packages.yml's jobs have exactly `!cancelled() && (not a draft) &&
     needs.classify.outputs.run != 'false'`, and no `continue-on-error`. Every workflow that calls
@@ -121,34 +127,45 @@ for an issue (CLAUDE.md).
   tarball and deb/rpm jobs wait for ready_for_review, so they do not run while a pull request is a
   draft. release.yml grants its call `pull-requests: read`.
 - `docs_only.sh` stays Woodpecker's (`ci/changes.sh`). It carries the same list of Markdown that
-  tests read (#15), by hand, so Woodpecker no longer calls a read document docs-only.
+  tests read (#15; and `ops/jepsen/README.md` and `ops/ci/README.md`, which `check-scripts` reads),
+  by hand, so Woodpecker no longer calls a read document docs-only.
 
 ## Limits
 
 What the manifest and its lint do not see. Each is a way a suite can read a file the manifest does
-not say it reads, so a change to that file skips the suite. They are known, not closed:
+not say it reads, so a change to that file skips the suite. They are known, not closed, and each
+has a `limit_*` case in `classify_changes_test.sh` that passes today, so a change that starts to
+see one is noticed:
 
-- **Dynamic paths.** A path built at run time (`os.path.join(root, name)` with a computed `name`,
-  an f-string or `+` with a variable, an `importlib` name, `__import__`) is not seen.
-- **Directory listings and globs.** `os.listdir`, `glob.glob("tests/api/*.py")`, `ls dir`, `find`
-  and a literal that names a directory are not expanded into the files they reach.
-- **Imports across suites.** Only `import X` where `X` is a tracked `X.py` (or, with none, a
-  tracked package directory by that name) is followed, and not further: a file the imported module
-  reads is the module's own entry. `sys.path` and `PYTHONPATH` are not read.
-- **Reads through another file.** A manifest, a config, a `git ls-files` or a script the suite
-  runs by a computed name.
-- **Docstrings and comments** are skipped as mentions, so a docstring that is really read (a
-  `__doc__` test) is not seen.
-- **Shell variables.** A literal path is found in a shell file; a path assembled from `$var/x` is
-  found only by its literal tail, and `$(dirname "$0")/..` is not evaluated.
-- **Roots.** The lint scans the files the manifest gives a suite class. A suite file the manifest
-  leaves unlisted runs everything, so is safe; one listed under the wrong class is not seen.
-- **The wiring of a workflow other than ci.yml and packages.yml** is not checked beyond the
-  permissions of a call.
-- **Files `all` reaches** are not followed: a change to one runs everything.
+- **Dynamic paths** (`limit_computed`, `limit_importlib`). A path built at run time
+  (`os.path.join(root, name)` with a computed name, an f-string or `+` with a variable, an
+  `importlib` name, `__import__`) is not seen.
+- **Directory listings and globs** (`limit_listdir`, `limit_glob`, `limit_directory`).
+  `os.listdir`, `glob.glob("tests/api/*.py")`, `ls dir`, `find` and a literal that names a
+  directory are not expanded into the files they reach.
+- **Reads through another file** (`limit_through_file`). A manifest, a config, a `git ls-files` or
+  a script the suite runs by a computed name: what a file the suite reads says is not followed.
+  A file that runs everything (`all`, or no rule) is not scanned at all.
+- **Roots** (`limit_wrong_class`). The lint scans the files the manifest gives a suite class. A
+  suite file the manifest leaves unlisted runs everything, so is safe; one listed under the wrong
+  class is checked as that class and not seen to be another's.
+- **Documents named in prose, by hand** (`limit_mentioned`). Docstrings are scanned, so a suite's
+  file may not name a document the manifest does not select for it. `CLAUDE.md`,
+  `docs/DECISIONS.md`, `docs/briefs/*.md` and one test-file pair are allowed by name in
+  `classify_guard.py` (`MENTIONED`), since the suites' docstrings cite them and nothing reads
+  them. A real read of one of those is not seen.
 
-Mutants of the guard that stay missed (computed paths, `os.listdir`, `glob`) are tested as limits
-in `classify_changes_test.sh` (`limit_*` cases), so a change that starts to see them is noticed.
+What the lint does see, and a reader may rely on: every name of a comma import, `import a; import
+b`, and a `from x import (a, b)`; a path in a docstring or any triple-quoted string (an embedded
+script included, and the code around it); a path of any extension, relative to the file or after a
+shell variable (`$here/../x.html`). Only a comment line (`#` or `//`) is skipped. A docstring that names a file only to mention it needs that file selected for its suite, or
+rewording.
+
+`sys.path` and `PYTHONPATH` are not read; an import is a tracked `X.py`, or with none a tracked
+package directory by that name. The wiring of a workflow other than ci.yml and packages.yml is not
+checked beyond the permissions of a call. A file `all` reaches is not followed: a change to it runs
+everything.
+
 The real safety net is a runtime audit of which tracked files each suite opens, compared with the
 manifest: follow-up #16, not part of this decision. Until it lands, a skipped suite that reads an
 unlisted file is found by the next push to main, which runs everything.

@@ -18,6 +18,13 @@
 set -u
 here=$(cd "$(dirname "$0")" && pwd)
 
+# Not a failure: a push, a release's call or a dispatch has no pull request to classify, so every class runs.
+everything() {
+    echo "classify_pr.sh: $1: every class runs" >&2
+    "$here/classify_changes.sh" --all < /dev/null || exit 1
+    exit 0
+}
+
 fail_closed() {
     echo "error[NRV-E1252]: classify_pr.sh: $1: every class runs" >&2
     # If even --all fails, so does this: the step fails, its output is empty and everything runs.
@@ -25,7 +32,8 @@ fail_closed() {
     exit 0
 }
 
-[ "${EVENT:-}" = pull_request ] && [ -n "${PR:-}" ] || fail_closed "not a pull request"
+[ "${EVENT:-}" = pull_request ] || everything "the event is not a pull request"
+[ -n "${PR:-}" ] || fail_closed "a pull request event with no number"
 [ -n "${HEAD_SHA:-}" ] && [ -n "${REPO:-}" ] || fail_closed "no head SHA or repository in the event"
 [[ "${CHANGED:-}" =~ ^[1-9][0-9]*$ ]] || fail_closed "the event's changed_files is 0 or missing"
 
