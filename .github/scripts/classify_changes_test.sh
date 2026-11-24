@@ -1,24 +1,21 @@
 #!/usr/bin/env bash
-# Table test for classify_changes.sh, and the guard's own tests (classify_guard.py): the guard
-# passes on this repository and fails on a suite that reads a file the classifier does not select
-# it for. Decision O14.
+# Table test for classify_changes.sh against the manifest .github/test-inputs.txt, the guard's own
+# tests (classify_guard.py: the manifest lint and the workflows' wiring), and the steps that run the
+# classifier, run as GitHub runs them with a stand-in `gh`. Decision O14.
 set -eu
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(cd "$here/../.." && pwd)
 fail=0
 
 suites="unit fuzz vopr targets integration api views release demo demo_r4 demo_r5 macos packaging ci_scripts"
-everything="all binary any $suites mac_keychain checks"
-# What `binary` makes true: every class but `all` and the keychain job's.
-binary_set="binary any $suites checks"
+everything="all any $suites mac_keychain checks"
 
 # check "<true classes, space separated>" "<changed files, newline separated>" [classifier args]
 check() {
-    local want got classes
+    local want got files=$2
     want=$(printf '%s\n' $1 | sed '/^$/d' | sort | tr '\n' ' ')
-    local files=$2; shift 2
-    classes=$(printf '%s' "$files" | "$here/classify_changes.sh" "$@" | sed -n 's/=true$//p' | sort | tr '\n' ' ')
-    got=$classes
+    shift 2
+    got=$(printf '%s' "$files" | "$here/classify_changes.sh" "$@" | sed -n 's/=true$//p' | sort | tr '\n' ' ')
     if [ "$got" != "$want" ]; then
         echo "classify_changes_test: want [$want], got [$got] for: $(printf '%s' "$files" | head -3) ($*)" >&2
         fail=1
@@ -32,7 +29,7 @@ if [ "$printed" != "$(printf '%s ' $everything)" ]; then
     fail=1
 fi
 
-# Fail closed: an empty list, a list of nothing, and a file nothing places.
+# Fail closed: an empty list, a list of nothing, and a file nothing places (coarse by default).
 check "$everything" ''
 check "$everything" $'\n\n'
 check "$everything" 'LICENSE'
@@ -42,55 +39,59 @@ check "$everything" 'docs/a.markdown'
 check "$everything" 'docs/img.png'
 check "$everything" 'newdir/x.py'
 check "$everything" 'tests/newsuite/x.py'
+check "$everything" 'tests/demo/other.py'
+check "$everything" 'docs/INSTALL.md.bak.md'
 check "$everything" $'README.md\nnewdir/x.py'
 check "$everything" '.github/CODEOWNERS'
-# A list the API cut short: fewer names than the pull request changed, or 3000 or more.
+# A list the API cut short: fewer files than the pull request changed, or 3000 or more.
 check "$everything" 'README.md' --expect 2
 check "$everything" 'README.md' --expect ''
 check "$everything" 'README.md' --expect many
+check "$everything" 'README.md' --expect 0
 check "$everything" 'README.md' --expect
 check "" 'README.md' --expect 1
-check "$everything" "$(seq 1 3000 | sed 's|^|docs/n|; s|$|.md|')" --expect 3000
-check "" "$(seq 1 2999 | sed 's|^|docs/n|; s|$|.md|')" --expect 2999
+check "$everything" "$(seq 1 3000 | sed 's|^|docs/decisions/n|; s|$|.md|')" --expect 3000
+check "" "$(seq 1 2999 | sed 's|^|docs/decisions/n|; s|$|.md|')" --expect 2999
 check "$everything" 'README.md' --all
 check "" $'README.md\nworklog/1.md' --expect 2
 
-# Markdown nothing reads: nothing runs (N68).
+# Documentation that nothing reads: nothing runs (N68).
 check "" 'README.md'
 check "" $'README.md\ndocs/decisions/O14-x.md\nworklog/14.md\n'
 check "" 'docs/briefs/r5.md'
-check "" 'CHANGELOG.md'
 check "" 'SECURITY.md'
-check "" 'docs/INSTALL.md.bak.md'
-# Markdown that something reads is a class of its own.
-check "unit macos ci_scripts checks any" 'docs/ERRORS.md'
-check "ci_scripts checks any" 'UPSTREAM.md'
-check "ci_scripts checks any" 'docs/QUICKSTART.md'
+check "" 'CLAUDE.md'
+check "" 'docs/releases/v0.7.1-audit.md'
+check "" 'docs/test-plan-r1.md'
+# Markdown that a test reads: the classes that read it, or everything.
+check "$everything" 'docs/ERRORS.md'
+check "$everything" 'UPSTREAM.md'
+check "ci_scripts checks any" 'CHANGELOG.md'
+check "ci_scripts packaging checks any" 'docs/QUICKSTART.md'
+check "ci_scripts checks any" 'docs/releases/automation.md'
 check "packaging ci_scripts checks any" 'docs/releases/packages.md'
-check "ci_scripts checks any" 'ops/jepsen/README.md'
 check "api any" 'docs/API.md'
 check "packaging checks any" 'docs/INSTALL.md'
-check "unit macos ci_scripts checks any" $'README.md\nUPSTREAM.md\ndocs/ERRORS.md'
+check "$everything" 'ops/jepsen/README.md'
+check "$everything" $'README.md\nUPSTREAM.md'
 
-# The binary's inputs run every suite, but not the keychain job.
+# The binary's inputs, the toolchain, CI plumbing and the classifier itself: everything.
 for f in src/nerva.zig src/vsr/replica.zig build.zig build.zig.zon zig/download.sh VERSION .gitmodules \
-    .gitattributes src/.gitattributes docs/.gitattributes; do
-    check "$binary_set" "$f"
-done
-check "$binary_set" $'README.md\nsrc/nerva.zig'
-
-# CI plumbing and the classifier itself: everything.
-for f in ci/job.sh ci/lib.sh ci/install_zig.sh ci/io_uring_check.sh .github/workflows/ci.yml \
-    .github/actions/zig-build-cache/action.yml .github/actions/zig-build-cache-save/action.yml \
-    .github/scripts/classify_changes.sh .github/scripts/classify_changes_test.sh .github/scripts/classify_guard.py; do
+    .gitattributes src/.gitattributes docs/.gitattributes ci/job.sh ci/lib.sh ci/install_zig.sh ci/changes.sh \
+    ci/ci_test.sh ci/woodpecker_step.sh ci/cache.sh .github/workflows/ci.yml .github/workflows/packages.yml \
+    .github/workflows/release.yml .github/actions/zig-build-cache/action.yml \
+    .github/scripts/classify_changes.sh .github/scripts/classify_changes_test.sh .github/scripts/classify_guard.py \
+    .github/scripts/classify_pr.sh .github/test-inputs.txt .woodpecker/api.yaml ops/ci/README.md \
+    scripts/quickstart_loop.sh perf/nightly/compare.py release/candidate tests/jepsen/run.sh \
+    .github/scripts/sbom.py .github/scripts/docs_only.sh .github/scripts/release_check.sh; do
     check "$everything" "$f"
 done
+check "$everything" $'README.md\nsrc/nerva.zig'
 
 # One suite's own files select that suite (and what shares them).
 check "api integration any" 'tests/api/api.py'
-check "api integration any" 'tests/api/docs_routes.py'
+check "api any" 'tests/api/docs_routes.py'
 check "api integration any" 'tests/errors/wire.py'
-check "api integration any" 'tests/errors/commands.py'
 check "integration any" 'tests/recover/recover.py'
 check "views checks any" 'tests/views/declared.py'
 check "release any" 'tests/release/mixed.py'
@@ -103,95 +104,111 @@ check "macos any" 'tests/macos/smoke.py'
 check "packaging checks any" 'tests/packaging/install.py'
 check "packaging ci_scripts macos checks any" 'packaging/homebrew/nerva.rb'
 check "packaging ci_scripts checks any" 'packaging/linux/install.sh'
-check "packaging ci_scripts checks any" '.github/workflows/packages.yml'
 check "packaging ci_scripts checks any" '.github/scripts/package_repos.sh'
 check "packaging ci_scripts checks any" '.github/scripts/r2.py'
-# What package_repos.sh and test_package_repos.py read and run: data and the tool installer.
 check "packaging ci_scripts checks any" '.github/scripts/pre_p417_tags'
-check "packaging ci_scripts checks any" 'ci/install_repo_tools.sh'
 check "packaging ci_scripts checks any" '.github/scripts/test_package_repos.py'
-check "packaging ci_scripts checks any" 'packaging/keys/nerva-release.asc'
 check "mac_keychain ci_scripts checks any" '.github/scripts/mac_keychain.sh'
 check "mac_keychain ci_scripts checks any" '.github/scripts/test_mac_sign.py'
-for f in .github/scripts/sbom.py .github/scripts/docs_only.sh .github/scripts/release_check.sh \
-    .github/workflows/release.yml .github/workflows/jepsen.yml ci/ci_test.sh ci/woodpecker_step.sh \
-    ci/cache.sh ci/changes.sh .woodpecker/api.yaml ops/ci/README.md ops/jepsen/jepsen_report.py \
-    perf/nightly/compare.py scripts/quickstart_loop.sh release/candidate tests/jepsen/run.sh; do
-    check "ci_scripts checks any" "$f"
-done
-# A rename lists both names (the API's `filename` and `previous_filename`): the old path is a
-# deletion, and the new one may be Markdown or unplaced. Each class is selected by its old path.
-# The new name alone selects nothing, which is the bug a list without previous_filename had.
-check "" 'notes/x.md' --expect 1
-check "unit macos ci_scripts checks any" $'notes/x.md\tdocs/ERRORS.md' --expect 1
-check "unit macos ci_scripts checks any" $'docs/ERRORS-old.md\tdocs/ERRORS.md' --expect 1
-check "api any" $'docs/HTTP.md\tdocs/API.md' --expect 1
-check "$binary_set" $'notes/wire_code.md\tsrc/nerva/wire_code.zig' --expect 1
-check "api integration any" $'docs/api.md\ttests/api/api.py' --expect 1
-check "packaging checks any" $'docs/old.md\tdocs/INSTALL.md' --expect 1
-check "packaging ci_scripts checks any" $'docs/old.md\tdocs/releases/packages.md' --expect 1
-check "ci_scripts checks any" $'docs/old.md\tUPSTREAM.md' --expect 1
-check "views checks any" $'notes/x.md\ttests/views/declared.py' --expect 1
-check "release any" $'notes/x.md\ttests/release/mixed.py' --expect 1
-check "demo any" $'notes/x.md\tdemo/common.py' --expect 1
-check "packaging ci_scripts checks any" $'notes/x.md\t.github/scripts/pre_p417_tags' --expect 1
-# --expect counts files, one line each (a rename is one file of two names), not names: a list with
-# a rename that is missing a file is truncated, though it has as many names as the files changed.
-# (review 6031181952: {rename views/old -> views/new, README.md} against 3 files, src/x.zig missing.)
-check "$everything" $'tests/views/new.py\ttests/views/old.py\nREADME.md' --expect 3
-check "$binary_set" $'tests/views/new.py\ttests/views/old.py\nREADME.md\nsrc/x.zig' --expect 3
-check "views checks any" $'tests/views/new.py\ttests/views/old.py\nREADME.md\nnotes/x.md' --expect 3
-check "$everything" $'a.md\tb.md\tc.md' --expect 2
-check "" $'a.md\tb.md\nc.md' --expect 2
-# A list with more files than changed_files is whole; one with fewer is truncated.
-check "unit macos ci_scripts checks any" $'a.md\tdocs/ERRORS.md\nb.md\nREADME.md' --expect 3
-check "unit macos ci_scripts checks any" $'a.md\tdocs/ERRORS.md\nb.md' --expect 2
-check "$everything" $'a.md\nREADME.md' --expect 3
-check "$everything" $'a.md\tREADME.md' --expect 2
 # Unions.
-check "api integration release any" $'tests/api/a.py\ntests/release/b.py'
+check "api release any" $'tests/api/a.py\ntests/release/b.py'
 check "views checks any" $'README.md\ntests/views/x.py'
 check "demo demo_r4 any" $'demo/common.py\ntests/demo/r4.py'
+check "api any" $'README.md\ndocs/API.md'
 
-# The guard passes on this repository.
-if ! python3 -I "$here/classify_guard.py" --root "$root" > /dev/null 2> "${TMPDIR:-/tmp}/classify_guard.$$.err"; then
-    echo "classify_changes_test: the guard fails on this repository:" >&2
-    cat "${TMPDIR:-/tmp}/classify_guard.$$.err" >&2
-    fail=1
-fi
-rm -f "${TMPDIR:-/tmp}/classify_guard.$$.err"
+# A rename lists both names (the API's `filename` and `previous_filename`): the old path is a
+# deletion, and both are classified. The new name alone selects nothing, which is the bug a list
+# without previous_filename had.
+check "" $'docs/decisions/x.md\tdocs/decisions/y.md' --expect 1
+check "api any" $'docs/decisions/n.md\tdocs/API.md' --expect 1
+check "packaging checks any" $'docs/decisions/n.md\tdocs/INSTALL.md' --expect 1
+check "api integration any" $'docs/decisions/n.md\ttests/api/api.py' --expect 1
+check "views checks any" $'docs/decisions/n.md\ttests/views/declared.py' --expect 1
+check "release any" $'docs/decisions/n.md\ttests/release/mixed.py' --expect 1
+check "demo any" $'docs/decisions/n.md\tdemo/common.py' --expect 1
+check "$everything" $'docs/decisions/n.md\tdocs/ERRORS.md' --expect 1
+check "$everything" $'docs/decisions/n.md\tsrc/nerva/wire_code.zig' --expect 1
+check "$everything" $'docs/decisions/n.md\t.github/workflows/ci.yml' --expect 1
+check "$everything" $'docs/decisions/n.md\t.github/scripts/classify_changes.sh' --expect 1
+check "$everything" $'docs/decisions/n.md\t.github/test-inputs.txt' --expect 1
+# A rename INTO the floor is the floor too.
+check "$everything" $'.github/workflows/new.yml\tdocs/decisions/y.md' --expect 1
+# --expect counts files, one line each (a rename is one file of two names), not names: a list with
+# a rename that is missing a file is truncated, though it has as many names as the files changed.
+check "$everything" $'tests/views/new.py\ttests/views/old.py\nREADME.md' --expect 3
+check "$everything" $'tests/views/new.py\ttests/views/old.py\nREADME.md\nsrc/x.zig' --expect 3
+check "views checks any" $'tests/views/new.py\ttests/views/old.py\nREADME.md\nworklog/x.md' --expect 3
+check "$everything" $'a.md\tb.md\tc.md' --expect 2
+check "" $'docs/decisions/a.md\tdocs/decisions/b.md\nworklog/c.md' --expect 2
+check "api any" $'docs/decisions/a.md\tdocs/API.md\ndocs/decisions/b.md\nREADME.md' --expect 3
+check "$everything" $'docs/decisions/a.md\nREADME.md' --expect 3
 
-# The guard on a small tree: a suite that reads a file the classifier does not select it for fails,
-# and each way of reading one is seen.
-tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
-tree() { # tree <name>: a repository with one api script, which does `reads`
-    local t="$tmp/$1"
-    mkdir -p "$t/tests/api" "$t/tests/shared" "$t/demo" "$t/src" "$t/docs"
-    cat > "$t/build.zig" <<'ZIG'
-pub fn build() void {
-    for ([_][]const u8{ "a.py" }) |script| {
-        const run = b.addSystemCommand(&.{ "python3", b.fmt("tests/api/{s}", .{script}) });
-        steps.test_api.dependOn(&run.step);
-    }
-}
-ZIG
-    echo "x" > "$t/demo/x.py"; echo x > "$t/src/x.zig"; echo x > "$t/docs/API.md"; echo x > "$t/docs/ERRORS.md"
-    printf 'def f():\n    pass\n' > "$t/demo/helper.py"
-    printf 'def f():\n    pass\n' > "$t/tests/api/own.py"
-    printf '%s\n' "$2" > "$t/tests/api/a.py"
-}
-guard_says() { # guard_says <want exit> <name> <script body> <fragment>
-    tree "$2" "$3"
+# The manifest: a rule the classifier cannot read is a usage error (exit 2, NRV-E1251), never a
+# narrowing. The floor holds whatever the manifest says.
+manifest_says() { # manifest_says <fragment> <manifest text>
     local out status=0
-    out=$(python3 -I "$here/classify_guard.py" --root "$tmp/$2" 2>&1) || status=$?
-    if [ "$status" != "$1" ]; then
-        echo "classify_changes_test: guard on '$2': exit $status, want $1: $out" >&2
+    printf '%s\n' "$2" > "$tmp/m.txt"
+    out=$(printf 'README.md\n' | CLASSIFY_MANIFEST="$tmp/m.txt" "$here/classify_changes.sh" 2>&1) || status=$?
+    if [ "$status" != 2 ]; then
+        echo "classify_changes_test: a manifest [$2] exits $status, want 2: $out" >&2
         fail=1
-    elif [ -n "${4:-}" ] && ! printf "%s" "$out" | grep -qF -- "${4:-}"; then
-        echo "classify_changes_test: guard on '$2' does not say '${4:-}': $out" >&2
+    elif ! printf '%s' "$out" | grep -qF "error[NRV-E1251]: classify_changes.sh: " || ! printf '%s' "$out" | grep -qF -- "$1"; then
+        echo "classify_changes_test: a manifest [$2] does not say NRV-E1251 and '$1': $out" >&2
         fail=1
     fi
+}
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+manifest_says "unknown class 'apii'" 'apii tests/api/*'
+manifest_says "unknown class 'unit'" 'unit tests/api/*'
+manifest_says "a rule is '<class> <glob>'" 'api'
+manifest_says "a rule is '<class> <glob>'" 'api tests/api/* extra'
+manifest_says "has no rule" '# nothing'
+if printf 'README.md\n' | CLASSIFY_MANIFEST="$tmp/none.txt" "$here/classify_changes.sh" > /dev/null 2>&1; then
+    echo "classify_changes_test: a missing manifest was accepted" >&2
+    fail=1
+fi
+printf 'none .github/workflows/*\nnone .github/actions/*\nnone .github/scripts/classify_*\nnone .github/test-inputs.txt\napi tests/api/*\n' > "$tmp/weak.txt"
+export CLASSIFY_MANIFEST="$tmp/weak.txt"
+check "$everything" '.github/workflows/ci.yml'
+check "$everything" '.github/actions/x/action.yml'
+check "$everything" '.github/scripts/classify_changes.sh'
+check "$everything" '.github/test-inputs.txt'
+check "api any" 'tests/api/x.py'
+# The union of every rule that matches; `none` adds nothing; an unmatched path is everything.
+printf 'none docs/*\napi docs/API.md\nviews docs/API.md\n' > "$tmp/union.txt"
+export CLASSIFY_MANIFEST="$tmp/union.txt"
+check "api views checks any" 'docs/API.md'
+check "" 'docs/other.md'
+check "$everything" 'other/x'
+unset CLASSIFY_MANIFEST
+
+# The guard passes on this repository.
+if ! python3 -I "$here/classify_guard.py" --root "$root" > /dev/null 2> "$tmp/guard.err"; then
+    echo "classify_changes_test: the guard fails on this repository:" >&2
+    cat "$tmp/guard.err" >&2
+    fail=1
+fi
+
+# The lint, on small trees with a manifest of their own: a literal path or an import in a suite's
+# file that the manifest does not select for that suite fails. Best effort: see the cases that pass.
+ltree() { # ltree <name>: a repository with an api suite (tests/api), a demo suite and a manifest
+    local t="$tmp/$1"
+    mkdir -p "$t/.github" "$t/tests/api" "$t/tests/shared" "$t/demo" "$t/src" "$t/docs"
+    cat > "$t/.github/test-inputs.txt" <<'TXT'
+all src/*
+all docs/ERRORS.md
+all UPSTREAM.md
+none README.md
+api docs/API.md
+api tests/api/*
+demo demo/*
+TXT
+    echo x > "$t/demo/x.py"; echo x > "$t/src/x.zig"; echo x > "$t/docs/API.md"; echo x > "$t/docs/ERRORS.md"
+    echo x > "$t/UPSTREAM.md"; echo x > "$t/README.md"; echo x > "$t/tests/shared/data.txt"
+    printf 'def f():\n    pass\n' > "$t/demo/helper.py"
+    printf 'def f():\n    pass\n' > "$t/tests/api/own.py"
+    printf '%s\n' "${2:-x = 1}" > "$t/tests/api/a.py"
 }
 guard_in() { # guard_in <want exit> <name> [fragment]: the guard on a tree already built
     local out status=0
@@ -207,166 +224,97 @@ guard_in() { # guard_in <want exit> <name> [fragment]: the guard on a tree alrea
         fail=1
     fi
 }
-guard_says 0 own 'import os
-import own'
-guard_says 0 binary 'x = "src/x.zig"'
-guard_says 0 api_doc 'x = "docs/API.md"'
-guard_says 0 unplaced 'import os
-open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "shared", "data.txt"))'
-guard_says 1 literal 'x = "docs/ERRORS.md"' 'docs/ERRORS.md is read by the api suite'
-guard_says 1 joined 'import os
-HERE = os.path.dirname(os.path.abspath(__file__))
-open(os.path.join(HERE, "..", "..", "demo", "x.py"))' 'demo/x.py is read by the api suite'
-guard_says 1 pathlib 'from pathlib import Path
-open(Path(__file__).resolve().parents[2] / "demo/x.py")' 'demo/x.py is read by the api suite'
-guard_says 1 sys_path 'import os, sys
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "demo"))
-import helper' 'demo/helper.py is read by the api suite'
-guard_says 1 chained 'import os, sys
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "demo"))
-import helper' 'tests/api/a.py'
-# Path construction the guard evaluates: f-strings and `+`, beside os.path.join and pathlib.
-guard_says 1 fstring 'import os
-open(f"{os.path.dirname(os.path.abspath(__file__))}/../../docs/ERRORS.md")' 'docs/ERRORS.md is read by the api suite'
-guard_says 1 concat 'import os
-open(os.path.dirname(os.path.abspath(__file__)) + "/../../docs/ERRORS.md")' 'docs/ERRORS.md is read by the api suite'
-guard_says 0 fstring_placed 'import os
-open(f"{os.path.dirname(os.path.abspath(__file__))}/../../docs/API.md")'
-# Path construction it cannot evaluate fails closed, unless a reviewed entry says what it reads.
-guard_says 1 opaque 'import tempfile
-open(f"{tempfile.gettempdir()}/docs/x.md")' 'cannot evaluate'
-guard_says 1 opaque_join 'import os, tempfile
-open(os.path.join(tempfile.gettempdir(), "docs/x.md"))' 'cannot evaluate'
-guard_says 1 opaque_format 'import tempfile
-open("{}/ci/job.sh".format(tempfile.gettempdir()))' 'cannot evaluate'
-guard_says 0 opaque_message 'import sys
-print(f"see docs/x.md for {sys.argv}")'
-guard_says 0 opaque_raise 'raise SystemExit(f"see docs/x.md for {1 + 1}")'
-# A join whose root it cannot place, with a repository directory in it, fails closed (the second review).
-guard_says 1 unknown_root_join 'import os, sys
-open(os.path.join(sys.argv[1], "docs", "API.md"))' 'cannot evaluate'
-guard_says 1 unknown_root_pathlib 'import sys
-from pathlib import Path
-open(Path(sys.argv[1]) / "docs" / "API.md")' 'cannot evaluate'
-guard_says 0 unknown_root_other 'import os, sys
-open(os.path.join(sys.argv[1], "scratch", "x"))'
-# A renamed import is the module it renames.
-guard_says 1 alias_join 'import os as _o, sys as _s
-open(_o.path.join(_s.argv[1], "docs", "API.md"))' 'cannot evaluate'
-guard_says 1 alias_path 'import sys as _s
-from pathlib import Path as _P
-open(_P(__file__).resolve().parents[2] / "docs/ERRORS.md")' 'docs/ERRORS.md is read by the api suite'
-guard_says 1 alias_sys_path 'import sys as _s
-_s.path.insert(0, "demo")
-import helper' 'demo/helper.py is read by the api suite'
-guard_says 1 from_join 'from os.path import join, dirname, abspath
-open(join(dirname(abspath(__file__)), "..", "..", "docs", "ERRORS.md"))' 'docs/ERRORS.md is read by the api suite'
-# A read inside print, assert or raise is still a read; only the message text is exempt.
-guard_says 1 print_open 'print(open("docs/ERRORS.md").read())' 'docs/ERRORS.md is read by the api suite'
-guard_says 1 assert_open 'assert open("docs/ERRORS.md").read()' 'docs/ERRORS.md is read by the api suite'
-guard_says 1 raise_open 'raise SystemExit(open("docs/ERRORS.md").read())' 'docs/ERRORS.md is read by the api suite'
-# A relative sys.path entry, and a module imported by name.
-guard_says 1 sys_path_relative 'import sys
-sys.path.insert(0, "demo")
-import helper' 'demo/helper.py is read by the api suite'
-guard_says 1 import_module 'import sys, importlib
-sys.path.insert(0, "demo")
-importlib.import_module("helper")' 'demo/helper.py is read by the api suite'
-guard_says 1 dunder_import 'import sys
-sys.path.append("demo")
-__import__("helper")' 'demo/helper.py is read by the api suite'
+lint() { # lint <want exit> <name> <body of tests/api/a.py> [fragment]
+    ltree "$2" "$3"
+    guard_in "$1" "$2" "${4:-}"
+}
+lint 0 lint_ok 'import os
+import own
+x = "docs/API.md"'
+lint 0 lint_all 'x = "docs/ERRORS.md"
+y = "UPSTREAM.md"
+z = "src/x.zig"'
+lint 1 lint_literal 'x = "demo/x.py"' 'names demo/x.py'
+lint 1 lint_readme 'x = "README.md"' 'does not select api'
+lint 1 lint_relative 'open("../../demo/x.py")' 'names demo/x.py'
+lint 1 lint_import 'import helper' 'import helper'
+lint 1 lint_from_import 'from helper import f' 'names demo/helper.py'
+# pkg_import (the third review): a package or a dotted import names the package's files.
+ltree lint_pkg_import 'from pkg.sub import x'
+mkdir -p "$tmp/lint_pkg_import/demo/pkg"
+echo x > "$tmp/lint_pkg_import/demo/pkg/__init__.py"
+guard_in 1 lint_pkg_import 'import pkg'
+ltree lint_pkg_dotted 'import pkg.sub'
+mkdir -p "$tmp/lint_pkg_dotted/demo/pkg"
+echo x > "$tmp/lint_pkg_dotted/demo/pkg/__init__.py"
+guard_in 1 lint_pkg_dotted 'import pkg'
+# A comment, a docstring and a mention in a message are not reads.
+lint 0 lint_comment '# demo/x.py is not read
+x = 1'
+lint 0 lint_docstring '"""Reads demo/x.py, they say."""
+x = 1'
+# Shell files of a suite are scanned like any other (sh_upstream, sh_root_md of the third review).
+ltree lint_sh_ok
+printf 'cat UPSTREAM.md\ncat "$here/../docs/ERRORS.md"\ncat docs/API.md\n' > "$tmp/lint_sh_ok/tests/api/run.sh"
+guard_in 0 lint_sh_ok
+ltree lint_sh_root_md
+printf 'root=$(cd "$(dirname "$0")/../.." && pwd)\ncat "$root/README.md"\n' > "$tmp/lint_sh_root_md/tests/api/run.sh"
+guard_in 1 lint_sh_root_md 'names README.md'
+ltree lint_sh_dir
+printf 'cat "$root/demo/x.py"\n' > "$tmp/lint_sh_dir/tests/api/run.sh"
+guard_in 1 lint_sh_dir 'names demo/x.py'
+ltree lint_sh_comment
+printf '# cat demo/x.py\necho hi\n' > "$tmp/lint_sh_comment/tests/api/run.sh"
+guard_in 0 lint_sh_comment
+# mac_not_root: the keychain job's scripts are a suite's own files, scanned for what they name.
+ltree lint_mac
+mkdir -p "$tmp/lint_mac/.github/scripts"
+printf 'mac_keychain .github/scripts/mac_*\nci_scripts .github/scripts/mac_*\n' >> "$tmp/lint_mac/.github/test-inputs.txt"
+printf 'cat docs/API.md\n' > "$tmp/lint_mac/.github/scripts/mac_x.sh"
+guard_in 1 lint_mac 'does not select ci_scripts and mac_keychain'
+printf 'cat docs/ERRORS.md\n' > "$tmp/lint_mac/.github/scripts/mac_x.sh"
+guard_in 0 lint_mac
+# A rule that matches no file is stale.
+ltree lint_stale
+printf 'api tests/gone/*\n' >> "$tmp/lint_stale/.github/test-inputs.txt"
+guard_in 1 lint_stale 'matches no file'
+# A manifest that is missing, or that the classifier refuses.
+ltree lint_no_manifest
+rm "$tmp/lint_no_manifest/.github/test-inputs.txt"
+guard_in 1 lint_no_manifest 'does not exist'
+ltree lint_bad_manifest
+printf 'apii tests/api/*\n' >> "$tmp/lint_bad_manifest/.github/test-inputs.txt"
+guard_in 1 lint_bad_manifest "unknown class 'apii'"
+# The limits (O14, "Limits"): what the lint cannot see passes. These cases say so, so a change that
+# starts to see them is noticed here, and a reader is not told the lint is a proof.
+lint 0 limit_listdir 'import os
+os.listdir("demo")'
+lint 0 limit_glob 'import glob
+glob.glob("demo/*.py")'
+lint 0 limit_directory 'x = "demo/"'
+lint 0 limit_computed 'import os
+open(os.path.join("de" + "mo", "x" + ".py"))'
+lint 0 limit_importlib 'import importlib
+importlib.import_module("hel" + "per")'
 # A tracked symbolic link, in a tree that is a git work tree.
-tree symlink 'x = 1'
-ln -s ../../docs/API.md "$tmp/symlink/tests/api/link.md"
-git -C "$tmp/symlink" init -q
-git -C "$tmp/symlink" add -f -A
-guard_in 1 symlink 'is a symbolic link'
-
-# A step the guard does not know, and a script build.zig runs that is not there.
-tree unknown_step 'x = 1'
-sed -i 's/steps.test_api/steps.test_mystery/' "$tmp/unknown_step/build.zig"
-if python3 -I "$here/classify_guard.py" --root "$tmp/unknown_step" > /dev/null 2>&1; then
-    echo "classify_changes_test: the guard accepted a step it does not know" >&2
-    fail=1
-fi
-tree missing 'x = 1'
-rm "$tmp/missing/tests/api/a.py"
-if python3 -I "$here/classify_guard.py" --root "$tmp/missing" > /dev/null 2>&1; then
-    echo "classify_changes_test: the guard accepted a script that is not there" >&2
-    fail=1
-fi
-
-# Shell roots: the scripts ci/job.sh's functions run are read for the repository paths in them.
-shell_tree() { # shell_tree <name> <body of scripts/t.sh>
-    tree "$1" 'x = 1'
-    mkdir -p "$tmp/$1/ci" "$tmp/$1/scripts"
-    cat > "$tmp/$1/ci/job.sh" <<'SH'
-check_code() {
-    .github/scripts/docs_only_test.sh
-}
-check_scripts() {
-    scripts/t.sh
-}
-check_packages() {
-    python3 .github/scripts/test_package_repos.py
-}
-SH
-    mkdir -p "$tmp/$1/.github/scripts"
-    touch "$tmp/$1/.github/scripts/docs_only_test.sh" "$tmp/$1/.github/scripts/test_package_repos.py"
-    printf '%s\n' "$2" > "$tmp/$1/scripts/t.sh"
-}
-shell_tree sh_ok 'cat docs/ERRORS.md'
-guard_in 0 sh_ok
-shell_tree sh_api 'cat "$here/../docs/API.md"
-here=$(cd "$(dirname "$0")" && pwd)'
-guard_in 1 sh_api 'docs/API.md is read by the ci_scripts suite'
-shell_tree sh_literal 'grep -q x docs/API.md'
-guard_in 1 sh_literal 'docs/API.md is read by the ci_scripts suite'
-shell_tree sh_root 'root=$(cd "$(dirname "$0")/.." && pwd)
-cat "$root/docs/API.md"'
-guard_in 1 sh_root 'docs/API.md is read by the ci_scripts suite'
-shell_tree sh_comment '# docs/API.md is not read
-echo hi'
-guard_in 0 sh_comment
-shell_tree sh_dirname 'cat "$(dirname "$0")/../docs/API.md"'
-guard_in 1 sh_dirname 'docs/API.md is read by the ci_scripts suite'
-shell_tree sh_bash_source 'cat "$(dirname "${BASH_SOURCE[0]}")/../docs/API.md"'
-guard_in 1 sh_bash_source 'docs/API.md is read by the ci_scripts suite'
-
-# The unit tests' reads of files outside src/: a literal, a const, an embed, a path it cannot evaluate.
-zig_tree() { # zig_tree <name> <zig source>
-    tree "$1" 'x = 1'
-    printf '%s\n' "$2" > "$tmp/$1/src/x.zig"
-}
-zig_tree zig_ok 'test "x" { _ = try std.fs.cwd().readFileAlloc(a, "docs/ERRORS.md", 1); }'
-guard_in 0 zig_ok
-zig_tree zig_literal 'test "x" { _ = try std.fs.cwd().readFileAlloc(a, "docs/API.md", 1); }'
-guard_in 1 zig_literal 'docs/API.md in a unit test'
-zig_tree zig_const 'const path = "docs/API.md";
-test "x" { _ = try std.fs.cwd().readFileAlloc(a, path, 1); }'
-guard_in 1 zig_const 'docs/API.md in a unit test'
-zig_tree zig_embed 'const text = @embedFile("../docs/API.md");'
-guard_in 1 zig_embed 'embeds docs/API.md'
-zig_tree zig_opaque 'test "x" { const p = try std.fmt.allocPrint(a, "{s}", .{name}); _ = try std.fs.cwd().readFileAlloc(a, p, 1); }'
-guard_in 1 zig_opaque 'cannot evaluate in a unit test'
-zig_tree zig_runtime 'fn f() void { _ = try std.fs.cwd().readFileAlloc(a, path, 1); }'
-guard_in 0 zig_runtime
+ltree lint_symlink
+ln -s ../../docs/API.md "$tmp/lint_symlink/tests/api/link.md"
+git -C "$tmp/lint_symlink" init -q
+git -C "$tmp/lint_symlink" add -f -A
+guard_in 1 lint_symlink 'is a symbolic link'
 
 # ci.yml: each way the guard says a gate is wrong. A job that waits for `changes`, with its steps.
-# The classify step of the `changes` job: it forces every class for a change to the workflows, the
-# classifier or the actions, from the pull request's own file list (the guard reads these fragments).
-force_step='      - id: classify
-        run: |
-          if [ "$EVENT" = pull_request ]; then
-            gh api x --jq ".[] | .filename, (.previous_filename // empty)" | grep -Eq "^(.github/workflows/|.github/scripts/classify_|.github/actions/)"
-          fi'
-workflow_tree() { # workflow_tree <name> <outputs override sed> <job yaml>
-    tree "$1" 'x = 1'
+system_needs="checks ci-scripts integration api releases targets macos-arm64 macos-x86_64 mac-keychain"
+workflow_tree() { # workflow_tree <name> <sed over ci.yml> <job yaml>
+    ltree "$1"
     mkdir -p "$tmp/$1/.github/workflows"
     {
         printf 'on: push\njobs:\n  changes:\n    runs-on: x\n    outputs:\n'
         for c in $everything; do printf '      %s: ${{ steps.classify.outputs.%s }}\n' "$c" "$c"; done
-        printf '    steps:\n%s\n%s\n' "$force_step" "$3"
+        printf '    steps:\n      - id: classify\n        run: x\n'
+        printf '  system:\n    needs:\n'
+        for j in $system_needs; do printf '      - %s\n' "$j"; done
+        printf '    runs-on: x\n    steps: []\n%s\n' "$3"
     } > "$tmp/$1/.github/workflows/ci.yml"
     if [ -n "$2" ]; then sed -i "$2" "$tmp/$1/.github/workflows/ci.yml"; fi
 }
@@ -389,6 +337,8 @@ workflow_tree wf_missing_output '/      demo_r4:/d' "$(job unit changes "$ok")"
 guard_in 1 wf_missing_output 'does not output the class demo_r4'
 workflow_tree wf_swapped_output 's/      views: .*/      views: ${{ steps.classify.outputs.api }}/' "$(job unit changes "$ok")"
 guard_in 1 wf_swapped_output 'outputs views as'
+workflow_tree wf_extra_output 's/^      all: .*/&\n      binary: ${{ steps.classify.outputs.binary }}/' "$(job unit changes "$ok")"
+guard_in 1 wf_extra_output 'outputs binary, which is not a class'
 workflow_tree wf_unknown_class '' "$(job unit changes "needs.changes.outputs.unitt != 'false'")"
 guard_in 1 wf_unknown_class 'which is not a class'
 workflow_tree wf_wrong_gate '' "$(job unit changes "needs.changes.outputs.fuzz != 'false'")"
@@ -412,14 +362,6 @@ workflow_tree wf_unknown_job '' "$(job mystery changes "$ok")"
 guard_in 1 wf_unknown_job 'does not know which class gates it'
 workflow_tree wf_no_primary '' "$(job unit changes "needs.changes.outputs.any != 'false'")"
 guard_in 1 wf_no_primary 'is gated on `any`'
-
-# The classifier must not decide whether its own test runs (the second review's selfgate mutant): a
-# change to the workflows or the classifier forces every class, and the classifier's test and its
-# checkout have no `if`.
-workflow_tree wf_no_force 's/previous_filename/other/' "$(job unit changes "$ok")"
-guard_in 1 wf_no_force 'does not force every class'
-workflow_tree wf_no_force_path 's|\.github/actions/|.github/action/|' "$(job unit changes "$ok")"
-guard_in 1 wf_no_force_path 'does not force every class'
 workflow_tree wf_no_job_if '/    if: \${{ !cancelled() }}/d' "$(job unit changes "$ok")"
 guard_in 1 wf_no_job_if 'job unit has `if: (none)`'
 workflow_tree wf_job_if_output 's/if: \${{ !cancelled() }}/if: ${{ needs.changes.outputs.unit == '"'true'"' }}/' "$(job unit changes "$ok")"
@@ -435,19 +377,16 @@ workflow_tree wf_always_ok '' "$(job unit changes "always() && needs.changes.out
 guard_in 0 wf_always_ok
 workflow_tree wf_always_or '' "$(job unit changes "always() || needs.changes.outputs.unit != 'false'")"
 guard_in 1 wf_always_or 'must be exactly'
-# The steps that run the unit tests are gated on the classes a file a unit test reads must select.
-unit_steps() { # unit_steps <class of the step that runs the unit tests>
-    printf '  unit:
-    needs: changes
-    if: ${{ !cancelled() }}
-    runs-on: x
-    steps:
-      - run: ci/job.sh unit
-        if: needs.changes.outputs.%s != '"'false'"'
-' "$1"
-}
-workflow_tree wf_unit_steps '' "$(unit_steps unit)"
-guard_in 1 wf_unit_steps 'requires a file a unit test reads to select'
+# `continue-on-error` turns a failed suite into a pass: refused on a gated job and on a gated step.
+workflow_tree wf_coe_job '/^  unit:/,$ s/^    runs-on: x$/    runs-on: x\n    continue-on-error: true/' "$(job unit changes "$ok")"
+guard_in 1 wf_coe_job 'job unit has `continue-on-error`'
+workflow_tree wf_coe_step '/^  unit:/,$ s/^      - run: a$/      - run: a\n        continue-on-error: true/' "$(job unit changes "$ok")"
+guard_in 1 wf_coe_step 'has `continue-on-error`: a failed step'
+# `system` is the required check: a job it stops waiting for can fail unseen.
+workflow_tree wf_system_drop '/^      - targets$/d' "$(job unit changes "$ok")"
+guard_in 1 wf_system_drop 'the required check `system` waits for'
+workflow_tree wf_system_extra 's/^      - targets$/&\n      - extra/' "$(job unit changes "$ok")"
+guard_in 1 wf_system_extra 'the required check `system` waits for'
 # The classifier's own test and its checkout run on every pull request.
 ci_scripts_job() { # ci_scripts_job <checkout if line> <test if line>
     printf '  ci-scripts:
@@ -466,9 +405,9 @@ ci_scripts_job() { # ci_scripts_job <checkout if line> <test if line>
 workflow_tree wf_cs_ok '' "$(ci_scripts_job '        name: c' '        name: t')"
 guard_in 0 wf_cs_ok
 workflow_tree wf_cs_test_gated '' "$(ci_scripts_job '        name: c' "        if: needs.changes.outputs.any != 'false'")"
-guard_in 1 wf_cs_test_gated 'with no gate'
+guard_in 1 wf_cs_test_gated 'it runs on every pull request'
 workflow_tree wf_cs_checkout_gated '' "$(ci_scripts_job "        if: needs.changes.outputs.any != 'false'" '        name: t')"
-guard_in 1 wf_cs_checkout_gated 'with no gate'
+guard_in 1 wf_cs_checkout_gated 'it runs on every pull request'
 workflow_tree wf_cs_no_test '' "$(ci_scripts_job '        name: c' '        name: t' | sed 's|classify_changes_test.sh|other.sh|')"
 guard_in 1 wf_cs_no_test 'has no step that runs classify_changes_test.sh'
 # Every push to main runs everything: a `paths-ignore` on `push` skips what a pull request skipped.
@@ -479,7 +418,7 @@ guard_in 1 wf_push_paths '`on.push` has `paths` or `paths-ignore`'
 workflow_tree wf_push_branches 's/^on: push/on:\n  push:\n    branches: [main]/' "$(job unit changes "$ok")"
 guard_in 0 wf_push_branches
 
-# packages.yml: the jobs wait for `classify`, run when it fails, and `run` covers every class.
+# packages.yml: the jobs wait for `classify` and run when it fails or says nothing.
 packages_tree() { # packages_tree <name> <sed over packages.yml>
     workflow_tree "$1" '' "$(job unit changes "$ok")"
     cat > "$tmp/$1/.github/workflows/packages.yml" <<'YML'
@@ -489,12 +428,7 @@ jobs:
     runs-on: x
     steps:
       - id: classify
-        run: |
-          classes=$(mktemp)
-          if grep -qx -e all=true -e binary=true -e packaging=true "$classes"; then run=true; else run=false; fi
-          if [ "$EVENT" = pull_request ]; then
-            gh api x --jq '.[] | .filename, (.previous_filename // empty)' | grep -Eq '^(.github/workflows/|.github/scripts/classify_|.github/actions/)'
-          fi
+        run: x
   tarball:
     needs: classify
     if: ${{ !cancelled() && (github.event_name != 'pull_request' || !github.event.pull_request.draft) && needs.classify.outputs.run != 'false' }}
@@ -513,17 +447,13 @@ packages_tree pk_always_false "s/needs.classify.outputs.run != 'false' }}/needs.
 guard_in 1 pk_always_false 'job `tarball` waits for `classify`'
 packages_tree pk_equals_true "s/needs.classify.outputs.run != 'false'/needs.classify.outputs.run == 'true'/"
 guard_in 1 pk_equals_true 'job `tarball` waits for `classify`'
-packages_tree pk_grep_misses 's/ -e packaging=true//'
-guard_in 1 pk_grep_misses '`classify` runs the jobs for the classes'
-packages_tree pk_grep_extra 's/ -e packaging=true/ -e packaging=true -e demo=true/'
-guard_in 1 pk_grep_extra '`classify` runs the jobs for the classes'
-packages_tree pk_no_force 's/previous_filename/other/'
-guard_in 1 pk_no_force 'does not force the run'
+packages_tree pk_coe 's/^    runs-on: x$/&\n    continue-on-error: true/'
+guard_in 1 pk_coe 'has `continue-on-error`'
 
 # A workflow that calls another grants it what its jobs ask for (the next release failed at startup
 # when release.yml called packages.yml without pull-requests: read).
 call_tree() { # call_tree <name> <caller permissions yaml, indented 4> <callee job permissions yaml, indented 4>
-    tree "$1" 'x = 1'
+    ltree "$1"
     mkdir -p "$tmp/$1/.github/workflows"
     printf 'on: push\njobs:\n  call:\n    uses: ./.github/workflows/callee.yml\n%s\n' "$2" > "$tmp/$1/.github/workflows/caller.yml"
     printf 'on: workflow_call\npermissions:\n  contents: read\njobs:\n  job:\n    runs-on: x\n%s\n    steps: []\n' "$3" > "$tmp/$1/.github/workflows/callee.yml"
@@ -592,8 +522,9 @@ pr_says() {
         fail=1
     fi
 }
-rename='[{"filename":"notes/x.md","previous_filename":"docs/ERRORS.md"}]'
-pr_says "unit macos ci_scripts checks any" "$rename" 'aaa aaa'
+rename='[{"filename":"docs/decisions/x.md","previous_filename":"docs/ERRORS.md"}]'
+pr_says "$everything" "$rename" 'aaa aaa'
+pr_says "api any" '[{"filename":"docs/decisions/x.md","previous_filename":"docs/API.md"}]' 'aaa aaa'
 pr_says "" '[{"filename":"README.md"}]' 'aaa aaa'
 pr_says "" '[{"filename":"README.md","previous_filename":null}]' 'aaa aaa'
 pr_says "$everything" "$rename" 'aaa bbb'
@@ -606,73 +537,134 @@ pr_says "$everything" "$rename" 'aaa aaa' EVENT=push
 pr_says "$everything" "$rename" 'aaa aaa' PR=
 pr_says "$everything" "$rename" 'aaa aaa' CHANGED=3
 pr_says "$everything" '[]' 'aaa aaa'
+# changed_files 0 or missing fails closed: a pull request has at least one file.
+pr_says "$everything" '[{"filename":"README.md"}]' 'aaa aaa' CHANGED=0
+pr_says "$everything" '[{"filename":"README.md"}]' 'aaa aaa' CHANGED=
+pr_says "$everything" '[{"filename":"README.md"}]' 'aaa aaa' CHANGED=many
 # The count is of files, not names: a rename lists two names and counts once. The second review's
 # case: a rename and README.md against changed_files=3 is a list one file short, so it fails closed.
 two_files='[{"filename":"tests/views/new.py","previous_filename":"tests/views/old.py"},{"filename":"README.md"}]'
 pr_says "views checks any" "$two_files" 'aaa aaa' CHANGED=2
 pr_says "$everything" "$two_files" 'aaa aaa' CHANGED=3
 pr_says "$everything" "$two_files" 'aaa aaa' CHANGED=
+# The floor reaches classify_pr.sh's output: the workflows, the classifier and the manifest.
+pr_says "$everything" '[{"filename":".github/workflows/ci.yml"}]' 'aaa aaa'
+pr_says "$everything" '[{"filename":"README.md"},{"filename":".github/test-inputs.txt"}]' 'aaa aaa' CHANGED=2
 # NRV-E1252: classify_pr.sh says why every class runs; NRV-E1251: the classifier's usage error.
 err=$(env PATH="$stub:$PATH" STUB_DIR="$stub" EVENT=pull_request PR= HEAD_SHA=aaa CHANGED=1 REPO=o/r "$here/classify_pr.sh" 2>&1 > /dev/null || true)
 case $err in *'error[NRV-E1252]: classify_pr.sh: '*) ;; *) echo "classify_changes_test: classify_pr.sh fails closed without NRV-E1252: $err" >&2; fail=1 ;; esac
+err=$(env PATH="$stub:$PATH" STUB_DIR="$stub" EVENT=pull_request PR=7 HEAD_SHA=aaa CHANGED=0 REPO=o/r "$here/classify_pr.sh" 2>&1 > /dev/null || true)
+case $err in *'error[NRV-E1252]: classify_pr.sh: the event'*'changed_files'*) ;; *) echo "classify_changes_test: changed_files 0 fails without NRV-E1252: $err" >&2; fail=1 ;; esac
 status=0
 err=$("$here/classify_changes.sh" --bogus 2>&1 < /dev/null) || status=$?
 case $err in *'error[NRV-E1251]: classify_changes.sh: usage'*) ;; *) echo "classify_changes_test: the usage error lacks NRV-E1251: $err" >&2; fail=1 ;; esac
 if [ "$status" != 2 ]; then echo "classify_changes_test: the usage error exits $status, want 2" >&2; fail=1; fi
+# If even `--all` fails, classify_pr.sh fails (the step fails, its output is empty, everything runs):
+# it never exits 0 with nothing printed.
+brokendir="$tmp/broken/.github/scripts"
+mkdir -p "$brokendir"
+cp "$here/classify_pr.sh" "$brokendir/"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$brokendir/classify_changes.sh"
+chmod +x "$brokendir/classify_changes.sh"
+status=0
+out=$(env EVENT=push "$brokendir/classify_pr.sh" 2> /dev/null) || status=$?
+if [ "$status" = 0 ] || [ -n "$out" ]; then
+    echo "classify_changes_test: classify_pr.sh exits $status with [$out] when --all fails" >&2
+    fail=1
+fi
 
-# ci.yml's `classify` step, run as GitHub runs it (bash -e) with the stand-in `gh`: a pull request that
-# changes the workflows, the classifier or the actions has every class true, whatever the classifier
-# says; and the second review's selfgate mutant (a classifier arm that swallows its own change) cannot
-# skip the run.
-step_script="$tmp/step.sh"
-python3 -I - "$root/.github/workflows/ci.yml" > "$step_script" <<'PY'
+# The steps that run the classifier, as GitHub runs them (bash -e) with the stand-in `gh`, from a
+# repository root of their own: ci.yml's `classify` step and packages.yml's.
+step_of() { # step_of <workflow> <job> > script: the `run` of the job's step with id `classify`
+    python3 -I - "$root/.github/workflows/$1" "$2" <<'PY'
 import sys, yaml
-steps = yaml.safe_load(open(sys.argv[1]))["jobs"]["changes"]["steps"]
+steps = yaml.safe_load(open(sys.argv[1]))["jobs"][sys.argv[2]]["steps"]
 print([s for s in steps if s.get("id") == "classify"][0]["run"])
 PY
-# step_says <scripts dir> "<true classes>" '<files json>' [env VAR=value ...]
-step_says() {
-    local scripts=$1 want=$2 files=$3 out got status=0
+}
+step_of ci.yml changes > "$tmp/ci_step.sh"
+step_of packages.yml classify > "$tmp/pk_step.sh"
+run_step() { # run_step <script> <repo root> <files json> [env VAR=value ...]: sets $status, writes $tmp/step.out
+    local script=$1 repo=$2 files=$3
     shift 3
-    out="$tmp/step.out"
-    : > "$out"
+    : > "$tmp/step.out"
     rm -f "$stub/n"
     printf '%s' "$files" > "$stub/files.json"
     printf 'aaa\naaa\n' > "$stub/heads"
-    (cd "$scripts/../.." && env PATH="$stub:$PATH" STUB_DIR="$stub" EVENT=pull_request PR=7 HEAD_SHA=aaa CHANGED=1 \
-        REPO=o/r GITHUB_OUTPUT="$out" "$@" bash -e "$step_script" > /dev/null 2>&1) || status=$?
-    got=$(sed -n 's/=true$//p' "$out" | sort | tr '\n' ' ')
+    status=0
+    (cd "$repo" && env PATH="$stub:$PATH" STUB_DIR="$stub" EVENT=pull_request PR=7 HEAD_SHA=aaa CHANGED=1 \
+        REPO=o/r GITHUB_OUTPUT="$tmp/step.out" "$@" bash -e "$script" > /dev/null 2>&1) || status=$?
+}
+# step_says "<true classes>" '<files json>' [env ...]: a step that fails has an empty output, and
+# an empty output runs every job (`!= 'false'`), so failing is closed.
+step_says() {
+    local want=$1 files=$2 got
+    shift 2
+    run_step "$tmp/ci_step.sh" "${STEP_ROOT:-$root}" "$files" "$@"
+    got=$(sed -n 's/=true$//p' "$tmp/step.out" | sort | tr '\n' ' ')
     want=$(printf '%s\n' $want | sed '/^$/d' | sort | tr '\n' ' ')
-    # A step that fails runs every job's steps too (`!= 'false'` on an empty output), so failing is closed.
     if [ "$status" != 0 ] && [ -z "$got" ]; then return; fi
     if [ "$got" != "$want" ] || [ "$status" != 0 ]; then
         echo "classify_changes_test: ci.yml classify step: want [$want], got [$got] (exit $status) for $files $*" >&2
         fail=1
     fi
 }
-step_says "$here" "" '[{"filename":"README.md"}]'
-step_says "$here" "$everything" '[{"filename":".github/workflows/ci.yml"}]'
-step_says "$here" "$everything" '[{"filename":".github/scripts/classify_changes.sh"}]'
-step_says "$here" "$everything" '[{"filename":".github/scripts/classify_guard.py"}]'
-step_says "$here" "$everything" '[{"filename":".github/actions/x/action.yml"}]'
-step_says "$here" "$everything" '[{"filename":"notes/old.md","previous_filename":".github/workflows/ci.yml"}]'
-step_says "$here" "$everything" '[{"filename":"README.md"},{"filename":".github/workflows/ci.yml"}]' CHANGED=2
-step_says "$here" "$everything" '[{"filename":"README.md"}]' EVENT=push
-step_says "$here" "$everything" '[{"filename":"README.md"}]' STUB_FILES_FAIL=1
-selfgate="$tmp/selfgate"
-mkdir -p "$selfgate/.github/scripts"
-cp "$here/classify_changes.sh" "$here/classify_pr.sh" "$selfgate/.github/scripts/"
-sed -i 's|^        # CI plumbing every job uses, and this classifier and its tests: everything runs.$|        .github/ISSUE_TEMPLATE/* \| .github/*) ;;\n&|' "$selfgate/.github/scripts/classify_changes.sh"
-if ! grep -q 'ISSUE_TEMPLATE' "$selfgate/.github/scripts/classify_changes.sh"; then
-    echo "classify_changes_test: the selfgate mutant did not apply" >&2
-    fail=1
-fi
-# The mutant classifier alone leaves the classifier's own change with no class: that was the hole.
-mutant=$(printf '.github/scripts/classify_changes.sh\n.github/scripts/classify_changes_test.sh\n' \
-    | "$selfgate/.github/scripts/classify_changes.sh" --expect 2 | sed -n 's/=true$//p' | tr '\n' ' ')
-if [ -n "$mutant" ]; then echo "classify_changes_test: the selfgate mutant selects [$mutant]" >&2; fail=1; fi
-# The step forces every class on top of it.
-step_says "$selfgate/.github/scripts" "$everything" '[{"filename":".github/scripts/classify_changes.sh"},{"filename":".github/scripts/classify_changes_test.sh"}]' CHANGED=2
+step_says "" '[{"filename":"README.md"}]'
+step_says "api any" '[{"filename":"docs/API.md"}]'
+step_says "$everything" '[{"filename":".github/workflows/ci.yml"}]'
+step_says "$everything" '[{"filename":".github/scripts/classify_changes.sh"}]'
+step_says "$everything" '[{"filename":".github/scripts/classify_guard.py"}]'
+step_says "$everything" '[{"filename":".github/test-inputs.txt"}]'
+step_says "$everything" '[{"filename":".github/actions/x/action.yml"}]'
+step_says "$everything" '[{"filename":"docs/decisions/old.md","previous_filename":".github/workflows/ci.yml"}]'
+step_says "$everything" '[{"filename":"README.md"},{"filename":".github/workflows/ci.yml"}]' CHANGED=2
+step_says "$everything" '[{"filename":"README.md"}]' EVENT=push
+step_says "$everything" '[{"filename":"README.md"}]' STUB_FILES_FAIL=1
+step_says "$everything" '[{"filename":"README.md"}]' CHANGED=0
+# pk_says <want: true|false|closed> '<files json>' [env ...]: `run` is false only for an explicit
+# all=false and packaging=false. A step that fails, or garbled or empty output, runs the jobs.
+pk_says() {
+    local want=$1 files=$2 got
+    shift 2
+    run_step "$tmp/pk_step.sh" "${STEP_ROOT:-$root}" "$files" "$@"
+    got=$(sed -n 's/^run=//p' "$tmp/step.out" | tail -1)
+    case $want in
+    closed) [ "$got" != false ] || { echo "classify_changes_test: packages.yml classify step skips the jobs: $files $*" >&2; fail=1; } ;;
+    *) if [ "$got" != "$want" ] || [ "$status" != 0 ]; then
+        echo "classify_changes_test: packages.yml classify step: want run=$want, got [$got] (exit $status) for $files $*" >&2
+        fail=1
+    fi ;;
+    esac
+}
+pk_says false '[{"filename":"README.md"}]'
+pk_says false '[{"filename":"tests/api/api.py"}]'
+pk_says true '[{"filename":"docs/INSTALL.md"}]'
+pk_says true '[{"filename":"tests/packaging/install.py"}]'
+pk_says true '[{"filename":"src/nerva.zig"}]'
+pk_says true '[{"filename":".github/workflows/packages.yml"}]'
+pk_says true '[{"filename":".github/scripts/classify_changes.sh"}]'
+pk_says true '[{"filename":".github/test-inputs.txt"}]'
+pk_says true '[{"filename":"docs/decisions/x.md","previous_filename":".github/workflows/packages.yml"}]'
+pk_says true '[{"filename":"README.md"}]' EVENT=push
+pk_says true '[{"filename":"README.md"}]' STUB_FILES_FAIL=1
+pk_says true '[{"filename":"README.md"}]' CHANGED=0
+# Garbled, empty and failing classifier output (the third review): the jobs run.
+fake="$tmp/fake"
+mkdir -p "$fake/.github/scripts"
+fake_says() { # fake_says <want> <body of classify_pr.sh>
+    printf '#!/usr/bin/env bash\n%s\n' "$2" > "$fake/.github/scripts/classify_pr.sh"
+    chmod +x "$fake/.github/scripts/classify_pr.sh"
+    STEP_ROOT=$fake pk_says "$1" '[]'
+}
+fake_says true 'echo garbage'
+fake_says true 'true'
+fake_says true 'echo all=false'
+fake_says true 'echo packaging=false'
+fake_says true "printf 'all=false\\npackaging=true\\n'"
+fake_says true "printf 'all=true\\npackaging=false\\n'"
+fake_says true "printf 'all=false\\nxpackaging=false\\n'"
+fake_says closed 'exit 1'
+fake_says false "printf 'all=false\\npackaging=false\\n'"
 
 [ "$fail" = 0 ] && echo "classify_changes_test: ok"
 exit "$fail"

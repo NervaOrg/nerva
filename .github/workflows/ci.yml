@@ -49,17 +49,16 @@ jobs:
   # report every required check, or a pull request that skips a suite could never merge. So every
   # job below runs on every pull request, and a job whose class is false skips each step, not the
   # job: a skipped matrix job reports under its bare name, and the required names (`vopr (1)`,
-  # `demo (seats_chaos.py)`) would never appear. A class is skipped only when this change cannot
-  # have caused a regression in it: its inputs are known (.github/scripts/classify_changes.sh,
-  # checked against build.zig and tests/** by classify_guard.py in the `ci-scripts` job) and none
-  # changed (a rename lists both names). A pull request that changes the workflows, the classifier
-  # or the actions runs every class, decided in the step below, not by the classifier. The
-  # classifier's own test runs on every pull request, ungated. Fail closed: only a pull request is
-  # classified; a push to main,
-  # a release's call and a dispatch run everything, as does a changed file the table does not
-  # place, a list that cannot be had, or one with fewer files than the pull request changed or the
-  # 3000 the API lists at most. If `changes` itself fails, every job still runs every step (the
-  # `!cancelled()` and `!= 'false'` conditions: an empty output is not 'false').
+  # `demo (seats_chaos.py)`) would never appear. Coarse by default: a class is skipped only for a
+  # change to documentation that no test reads or to one suite's own files, as the hand-kept
+  # manifest .github/test-inputs.txt says (classify_guard.py lints it in the `ci-scripts` job);
+  # anything else, the workflows, the classifier and its manifest included, runs every class
+  # (decided in the classifier, from the one file list classify_pr.sh reads). The classifier's own
+  # test runs on every pull request, ungated. Fail closed: only a pull request is classified; a push
+  # to main, a release's call and a dispatch run everything, as does a changed file the manifest
+  # does not place, a list that cannot be had, or one with fewer files than the pull request changed
+  # or the 3000 the API lists at most. If `changes` itself fails, every job still runs every step
+  # (the `!cancelled()` and `!= 'false'` conditions: an empty output is not 'false').
   changes:
     name: changes
     runs-on: ubuntu-24.04
@@ -69,7 +68,6 @@ jobs:
       pull-requests: read
     outputs:
       all: ${{ steps.classify.outputs.all }}
-      binary: ${{ steps.classify.outputs.binary }}
       any: ${{ steps.classify.outputs.any }}
       unit: ${{ steps.classify.outputs.unit }}
       fuzz: ${{ steps.classify.outputs.fuzz }}
@@ -103,20 +101,12 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           # Only a pull request is classified; a push to main, a release's call and a dispatch run
-          # everything. A list that cannot be had, or is of another head, fails closed too (O14).
+          # everything. A list that cannot be had, or is of another head, fails closed too, and the
+          # classifier itself runs everything for a change to the workflows, the actions, itself or
+          # its manifest (O14). The list is read once, in classify_pr.sh. A failed call fails the
+          # step, and an empty output runs everything.
           classes=$(mktemp)
           .github/scripts/classify_pr.sh > "$classes"
-          # A pull request that changes the workflows, the classifier or the actions runs every class,
-          # whatever the classifier (which that pull request may have changed) says: a broken
-          # classifier must never skip the run that changes it. Decided here, outside
-          # classify_changes.sh, from the pull request's own file list (a rename lists both names).
-          # A failed call fails the step, and an empty output runs everything.
-          if [ "$EVENT" = pull_request ]; then
-            names=$(gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[] | .filename, (.previous_filename // empty)')
-            if printf '%s\n' "$names" | grep -Eq '^(\.github/workflows/|\.github/scripts/classify_|\.github/actions/)'; then
-              sed -i 's/=false$/=true/' "$classes"
-            fi
-          fi
           cat "$classes"
           cat "$classes" >> "$GITHUB_OUTPUT"
 
@@ -201,7 +191,7 @@ jobs:
         if: needs.changes.outputs.ci_scripts != 'false'
         run: sudo env "PATH=$PATH" bash ci/ci_test.sh
 
-      # The change classifier's table and the guard that checks it against build.zig and tests/**
+      # The change classifier's manifest test and the guard that lints the manifest and the wiring
       # (O14). Every run, with no gate: they are what lets a suite be skipped, so the classifier
       # must not decide whether they run (a broken classifier would skip its own test). They take
       # seconds; the guard checks that this step has no `if`.

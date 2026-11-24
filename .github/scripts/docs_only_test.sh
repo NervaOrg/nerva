@@ -18,6 +18,12 @@ check false $'README.md\ndocs/decisions/P1-x.md\nworklog/1.md\n'
 check false 'docs/briefs/r5.md'
 check true 'docs/ERRORS.md'
 check true $'README.md\nUPSTREAM.md'
+# Markdown that a test reads is code (#15).
+for f in docs/API.md docs/INSTALL.md docs/QUICKSTART.md CHANGELOG.md docs/releases/automation.md docs/releases/packages.md; do
+    check true "$f"
+    check true $'README.md\n'"$f"
+done
+check false 'docs/releases/v0.7.1-audit.md'
 check true 'src/nerva.zig'
 check true $'README.md\nsrc/nerva.zig'
 check true '.github/workflows/ci.yml'
